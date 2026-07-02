@@ -3,7 +3,7 @@ import {
   Package, AlertTriangle, Search, Plus, Pencil, Trash2, X,
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
-  Mail, Phone, User, CheckCircle2, Tag
+  Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -16,6 +16,8 @@ const LOGO_DATA_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAB54AAAFsCAY
 const DEFAULT_CATEGORIES = ['Raw Materials', 'Components', 'Packaging', 'Finished Goods', 'Tools & Equipment'];
 const LOCATIONS = ['A-01', 'A-02', 'B-01', 'B-02', 'C-01', 'C-02', 'Dock'];
 const DAY_MS = 24 * 60 * 60 * 1000;
+const PAYMENT_METHODS = ['Cash', 'Card', 'GCash'];
+const TAX_RATE = 0.12;
 
 function PesoIcon({ size = 18, color = 'currentColor', strokeWidth = 2.2 }) {
   return (
@@ -61,6 +63,7 @@ export default function InventorySystem() {
   const [movements, setMovements] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
   const [categories, setCategories] = useState([]);
+  const [sales, setSales] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState('overview');
   const [search, setSearch] = useState('');
@@ -83,24 +86,29 @@ export default function InventorySystem() {
       const storedMoves = JSON.parse(localStorage.getItem('depot-movements') || 'null');
       const storedSuppliers = JSON.parse(localStorage.getItem('depot-suppliers') || 'null');
       const storedCategories = JSON.parse(localStorage.getItem('depot-categories') || 'null');
+      const storedSales = JSON.parse(localStorage.getItem('depot-sales') || 'null');
 
       const initItems = storedItems || seedItems();
       const initMoves = storedMoves || seedMovements(initItems);
       const initSuppliers = storedSuppliers || seedSuppliers();
       const initCategories = storedCategories || DEFAULT_CATEGORIES.slice();
+      const initSales = storedSales || [];
       setItems(initItems);
       setMovements(initMoves);
       setSuppliers(initSuppliers);
       setCategories(initCategories);
+      setSales(initSales);
       if (!storedItems) localStorage.setItem('depot-items', JSON.stringify(initItems));
       if (!storedMoves) localStorage.setItem('depot-movements', JSON.stringify(initMoves));
       if (!storedSuppliers) localStorage.setItem('depot-suppliers', JSON.stringify(initSuppliers));
       if (!storedCategories) localStorage.setItem('depot-categories', JSON.stringify(initCategories));
+      if (!storedSales) localStorage.setItem('depot-sales', JSON.stringify(initSales));
     } catch (e) {
       setItems(seedItems());
       setMovements([]);
       setSuppliers(seedSuppliers());
       setCategories(DEFAULT_CATEGORIES.slice());
+      setSales([]);
     } finally {
       setLoaded(true);
     }
@@ -124,6 +132,11 @@ export default function InventorySystem() {
   const persistCategories = useCallback((next) => {
     setCategories(next);
     try { localStorage.setItem('depot-categories', JSON.stringify(next)); } catch {}
+  }, []);
+
+  const persistSales = useCallback((next) => {
+    setSales(next);
+    try { localStorage.setItem('depot-sales', JSON.stringify(next)); } catch {}
   }, []);
 
   const showToast = (msg) => {
@@ -209,6 +222,49 @@ export default function InventorySystem() {
     persistMovements([mv, ...movements]);
     setMoveModal(null);
     showToast(`${type === 'in' ? 'Received' : 'Issued'} ${qty} × ${item.sku}`);
+  };
+
+  const completeSale = (cartLines, paymentMethod) => {
+    if (cartLines.length === 0) return;
+    for (const line of cartLines) {
+      const item = items.find((i) => i.id === line.itemId);
+      if (!item || line.qty > item.quantity) {
+        showToast(`Not enough stock for ${item ? item.sku : 'item'}`);
+        return;
+      }
+    }
+    const receiptNo = 'R' + Date.now().toString(36).toUpperCase();
+    const now = Date.now();
+    const saleLines = cartLines.map((line) => {
+      const item = items.find((i) => i.id === line.itemId);
+      return {
+        itemId: item.id, sku: item.sku, name: item.name,
+        qty: line.qty, unitPrice: item.unitCost, lineTotal: item.unitCost * line.qty,
+      };
+    });
+    const subtotal = saleLines.reduce((s, l) => s + l.lineTotal, 0);
+    const tax = subtotal * TAX_RATE;
+    const total = subtotal + tax;
+
+    const nextItems = items.map((it) => {
+      const line = cartLines.find((l) => l.itemId === it.id);
+      return line ? { ...it, quantity: it.quantity - line.qty } : it;
+    });
+    const newMovements = cartLines.map((line) => {
+      const item = items.find((i) => i.id === line.itemId);
+      return {
+        id: 'm' + Math.random().toString(36).slice(2, 9),
+        itemId: line.itemId, type: 'out', qty: line.qty,
+        reason: `Sale ${receiptNo}`, timestamp: now,
+      };
+    });
+    const sale = { id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines, subtotal, tax, total, paymentMethod };
+
+    persistItems(nextItems);
+    persistMovements([...newMovements, ...movements]);
+    persistSales([sale, ...sales]);
+    showToast(`Sale ${receiptNo} recorded — ${currency(total)}`);
+    return sale;
   };
 
   const filtered = useMemo(() => {
@@ -364,6 +420,14 @@ export default function InventorySystem() {
           <DeliveryTimesView rows={deliveryRows} />
         )}
 
+        {view === 'pos' && (
+          <POSView items={items} onCompleteSale={completeSale} />
+        )}
+
+        {view === 'sales' && (
+          <SalesHistoryView sales={sales} />
+        )}
+
         {view === 'history' && (
           <TransactionHistoryView
             movements={filteredMovements}
@@ -437,10 +501,12 @@ export default function InventorySystem() {
 function Sidebar({ view, setView, lowCount }) {
   const items = [
     { key: 'overview', label: 'Overview', icon: LayoutGrid },
+    { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
     { key: 'inventory', label: 'Inventory', icon: Boxes },
     { key: 'suppliers', label: 'Suppliers', icon: Truck },
     { key: 'categories', label: 'Categories', icon: Tag },
     { key: 'delivery', label: 'Delivery Times', icon: Timer },
+    { key: 'sales', label: 'Sales History', icon: Receipt },
     { key: 'history', label: 'Transaction History', icon: ScrollText },
   ];
   return (
@@ -482,10 +548,12 @@ function Sidebar({ view, setView, lowCount }) {
 function TopBar({ view, onAdd }) {
   const titles = {
     overview: ['Overview', 'Warehouse status at a glance'],
+    pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     categories: ['Categories', 'Organize items into your own groups'],
     delivery: ['Delivery Times', 'Lead times and expected restocks'],
+    sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
   };
   const [title, sub] = titles[view];
@@ -793,6 +861,189 @@ function DeliveryTimesView({ rows }) {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+function POSView({ items, onCompleteSale }) {
+  const [search, setSearch] = useState('');
+  const [cart, setCart] = useState([]); // [{itemId, qty}]
+  const [paymentMethod, setPaymentMethod] = useState(PAYMENT_METHODS[0]);
+  const [lastReceipt, setLastReceipt] = useState(null);
+
+  const sellable = useMemo(() => items.filter((it) => it.quantity > 0), [items]);
+  const filtered = useMemo(() => {
+    const q = search.toLowerCase();
+    return sellable.filter((it) => it.sku.toLowerCase().includes(q) || it.name.toLowerCase().includes(q));
+  }, [sellable, search]);
+
+  const itemMap = useMemo(() => Object.fromEntries(items.map((i) => [i.id, i])), [items]);
+
+  const addToCart = (item) => {
+    setLastReceipt(null);
+    setCart((prev) => {
+      const existing = prev.find((l) => l.itemId === item.id);
+      if (existing) {
+        if (existing.qty >= item.quantity) return prev;
+        return prev.map((l) => (l.itemId === item.id ? { ...l, qty: l.qty + 1 } : l));
+      }
+      return [...prev, { itemId: item.id, qty: 1 }];
+    });
+  };
+
+  const changeQty = (itemId, delta) => {
+    setCart((prev) => prev
+      .map((l) => {
+        if (l.itemId !== itemId) return l;
+        const max = itemMap[itemId]?.quantity ?? l.qty;
+        const nextQty = Math.min(max, Math.max(1, l.qty + delta));
+        return { ...l, qty: nextQty };
+      })
+    );
+  };
+
+  const removeLine = (itemId) => setCart((prev) => prev.filter((l) => l.itemId !== itemId));
+
+  const subtotal = cart.reduce((s, l) => s + (itemMap[l.itemId]?.unitCost ?? 0) * l.qty, 0);
+  const tax = subtotal * TAX_RATE;
+  const total = subtotal + tax;
+
+  const checkout = () => {
+    const sale = onCompleteSale(cart, paymentMethod);
+    if (sale) {
+      setLastReceipt(sale);
+      setCart([]);
+    }
+  };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease', display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 16, alignItems: 'start' }}>
+      <div>
+        <div style={styles.searchBox}>
+          <Search size={15} color="rgba(20,33,61,0.5)" />
+          <input
+            className="depot-input"
+            placeholder="Search items to sell…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={styles.searchInput}
+          />
+        </div>
+        <div style={styles.posGrid}>
+          {filtered.length === 0 && (
+            <div style={styles.emptyState}>No sellable items match your search.</div>
+          )}
+          {filtered.map((it) => (
+            <button key={it.id} className="depot-btn" style={styles.posItemCard} onClick={() => addToCart(it)}>
+              <div style={styles.posItemSku}>{it.sku}</div>
+              <div style={styles.posItemName}>{it.name}</div>
+              <div style={styles.posItemFooter}>
+                <span>{currency(it.unitCost)}</span>
+                <span style={{ color: 'rgba(20,33,61,0.5)' }}>{it.quantity} in stock</span>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={styles.cartPanel}>
+        <div style={styles.panelHeader}>
+          <ShoppingCart size={15} />
+          <span>CURRENT SALE</span>
+        </div>
+
+        {cart.length === 0 ? (
+          <div style={styles.emptyState}>Tap an item to add it to the sale.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+            {cart.map((line) => {
+              const item = itemMap[line.itemId];
+              if (!item) return null;
+              return (
+                <div key={line.itemId} style={styles.cartLine}>
+                  <div style={{ flex: 1 }}>
+                    <div style={styles.watchSku}>{item.sku}</div>
+                    <div style={styles.watchName}>{item.name}</div>
+                  </div>
+                  <div style={styles.qtyStepper}>
+                    <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.itemId, -1)}><Minus size={12} /></button>
+                    <span style={styles.qtyValue}>{line.qty}</span>
+                    <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.itemId, 1)}><Plus size={12} /></button>
+                  </div>
+                  <div style={{ width: 72, textAlign: 'right', fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
+                    {currency(item.unitCost * line.qty)}
+                  </div>
+                  <IconBtn onClick={() => removeLine(line.itemId)} title="Remove" danger><X size={13} /></IconBtn>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={styles.cartTotals}>
+          <div style={styles.cartTotalsRow}><span>Subtotal</span><span>{currency(subtotal)}</span></div>
+          <div style={styles.cartTotalsRow}><span>VAT (12%)</span><span>{currency(tax)}</span></div>
+          <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(total)}</span></div>
+        </div>
+
+        <div style={{ display: 'flex', gap: 6, marginTop: 12 }}>
+          {PAYMENT_METHODS.map((m) => (
+            <button key={m} className="depot-btn" onClick={() => setPaymentMethod(m)}
+              style={{ ...styles.paymentBtn, background: paymentMethod === m ? 'var(--blueprint)' : 'transparent', color: paymentMethod === m ? '#fff' : 'var(--ink)' }}>
+              {m}
+            </button>
+          ))}
+        </div>
+
+        <button className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 12, opacity: cart.length ? 1 : 0.45 }}
+          disabled={!cart.length} onClick={checkout}>
+          <Receipt size={16} /> Complete Sale
+        </button>
+
+        {lastReceipt && (
+          <div style={styles.receiptBox}>
+            <div style={styles.receiptTitle}>Sale {lastReceipt.receiptNo}</div>
+            <div style={styles.supplierMeta}>{lastReceipt.items.length} item{lastReceipt.items.length === 1 ? '' : 's'} · {lastReceipt.paymentMethod} · {currency(lastReceipt.total)}</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SalesHistoryView({ sales }) {
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {sales.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>No sales recorded yet. Ring one up in Point of Sale.</div></div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                {['Receipt', 'Date', 'Items', 'Payment', 'Total'].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sales.map((sale) => (
+                <tr key={sale.id} className="depot-row">
+                  <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 500 }}>{sale.receiptNo}</td>
+                  <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
+                    {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </td>
+                  <td style={styles.td}>
+                    {sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}
+                  </td>
+                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
+                  <td style={{ ...styles.td, fontWeight: 600 }}>{currency(sale.total)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -1166,6 +1417,36 @@ const styles = {
     borderRadius: 8, padding: '12px 14px', animation: 'slideUp 0.3s ease',
   },
   categoryIcon: { width: 32, height: 32, borderRadius: 7, background: 'var(--amber-deep)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  posGrid: {
+    display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 10, marginTop: 14,
+    maxHeight: 560, overflowY: 'auto',
+  },
+  posItemCard: {
+    display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start', textAlign: 'left',
+    background: '#fff', border: '1px solid rgba(20,33,61,0.1)', borderRadius: 8, padding: '10px 12px',
+  },
+  posItemSku: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: 'var(--blueprint)', fontWeight: 600 },
+  posItemName: { fontSize: 12.5, fontWeight: 500, lineHeight: 1.3 },
+  posItemFooter: { display: 'flex', justifyContent: 'space-between', width: '100%', fontSize: 11, marginTop: 4, fontFamily: "'IBM Plex Mono', monospace" },
+  cartPanel: { background: '#fff', border: '1px solid rgba(20,33,61,0.08)', borderRadius: 8, padding: 18, position: 'sticky', top: 0 },
+  cartLine: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid rgba(20,33,61,0.06)' },
+  qtyStepper: { display: 'flex', alignItems: 'center', gap: 6 },
+  qtyBtn: {
+    width: 22, height: 22, borderRadius: 5, background: 'rgba(15,42,71,0.07)', display: 'flex',
+    alignItems: 'center', justifyContent: 'center', color: 'var(--ink)',
+  },
+  qtyValue: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5, width: 18, textAlign: 'center' },
+  cartTotals: { marginTop: 14, paddingTop: 10, borderTop: '1px solid rgba(20,33,61,0.08)' },
+  cartTotalsRow: { display: 'flex', justifyContent: 'space-between', fontSize: 13, padding: '3px 0', fontFamily: "'IBM Plex Mono', monospace" },
+  cartTotalsFinal: { fontWeight: 700, fontSize: 15, borderTop: '1px dashed rgba(20,33,61,0.15)', marginTop: 4, paddingTop: 8 },
+  paymentBtn: {
+    flex: 1, padding: '8px 0', borderRadius: 6, border: '1px solid rgba(20,33,61,0.15)', fontSize: 12.5, fontWeight: 500,
+  },
+  receiptBox: {
+    marginTop: 12, background: 'rgba(79,138,99,0.08)', borderLeft: '3px solid var(--green)',
+    borderRadius: 6, padding: '10px 12px',
+  },
+  receiptTitle: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5, fontWeight: 600, color: 'var(--green)' },
   supplierName: { fontSize: 14.5, fontWeight: 600, lineHeight: 1.3 },
   supplierMeta: { fontSize: 11.5, color: 'rgba(20,33,61,0.5)', marginTop: 2 },
   supplierBody: { display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 10, borderTop: '1px solid rgba(20,33,61,0.06)' },
