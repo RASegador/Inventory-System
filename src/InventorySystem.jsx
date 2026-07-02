@@ -162,8 +162,22 @@ const DECOR_SETS = {
     { Icon: ShoppingBasket, top: '72%', left: '8%', size: 54, rotate: 12, color: '#D9A441' },
     { Icon: Apple, top: '14%', left: '86%', size: 42, rotate: 15, color: '#C1503A' },
     { Icon: Tag, top: '80%', left: '88%', size: 38, rotate: -10, color: '#A9701D' },
-    { Icon: Leaf, top: '55%', left: '92%', size: 30, rotate: 30, color: '#5C8A5A' },
+    { Icon: Leaf, top: '55%', left: '92%', size: 30, rotate: 30, color: '#5C8A5A', opacity: 0.08 },
     { Icon: ShoppingCart, top: '85%', left: '48%', size: 40, rotate: -6, color: '#2F4A32' },
+    { Icon: Package, top: '4%', left: '46%', size: 30, rotate: 8, color: '#A9701D', opacity: 0.08 },
+    { Icon: Leaf, top: '38%', left: '4%', size: 26, rotate: -35, color: '#5C8A5A', opacity: 0.09 },
+    { Icon: Tag, top: '25%', left: '95%', size: 26, rotate: -22, color: '#C1503A', opacity: 0.08 },
+    { Icon: Apple, top: '92%', left: '18%', size: 30, rotate: 20, color: '#5C8A5A', opacity: 0.09 },
+    { Icon: ShoppingBasket, top: '48%', left: '2%', size: 24, rotate: -10, color: '#D9A441', opacity: 0.07 },
+    { Icon: Leaf, top: '95%', left: '68%', size: 34, rotate: 12, color: '#2F4A32', opacity: 0.08 },
+    { Icon: ShoppingCart, top: '2%', left: '68%', size: 24, rotate: 18, color: '#A9701D', opacity: 0.07 },
+    { Icon: Apple, top: '65%', left: '3%', size: 22, rotate: -14, color: '#C1503A', opacity: 0.07 },
+    { Icon: Package, top: '35%', left: '78%', size: 28, rotate: -6, color: '#2F4A32', opacity: 0.07 },
+    { Icon: Tag, top: '60%', left: '38%', size: 20, rotate: 26, color: '#D9A441', opacity: 0.06 },
+    { Icon: Leaf, top: '15%', left: '58%', size: 22, rotate: -40, color: '#5C8A5A', opacity: 0.07 },
+    { Icon: ShoppingBasket, top: '30%', left: '30%', size: 20, rotate: 15, color: '#A9701D', opacity: 0.06 },
+    { Icon: Apple, top: '5%', left: '25%', size: 24, rotate: 10, color: '#C1503A', opacity: 0.07 },
+    { Icon: ShoppingCart, top: '78%', left: '75%', size: 26, rotate: -12, color: '#2F4A32', opacity: 0.07 },
   ],
   app: [
     { Icon: Leaf, top: '4%', left: '3%', size: 40, rotate: -20, color: 'var(--green)' },
@@ -171,6 +185,16 @@ const DECOR_SETS = {
     { Icon: Tag, top: '8%', left: '97%', size: 34, rotate: 16, color: 'var(--amber-deep)' },
     { Icon: Apple, top: '92%', left: '95%', size: 36, rotate: -12, color: 'var(--red)' },
     { Icon: Package, top: '48%', left: '98%', size: 32, rotate: 8, color: 'var(--blueprint)' },
+    { Icon: Leaf, top: '65%', left: '1%', size: 26, rotate: 25, color: 'var(--green)', opacity: 0.08 },
+    { Icon: ShoppingCart, top: '30%', left: '2%', size: 28, rotate: -8, color: 'var(--amber-deep)', opacity: 0.08 },
+    { Icon: Tag, top: '70%', left: '99%', size: 24, rotate: -18, color: 'var(--red)', opacity: 0.07 },
+    { Icon: Apple, top: '18%', left: '99%', size: 26, rotate: 14, color: 'var(--green)', opacity: 0.08 },
+    { Icon: ShoppingBasket, top: '99%', left: '55%', size: 30, rotate: -6, color: 'var(--amber)', opacity: 0.07 },
+    { Icon: Leaf, top: '2%', left: '55%', size: 22, rotate: 20, color: 'var(--amber-deep)', opacity: 0.06 },
+    { Icon: Package, top: '80%', left: '2%', size: 24, rotate: -10, color: 'var(--red)', opacity: 0.07 },
+    { Icon: Tag, top: '40%', left: '1%', size: 20, rotate: 30, color: 'var(--green)', opacity: 0.06 },
+    { Icon: ShoppingCart, top: '55%', left: '99%', size: 24, rotate: -22, color: 'var(--blueprint)', opacity: 0.07 },
+    { Icon: Apple, top: '99%', left: '25%', size: 22, rotate: 12, color: 'var(--amber-deep)', opacity: 0.06 },
   ],
 };
 
@@ -178,14 +202,14 @@ function BackgroundDecor({ variant = 'app' }) {
   const set = DECOR_SETS[variant] || DECOR_SETS.app;
   return (
     <div style={styles.decorLayer} aria-hidden="true">
-      {set.map(({ Icon, top, left, size, rotate, color }, i) => (
+      {set.map(({ Icon, top, left, size, rotate, color, opacity }, i) => (
         <Icon
           key={i}
           size={size}
           color={color}
           strokeWidth={1.4}
           style={{
-            position: 'absolute', top, left, opacity: 0.1,
+            position: 'absolute', top, left, opacity: opacity ?? 0.1,
             transform: `rotate(${rotate}deg)`,
           }}
         />
