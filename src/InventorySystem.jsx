@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { auth, db } from './firebase';
-import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
+import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
   collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot,
 } from 'firebase/firestore';
@@ -162,22 +162,22 @@ const DECOR_SETS = {
     { Icon: ShoppingBasket, top: '72%', left: '8%', size: 54, rotate: 12, color: '#D9A441' },
     { Icon: Apple, top: '14%', left: '86%', size: 42, rotate: 15, color: '#C1503A' },
     { Icon: Tag, top: '80%', left: '88%', size: 38, rotate: -10, color: '#A9701D' },
-    { Icon: Leaf, top: '55%', left: '92%', size: 30, rotate: 30, color: '#5C8A5A', opacity: 0.08 },
+    { Icon: Leaf, top: '55%', left: '92%', size: 30, rotate: 30, color: '#5C8A5A', opacity: 0.21 },
     { Icon: ShoppingCart, top: '85%', left: '48%', size: 40, rotate: -6, color: '#2F4A32' },
-    { Icon: Package, top: '4%', left: '46%', size: 30, rotate: 8, color: '#A9701D', opacity: 0.08 },
-    { Icon: Leaf, top: '38%', left: '4%', size: 26, rotate: -35, color: '#5C8A5A', opacity: 0.09 },
-    { Icon: Tag, top: '25%', left: '95%', size: 26, rotate: -22, color: '#C1503A', opacity: 0.08 },
-    { Icon: Apple, top: '92%', left: '18%', size: 30, rotate: 20, color: '#5C8A5A', opacity: 0.09 },
-    { Icon: ShoppingBasket, top: '48%', left: '2%', size: 24, rotate: -10, color: '#D9A441', opacity: 0.07 },
-    { Icon: Leaf, top: '95%', left: '68%', size: 34, rotate: 12, color: '#2F4A32', opacity: 0.08 },
-    { Icon: ShoppingCart, top: '2%', left: '68%', size: 24, rotate: 18, color: '#A9701D', opacity: 0.07 },
-    { Icon: Apple, top: '65%', left: '3%', size: 22, rotate: -14, color: '#C1503A', opacity: 0.07 },
-    { Icon: Package, top: '35%', left: '78%', size: 28, rotate: -6, color: '#2F4A32', opacity: 0.07 },
-    { Icon: Tag, top: '60%', left: '38%', size: 20, rotate: 26, color: '#D9A441', opacity: 0.06 },
-    { Icon: Leaf, top: '15%', left: '58%', size: 22, rotate: -40, color: '#5C8A5A', opacity: 0.07 },
-    { Icon: ShoppingBasket, top: '30%', left: '30%', size: 20, rotate: 15, color: '#A9701D', opacity: 0.06 },
-    { Icon: Apple, top: '5%', left: '25%', size: 24, rotate: 10, color: '#C1503A', opacity: 0.07 },
-    { Icon: ShoppingCart, top: '78%', left: '75%', size: 26, rotate: -12, color: '#2F4A32', opacity: 0.07 },
+    { Icon: Package, top: '4%', left: '46%', size: 30, rotate: 8, color: '#A9701D', opacity: 0.21 },
+    { Icon: Leaf, top: '38%', left: '4%', size: 26, rotate: -35, color: '#5C8A5A', opacity: 0.23 },
+    { Icon: Tag, top: '25%', left: '95%', size: 26, rotate: -22, color: '#C1503A', opacity: 0.21 },
+    { Icon: Apple, top: '92%', left: '18%', size: 30, rotate: 20, color: '#5C8A5A', opacity: 0.23 },
+    { Icon: ShoppingBasket, top: '48%', left: '2%', size: 24, rotate: -10, color: '#D9A441', opacity: 0.18 },
+    { Icon: Leaf, top: '95%', left: '68%', size: 34, rotate: 12, color: '#2F4A32', opacity: 0.21 },
+    { Icon: ShoppingCart, top: '2%', left: '68%', size: 24, rotate: 18, color: '#A9701D', opacity: 0.18 },
+    { Icon: Apple, top: '65%', left: '3%', size: 22, rotate: -14, color: '#C1503A', opacity: 0.18 },
+    { Icon: Package, top: '35%', left: '78%', size: 28, rotate: -6, color: '#2F4A32', opacity: 0.18 },
+    { Icon: Tag, top: '60%', left: '38%', size: 20, rotate: 26, color: '#D9A441', opacity: 0.16 },
+    { Icon: Leaf, top: '15%', left: '58%', size: 22, rotate: -40, color: '#5C8A5A', opacity: 0.18 },
+    { Icon: ShoppingBasket, top: '30%', left: '30%', size: 20, rotate: 15, color: '#A9701D', opacity: 0.16 },
+    { Icon: Apple, top: '5%', left: '25%', size: 24, rotate: 10, color: '#C1503A', opacity: 0.18 },
+    { Icon: ShoppingCart, top: '78%', left: '75%', size: 26, rotate: -12, color: '#2F4A32', opacity: 0.18 },
   ],
   app: [
     { Icon: Leaf, top: '4%', left: '3%', size: 40, rotate: -20, color: 'var(--green)' },
@@ -185,16 +185,16 @@ const DECOR_SETS = {
     { Icon: Tag, top: '8%', left: '97%', size: 34, rotate: 16, color: 'var(--amber-deep)' },
     { Icon: Apple, top: '92%', left: '95%', size: 36, rotate: -12, color: 'var(--red)' },
     { Icon: Package, top: '48%', left: '98%', size: 32, rotate: 8, color: 'var(--blueprint)' },
-    { Icon: Leaf, top: '65%', left: '1%', size: 26, rotate: 25, color: 'var(--green)', opacity: 0.08 },
-    { Icon: ShoppingCart, top: '30%', left: '2%', size: 28, rotate: -8, color: 'var(--amber-deep)', opacity: 0.08 },
-    { Icon: Tag, top: '70%', left: '99%', size: 24, rotate: -18, color: 'var(--red)', opacity: 0.07 },
-    { Icon: Apple, top: '18%', left: '99%', size: 26, rotate: 14, color: 'var(--green)', opacity: 0.08 },
-    { Icon: ShoppingBasket, top: '99%', left: '55%', size: 30, rotate: -6, color: 'var(--amber)', opacity: 0.07 },
-    { Icon: Leaf, top: '2%', left: '55%', size: 22, rotate: 20, color: 'var(--amber-deep)', opacity: 0.06 },
-    { Icon: Package, top: '80%', left: '2%', size: 24, rotate: -10, color: 'var(--red)', opacity: 0.07 },
-    { Icon: Tag, top: '40%', left: '1%', size: 20, rotate: 30, color: 'var(--green)', opacity: 0.06 },
-    { Icon: ShoppingCart, top: '55%', left: '99%', size: 24, rotate: -22, color: 'var(--blueprint)', opacity: 0.07 },
-    { Icon: Apple, top: '99%', left: '25%', size: 22, rotate: 12, color: 'var(--amber-deep)', opacity: 0.06 },
+    { Icon: Leaf, top: '65%', left: '1%', size: 26, rotate: 25, color: 'var(--green)', opacity: 0.21 },
+    { Icon: ShoppingCart, top: '30%', left: '2%', size: 28, rotate: -8, color: 'var(--amber-deep)', opacity: 0.21 },
+    { Icon: Tag, top: '70%', left: '99%', size: 24, rotate: -18, color: 'var(--red)', opacity: 0.18 },
+    { Icon: Apple, top: '18%', left: '99%', size: 26, rotate: 14, color: 'var(--green)', opacity: 0.21 },
+    { Icon: ShoppingBasket, top: '99%', left: '55%', size: 30, rotate: -6, color: 'var(--amber)', opacity: 0.18 },
+    { Icon: Leaf, top: '2%', left: '55%', size: 22, rotate: 20, color: 'var(--amber-deep)', opacity: 0.16 },
+    { Icon: Package, top: '80%', left: '2%', size: 24, rotate: -10, color: 'var(--red)', opacity: 0.18 },
+    { Icon: Tag, top: '40%', left: '1%', size: 20, rotate: 30, color: 'var(--green)', opacity: 0.16 },
+    { Icon: ShoppingCart, top: '55%', left: '99%', size: 24, rotate: -22, color: 'var(--blueprint)', opacity: 0.18 },
+    { Icon: Apple, top: '99%', left: '25%', size: 22, rotate: 12, color: 'var(--amber-deep)', opacity: 0.16 },
   ],
 };
 
@@ -209,7 +209,7 @@ function BackgroundDecor({ variant = 'app' }) {
           color={color}
           strokeWidth={1.4}
           style={{
-            position: 'absolute', top, left, opacity: opacity ?? 0.1,
+            position: 'absolute', top, left, opacity: opacity ?? 0.24,
             transform: `rotate(${rotate}deg)`,
           }}
         />
@@ -221,6 +221,10 @@ function BackgroundDecor({ variant = 'app' }) {
 export default function InventorySystem() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [myProfile, setMyProfile] = useState(null);
+  const [profileChecked, setProfileChecked] = useState(false);
+  const [pendingUsers, setPendingUsers] = useState([]);
+  const [approvedUsers, setApprovedUsers] = useState([]);
   const [items, setItems] = useState([]);
   const [movements, setMovements] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
@@ -254,9 +258,72 @@ export default function InventorySystem() {
     return unsub;
   }, []);
 
+  // Approval: ensure a users/{uid} profile exists, then subscribe to it live
+  useEffect(() => {
+    if (!user) { setMyProfile(null); setProfileChecked(false); return; }
+    let unsub;
+    setProfileChecked(false);
+    (async () => {
+      try {
+        const ref = doc(db, 'users', user.uid);
+        const snap = await getDoc(ref);
+        if (!snap.exists()) {
+          await setDoc(ref, {
+            email: user.email || '', approved: false, isAdmin: false, createdAt: Date.now(),
+          });
+        }
+      } catch (e) {
+        console.error('Profile bootstrap error:', e);
+      }
+      unsub = onSnapshot(doc(db, 'users', user.uid), (d) => {
+        setMyProfile(d.exists() ? d.data() : null);
+        setProfileChecked(true);
+      });
+    })();
+    return () => { if (unsub) unsub(); };
+  }, [user]);
+
+  // Admin: subscribe to the full users list (Firestore rules only return docs this account can read)
+  useEffect(() => {
+    if (!user || !myProfile?.isAdmin) { setPendingUsers([]); setApprovedUsers([]); return; }
+    const unsub = onSnapshot(collection(db, 'users'), (snap) => {
+      const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setPendingUsers(all.filter((u) => !u.approved));
+      setApprovedUsers(all.filter((u) => u.approved));
+    });
+    return unsub;
+  }, [user, myProfile?.isAdmin]);
+
+  const approveUser = async (uid) => {
+    try {
+      await setDoc(doc(db, 'users', uid), { approved: true }, { merge: true });
+      showToast('Account approved');
+    } catch (e) {
+      showToast('Could not approve — check your connection');
+    }
+  };
+
+  const denyUser = async (uid) => {
+    try {
+      await deleteDoc(doc(db, 'users', uid));
+      showToast('Request removed');
+    } catch (e) {
+      showToast('Could not remove request — check your connection');
+    }
+  };
+
+  const revokeUser = async (uid) => {
+    try {
+      await deleteDoc(doc(db, 'users', uid));
+      showToast('Access revoked');
+    } catch (e) {
+      showToast('Could not revoke access — check your connection');
+    }
+  };
+
   // Data: seed once if empty, then subscribe to live Firestore updates
   useEffect(() => {
-    if (!user) { setLoaded(false); return; }
+    if (!user || !myProfile?.approved) { setLoaded(false); return; }
     let unsubs = [];
     let cancelled = false;
 
@@ -316,7 +383,7 @@ export default function InventorySystem() {
     })();
 
     return () => { cancelled = true; unsubs.forEach((u) => u()); };
-  }, [user]);
+  }, [user, myProfile?.approved]);
 
   const showToast = (msg) => {
     setToast(msg);
@@ -599,6 +666,21 @@ export default function InventorySystem() {
     return <LoginScreen />;
   }
 
+  if (!profileChecked) {
+    return (
+      <div style={{ ...styles.wrap, alignItems: 'center', justifyContent: 'center', display: 'flex' }}>
+        <style>{FONT_IMPORT}</style>
+        <div style={{ fontFamily: "'Quicksand', sans-serif", color: 'var(--line)', letterSpacing: '0.08em' }}>
+          CHECKING YOUR ACCOUNT…
+        </div>
+      </div>
+    );
+  }
+
+  if (myProfile && !myProfile.approved) {
+    return <PendingApprovalScreen email={user.email} />;
+  }
+
   if (!loaded) {
     return (
       <div style={{ ...styles.wrap, alignItems: 'center', justifyContent: 'center', display: 'flex' }}>
@@ -647,7 +729,7 @@ export default function InventorySystem() {
 
       <BackgroundDecor variant="app" />
 
-      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} />
+      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} isAdmin={!!myProfile?.isAdmin} pendingCount={pendingUsers.length} />
 
       <main style={styles.main} className="depot-scroll depot-main">
         <TopBar
@@ -722,6 +804,17 @@ export default function InventorySystem() {
             histSearch={histSearch} setHistSearch={setHistSearch}
             histType={histType} setHistType={setHistType}
             histItem={histItem} setHistItem={setHistItem}
+          />
+        )}
+
+        {view === 'approvals' && myProfile?.isAdmin && (
+          <TeamAccessView
+            pendingUsers={pendingUsers}
+            approvedUsers={approvedUsers}
+            currentUid={user.uid}
+            onApprove={approveUser}
+            onDeny={denyUser}
+            onRevoke={revokeUser}
           />
         )}
       </main>
@@ -805,22 +898,52 @@ export default function InventorySystem() {
 }
 
 function LoginScreen() {
+  const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
+  const friendlyError = (err) => {
+    const code = err?.code || '';
+    if (code === 'auth/email-already-in-use') return 'That email already has an account. Try signing in instead.';
+    if (code === 'auth/invalid-email') return 'That email address doesn\'t look right.';
+    if (code === 'auth/weak-password') return 'Password should be at least 6 characters.';
+    if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+      return 'Sign-in failed. Check your email and password.';
+    }
+    return mode === 'signup' ? 'Could not create your account. Please try again.' : 'Sign-in failed. Check your email and password.';
+  };
 
   const submit = async (e) => {
     e.preventDefault();
     setError('');
+
+    if (mode === 'signup' && password !== confirmPassword) {
+      setError('Passwords don\'t match.');
+      return;
+    }
+
     setBusy(true);
     try {
-      await signInWithEmailAndPassword(auth, email.trim(), password);
+      if (mode === 'signup') {
+        await createUserWithEmailAndPassword(auth, email.trim(), password);
+      } else {
+        await signInWithEmailAndPassword(auth, email.trim(), password);
+      }
     } catch (err) {
-      setError('Sign-in failed. Check your email and password.');
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
+  };
+
+  const switchMode = () => {
+    setMode(mode === 'signin' ? 'signup' : 'signin');
+    setError('');
+    setPassword('');
+    setConfirmPassword('');
   };
 
   return (
@@ -844,10 +967,10 @@ function LoginScreen() {
           <img src={LOGO_DATA_URI} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
         </div>
         <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: '#3B2A1F' }}>
-          Welcome Back!
+          {mode === 'signup' ? 'Create Your Account' : 'Welcome Back!'}
         </div>
         <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 20 }}>
-          Sign in to Your RAS Client Account
+          {mode === 'signup' ? 'Sign up for a RAS Client Account' : 'Sign in to Your RAS Client Account'}
         </div>
         <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Email</label>
         <input
@@ -857,21 +980,82 @@ function LoginScreen() {
         <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Password</label>
         <input
           type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
-          style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
+          style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: mode === 'signup' ? 14 : 16, boxSizing: 'border-box' }}
         />
+        {mode === 'signup' && (
+          <>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Confirm Password</label>
+            <input
+              type="password" required value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
+            />
+          </>
+        )}
         {error && <div style={{ fontSize: 12.5, color: '#C1503A', marginBottom: 12 }}>{error}</div>}
         <button type="submit" disabled={busy} style={{
           width: '100%', background: '#2F4A32', color: '#fff', border: 'none', borderRadius: 6,
           padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: busy ? 0.6 : 1,
         }}>
-          {busy ? 'Signing in…' : 'Sign In'}
+          {busy ? (mode === 'signup' ? 'Creating account…' : 'Signing in…') : (mode === 'signup' ? 'Sign Up' : 'Sign In')}
         </button>
+        <div style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>
+          {mode === 'signup' ? 'Already have an account?' : "Don't have an account?"}{' '}
+          <button type="button" onClick={switchMode} style={{
+            background: 'none', border: 'none', padding: 0, color: '#2F4A32', fontWeight: 600,
+            cursor: 'pointer', textDecoration: 'underline', fontSize: 12.5,
+          }}>
+            {mode === 'signup' ? 'Sign In' : 'Sign Up'}
+          </button>
+        </div>
       </form>
     </div>
   );
 }
 
-function Sidebar({ view, setView, lowCount }) {
+function PendingApprovalScreen({ email }) {
+  return (
+    <div style={{
+      minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'var(--paper, #F7EFDD)', fontFamily: "'Nunito', sans-serif", borderRadius: 8,
+      position: 'relative', overflow: 'hidden',
+    }}>
+      <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
+      <BackgroundDecor variant="login" />
+      <div className="depot-login-form" style={{
+        background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
+        boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(217,164,65,0.15)',
+        border: '1px solid rgba(217,164,65,0.35)', position: 'relative', zIndex: 1,
+      }}>
+        <div style={{
+          width: 52, height: 52, borderRadius: '50%', background: 'var(--amber, #D9A441)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px',
+        }}>
+          <Clock size={26} color="#fff" />
+        </div>
+        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 19, marginBottom: 8, color: '#3B2A1F' }}>
+          Awaiting Approval
+        </div>
+        <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
+          Your account (<strong>{email}</strong>) has been created, but an administrator needs to approve it before you can access Stock It.
+        </div>
+        <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginTop: 10, marginBottom: 22 }}>
+          This page will update automatically once you're approved — no need to refresh.
+        </div>
+        <button
+          onClick={() => signOut(auth)}
+          style={{
+            width: '100%', background: 'transparent', border: '1px solid rgba(59,42,31,0.2)', color: '#3B2A1F',
+            borderRadius: 6, padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer',
+          }}
+        >
+          Sign Out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ view, setView, lowCount, isAdmin, pendingCount }) {
   const items = [
     { key: 'overview', label: 'Overview', icon: LayoutGrid },
     { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
@@ -882,6 +1066,7 @@ function Sidebar({ view, setView, lowCount }) {
     { key: 'delivery', label: 'Delivery Times', icon: Timer },
     { key: 'sales', label: 'Sales History', icon: Receipt },
     { key: 'history', label: 'Transaction History', icon: ScrollText },
+    ...(isAdmin ? [{ key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount }] : []),
   ];
   return (
     <aside style={styles.sidebar} className="depot-sidebar">
@@ -891,7 +1076,7 @@ function Sidebar({ view, setView, lowCount }) {
         </div>
       </div>
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 28 }} className="depot-sidebar-nav">
-        {items.map(({ key, label, icon: Icon }) => (
+        {items.map(({ key, label, icon: Icon, badge }) => (
           <button
             key={key}
             className={`depot-btn depot-nav-btn${view === key ? ' depot-nav-active' : ''}`}
@@ -907,6 +1092,9 @@ function Sidebar({ view, setView, lowCount }) {
             <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{label}</span>
             {key === 'inventory' && lowCount > 0 && (
               <span style={styles.navBadge}>{lowCount}</span>
+            )}
+            {key === 'approvals' && badge > 0 && (
+              <span style={styles.navBadge}>{badge}</span>
             )}
           </button>
         ))}
@@ -940,6 +1128,7 @@ function TopBar({ view, onAdd }) {
     delivery: ['Delivery Times', 'Lead times and expected restocks'],
     sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
+    approvals: ['Team Access', 'Approve sign-ups and manage accounts'],
   };
   const [title, sub] = titles[view];
   const showAdd = view === 'inventory' || view === 'suppliers';
@@ -1550,6 +1739,61 @@ function SalesHistoryView({ sales }) {
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, onApprove, onDeny, onRevoke }) {
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={styles.panel}>
+        <div style={styles.panelHeader}>
+          <User size={15} />
+          <span>PENDING APPROVAL ({pendingUsers.length})</span>
+        </div>
+        {pendingUsers.length === 0 ? (
+          <div style={styles.emptyState}>No sign-ups waiting on approval.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+            {pendingUsers.map((u) => (
+              <div key={u.id} style={styles.watchRow}>
+                <div>
+                  <div style={styles.watchSku}>{u.email}</div>
+                  <div style={styles.watchName}>Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}</div>
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onApprove(u.id)}>Approve</button>
+                  <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onDeny(u.id)}>Deny</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={{ ...styles.panel, marginTop: 16 }}>
+        <div style={styles.panelHeader}>
+          <CheckCircle2 size={15} />
+          <span>TEAM MEMBERS ({approvedUsers.length})</span>
+        </div>
+        {approvedUsers.length === 0 ? (
+          <div style={styles.emptyState}>No approved accounts yet.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+            {approvedUsers.map((u) => (
+              <div key={u.id} style={styles.watchRow}>
+                <div>
+                  <div style={styles.watchSku}>{u.email}</div>
+                  <div style={styles.watchName}>{u.isAdmin ? 'Administrator' : 'Team member'}{u.id === currentUid ? ' (you)' : ''}</div>
+                </div>
+                {u.id !== currentUid && (
+                  <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onRevoke(u.id)}>Revoke</button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
