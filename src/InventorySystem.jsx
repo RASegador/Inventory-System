@@ -152,6 +152,19 @@ function getSupplierIds(item) {
   return item?.supplierId ? [item.supplierId] : [];
 }
 
+// Items store the acquisition cost as `unitCost` ("Base Cost" in the UI -
+// this already meant "cost basis" even before markup/pricing existed, so
+// no field rename/migration needed). Selling price is derived from that
+// base cost plus a markup, either a percentage on top of cost or a flat
+// peso amount added to it, then persisted on the item as `sellingPrice` so
+// POS and profit calculations don't need to recompute it every time.
+function computeSellingPrice(baseCost, markupType, markupValue) {
+  const cost = Math.max(0, Number(baseCost) || 0);
+  const markup = Math.max(0, Number(markupValue) || 0);
+  const price = markupType === 'fixed' ? cost + markup : cost * (1 + markup / 100);
+  return Math.round(price * 100) / 100;
+}
+
 function ExportBar({ onPrint, onDownload }) {
   return (
     <div className="depot-no-print depot-export-bar" style={styles.exportBar}>
@@ -813,8 +826,12 @@ export default function InventorySystem() {
   const saveItem = async (draft) => {
     if (!can(myRole, 'editInventory')) { showToast("You don't have permission to edit inventory"); return; }
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
+    const unitCost = Math.max(0, Number(draft.unitCost) || 0);
+    const markupType = draft.markupType === 'fixed' ? 'fixed' : 'percent';
+    const markupValue = Math.max(0, Number(draft.markupValue) || 0);
+    const sellingPrice = computeSellingPrice(unitCost, markupType, markupValue);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, unitCost, markupType, markupValue, sellingPrice });
       showToast(draft.id ? `Updated ${draft.sku}` : `Added ${draft.sku} to the manifest`);
     } catch (e) {
       showToast('Could not save item — check your connection');
@@ -990,16 +1007,23 @@ export default function InventorySystem() {
     const now = Date.now();
     const saleLines = cartLines.map((line) => {
       const item = items.find((i) => i.id === line.itemId);
+      // Fall back to unitCost for items saved before markup/pricing existed
+      // (they've never had a sellingPrice computed and stored yet).
+      const price = item.sellingPrice ?? item.unitCost;
+      const cost = item.unitCost;
       return {
         itemId: item.id, sku: item.sku, name: item.name,
-        qty: line.qty, unitPrice: item.unitCost, lineTotal: item.unitCost * line.qty,
+        qty: line.qty, unitPrice: price, unitCost: cost,
+        lineTotal: price * line.qty, lineProfit: (price - cost) * line.qty,
       };
     });
     const subtotal = saleLines.reduce((s, l) => s + l.lineTotal, 0);
+    const totalCost = saleLines.reduce((s, l) => s + l.unitCost * l.qty, 0);
+    const totalProfit = saleLines.reduce((s, l) => s + l.lineProfit, 0);
     const total = subtotal;
     const sale = {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
-      subtotal, total, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '', ownerId,
+      subtotal, total, totalCost, totalProfit, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '', ownerId,
     };
 
     try {
@@ -1146,6 +1170,37 @@ export default function InventorySystem() {
     })).filter((c) => c.units > 0);
   }, [items, categories]);
 
+  // Profit is derived entirely from completed (non-cancelled) sales, which
+  // already carry a cost/profit snapshot per line from the moment they were
+  // rung up - so re-pricing an item later never rewrites history here.
+  const profitStats = useMemo(() => {
+    const completed = sales.filter((s) => !s.cancelled);
+    const totalRevenue = completed.reduce((s, sale) => s + (sale.total ?? 0), 0);
+    const totalCost = completed.reduce((s, sale) => s + (sale.totalCost ?? 0), 0);
+    const totalProfit = completed.reduce((s, sale) => s + (sale.totalProfit ?? (sale.total ?? 0) - (sale.totalCost ?? 0)), 0);
+    const margin = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
+
+    const byItem = {};
+    completed.forEach((sale) => {
+      (sale.items || []).forEach((line) => {
+        if (!byItem[line.itemId]) byItem[line.itemId] = { itemId: line.itemId, sku: line.sku, name: line.name, qty: 0, profit: 0 };
+        byItem[line.itemId].qty += line.qty;
+        byItem[line.itemId].profit += line.lineProfit ?? ((line.unitPrice ?? 0) - (line.unitCost ?? 0)) * line.qty;
+      });
+    });
+    const profitByItem = Object.values(byItem).sort((a, b) => b.profit - a.profit);
+
+    const perSale = completed
+      .slice(0, 8)
+      .map((s) => ({
+        id: s.id, receiptNo: s.receiptNo, timestamp: s.timestamp,
+        revenue: s.total ?? 0, cost: s.totalCost ?? 0,
+        profit: s.totalProfit ?? (s.total ?? 0) - (s.totalCost ?? 0),
+      }));
+
+    return { totalRevenue, totalCost, totalProfit, margin, profitByItem, perSale };
+  }, [sales]);
+
   const filteredMovements = useMemo(() => {
     return movements.filter((m) => {
       const item = items.find((i) => i.id === m.itemId);
@@ -1271,7 +1326,7 @@ export default function InventorySystem() {
         ) : (
         <>
         {view === 'overview' && (
-          <Overview totals={totals} categoryData={categoryData} onQuickMove={(it) => setMoveModal(it)} />
+          <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} role={myRole} onQuickMove={(it) => setMoveModal(it)} />
         )}
 
         {view === 'inventory' && (
@@ -1905,7 +1960,8 @@ function StatCard({ icon: Icon, label, value, accent }) {
   );
 }
 
-function Overview({ totals, categoryData, onQuickMove }) {
+function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
+  const canViewProfit = can(role, 'viewReports');
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <div style={styles.statGrid} className="depot-stat-grid">
@@ -1968,6 +2024,71 @@ function Overview({ totals, categoryData, onQuickMove }) {
           )}
         </div>
       </div>
+
+      {/* Profit is commercially sensitive (it reveals cost basis and
+          margins) - only managers who can already view Reports get to see
+          it. Staff never see this section, even though they see Overview. */}
+      {canViewProfit && (
+        <>
+          <div style={{ ...styles.panelHeader, marginTop: 24, marginBottom: 10 }}>
+            <PesoIcon size={15} />
+            <span>PROFIT TRACKER</span>
+          </div>
+
+          <div style={styles.statGrid} className="depot-stat-grid">
+            <StatCard icon={PesoIcon} label="Total Profit" value={currency(profitStats.totalProfit)} accent={profitStats.totalProfit >= 0 ? 'var(--green)' : 'var(--red)'} />
+            <StatCard icon={Receipt} label="Total Revenue" value={currency(profitStats.totalRevenue)} accent="var(--blueprint)" />
+            <StatCard icon={Package} label="Cost of Goods Sold" value={currency(profitStats.totalCost)} accent="#2E5C87" />
+            <StatCard icon={CheckCircle2} label="Profit Margin" value={`${profitStats.margin.toFixed(1)}%`} accent={profitStats.margin >= 0 ? 'var(--green)' : 'var(--red)'} />
+          </div>
+
+          <div style={styles.overviewGrid} className="depot-overview-grid">
+            <div style={styles.panel}>
+              <div style={styles.panelHeader}>
+                <Boxes size={15} />
+                <span>PROFIT BY ITEM</span>
+              </div>
+              {profitStats.profitByItem.length === 0 ? (
+                <div style={styles.emptyState}>No completed sales yet.</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10, maxHeight: 240, overflowY: 'auto' }} className="depot-scroll">
+                  {profitStats.profitByItem.slice(0, 10).map((row) => (
+                    <div key={row.itemId} style={styles.watchRow}>
+                      <div>
+                        <div style={styles.watchSku}>{row.sku}</div>
+                        <div style={styles.watchName}>{row.name} · {row.qty} sold</div>
+                      </div>
+                      <span style={{ fontWeight: 700, color: row.profit >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(row.profit)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={styles.panel}>
+              <div style={styles.panelHeader}>
+                <Receipt size={15} />
+                <span>PROFIT PER SALE</span>
+              </div>
+              {profitStats.perSale.length === 0 ? (
+                <div style={styles.emptyState}>No completed sales yet.</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10, maxHeight: 240, overflowY: 'auto' }} className="depot-scroll">
+                  {profitStats.perSale.map((s) => (
+                    <div key={s.id} style={styles.watchRow}>
+                      <div>
+                        <div style={styles.watchSku}>{s.receiptNo}</div>
+                        <div style={styles.watchName}>{formatDate(s.timestamp)} · Revenue {currency(s.revenue)}</div>
+                      </div>
+                      <span style={{ fontWeight: 700, color: s.profit >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(s.profit)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1976,10 +2097,10 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
   const supplierNames = (it) => getSupplierIds(it).map((sid) => supplierMap[sid]?.name).filter(Boolean);
 
   const handleDownload = () => {
-    const headers = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Unit Cost', 'Value'];
+    const headers = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Value'];
     const rows = filtered.map((it) => [
       it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
-      it.quantity, it.unitCost.toFixed(2), (it.quantity * it.unitCost).toFixed(2),
+      it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2), (it.quantity * it.unitCost).toFixed(2),
     ]);
     downloadCSV('inventory.csv', headers, rows);
   };
@@ -2018,14 +2139,14 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
         <table style={styles.table} className="depot-table">
           <thead>
             <tr>
-              {['SKU', 'Item', 'Category', 'Suppliers', 'Location', 'Qty', 'Unit Cost', 'Value', ...(showActionsCol ? [''] : [])].map((h) => (
+              {['SKU', 'Item', 'Category', 'Suppliers', 'Location', 'Qty', 'Base Cost', 'Selling Price', 'Value', ...(showActionsCol ? [''] : [])].map((h) => (
                 <th key={h} style={styles.th}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {filtered.length === 0 && (
-              <tr><td colSpan={9} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your search.</td></tr>
+              <tr><td colSpan={10} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your search.</td></tr>
             )}
             {filtered.map((it) => {
               const low = it.quantity <= it.reorderPoint;
@@ -2046,6 +2167,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                     {low && <AlertTriangle size={12} color="var(--red)" style={{ marginLeft: 5, verticalAlign: -1 }} />}
                   </td>
                   <td style={styles.td}>{currency(it.unitCost)}</td>
+                  <td style={styles.td}>{currency(it.sellingPrice ?? it.unitCost)}</td>
                   <td style={styles.td}>{currency(it.quantity * it.unitCost)}</td>
                   {showActionsCol && (
                     <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
@@ -2420,6 +2542,7 @@ function POSView({ items, onCompleteSale }) {
   }, [sellable, search]);
 
   const itemMap = useMemo(() => Object.fromEntries(items.map((i) => [i.id, i])), [items]);
+  const priceOf = (item) => item.sellingPrice ?? item.unitCost;
 
   const addToCart = (item) => {
     setLastReceipt(null);
@@ -2446,7 +2569,7 @@ function POSView({ items, onCompleteSale }) {
 
   const removeLine = (itemId) => setCart((prev) => prev.filter((l) => l.itemId !== itemId));
 
-  const subtotal = cart.reduce((s, l) => s + (itemMap[l.itemId]?.unitCost ?? 0) * l.qty, 0);
+  const subtotal = cart.reduce((s, l) => s + priceOf(itemMap[l.itemId] || {}) * l.qty, 0);
   const total = subtotal;
 
   const [busy, setBusy] = useState(false);
@@ -2486,7 +2609,7 @@ function POSView({ items, onCompleteSale }) {
               <div style={styles.posItemSku}>{it.sku}</div>
               <div style={styles.posItemName}>{it.name}</div>
               <div style={styles.posItemFooter}>
-                <span>{currency(it.unitCost)}</span>
+                <span>{currency(priceOf(it))}</span>
                 <span style={{ color: 'rgba(59,42,31,0.5)' }}>{it.quantity} in stock</span>
               </div>
             </button>
@@ -2519,7 +2642,7 @@ function POSView({ items, onCompleteSale }) {
                     <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.itemId, 1)}><Plus size={12} /></button>
                   </div>
                   <div style={{ width: 72, textAlign: 'right', fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
-                    {currency(item.unitCost * line.qty)}
+                    {currency(priceOf(item) * line.qty)}
                   </div>
                   <IconBtn onClick={() => removeLine(line.itemId)} title="Remove" danger><X size={13} /></IconBtn>
                 </div>
@@ -3432,12 +3555,20 @@ function IconBtn({ children, onClick, title, danger, className }) {
 function ItemModal({ draft, suppliers, categories, locations, onClose, onSave }) {
   const [form, setForm] = useState(() => {
     if (!draft) {
-      return { sku: '', name: '', category: categories[0] || '', quantity: 0, reorderPoint: 10, unitCost: 0, location: locations[0] || '', supplierIds: [] };
+      return {
+        sku: '', name: '', category: categories[0] || '', quantity: 0, reorderPoint: 10, unitCost: 0,
+        location: locations[0] || '', supplierIds: [], markupType: 'percent', markupValue: 0,
+      };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
-    return { ...rest, supplierIds: getSupplierIds(draft) };
+    return {
+      ...rest, supplierIds: getSupplierIds(draft),
+      markupType: draft.markupType === 'fixed' ? 'fixed' : 'percent',
+      markupValue: draft.markupValue ?? 0,
+    };
   });
   const valid = form.sku.trim() && form.name.trim();
+  const sellingPricePreview = computeSellingPrice(form.unitCost, form.markupType, form.markupValue);
   const toggleSupplier = (sid) => {
     setForm({
       ...form,
@@ -3505,9 +3636,27 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
               <input className="depot-input" type="number" style={styles.modalInput} value={form.reorderPoint}
                 onChange={(e) => setForm({ ...form, reorderPoint: Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label="Unit Cost (₱)" grow>
+            <Field label="Base Cost (₱)" grow>
               <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={form.unitCost}
                 onChange={(e) => setForm({ ...form, unitCost: Math.max(0, Number(e.target.value)) })} />
+            </Field>
+          </div>
+          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+            <Field label="Markup Type" grow>
+              <select className="depot-select" style={styles.modalInput} value={form.markupType}
+                onChange={(e) => setForm({ ...form, markupType: e.target.value })}>
+                <option value="percent">Percentage</option>
+                <option value="fixed">Fixed Amount (₱)</option>
+              </select>
+            </Field>
+            <Field label={form.markupType === 'fixed' ? 'Markup (₱)' : 'Markup (%)'} grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.markupValue}
+                onChange={(e) => setForm({ ...form, markupValue: Math.max(0, Number(e.target.value)) })} />
+            </Field>
+            <Field label="Selling Price" grow>
+              <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(79,138,99,0.08)', fontWeight: 700, color: 'var(--green)' }}>
+                {currency(sellingPricePreview)}
+              </div>
             </Field>
           </div>
         </div>
