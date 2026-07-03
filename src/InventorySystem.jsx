@@ -2035,6 +2035,7 @@ function POSView({ items, onCompleteSale }) {
 function SalesHistoryView({ sales, role, onCancelSale }) {
   const canCancel = can(role, 'cancelSales');
   const [cashierFilter, setCashierFilter] = useState('All');
+  const [expandedId, setExpandedId] = useState(null);
 
   const cashiers = useMemo(() => {
     const set = new Set(sales.map((s) => s.cashierEmail).filter(Boolean));
@@ -2138,15 +2139,29 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((sale) => (
-                <tr key={sale.id} className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
+              {filtered.map((sale) => {
+                const isOpen = expandedId === sale.id;
+                const colCount = 7 + (canCancel ? 1 : 0);
+                return (
+                <React.Fragment key={sale.id}>
+                <tr className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{sale.receiptNo}</td>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
                   <td style={{ ...styles.td, fontSize: 12.5 }}>{sale.cashierEmail || '—'}</td>
                   <td style={styles.td}>
-                    {sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}
+                    <button
+                      className="depot-btn"
+                      onClick={() => setExpandedId(isOpen ? null : sale.id)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 5, background: 'transparent',
+                        border: 'none', padding: 0, color: 'var(--blueprint)', fontSize: 13, fontFamily: "'Nunito', sans-serif",
+                      }}
+                    >
+                      <ChevronDown size={14} className="depot-no-print" style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s ease' }} />
+                      {sale.items.length} item{sale.items.length === 1 ? '' : 's'}
+                    </button>
                   </td>
                   <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
@@ -2167,8 +2182,37 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
                     </td>
                   )}
                 </tr>
-              ))}
+                {isOpen && (
+                  <tr className="depot-row">
+                    <td colSpan={colCount} style={{ ...styles.td, background: 'rgba(20,33,61,0.02)', padding: '10px 14px' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                        <thead>
+                          <tr>
+                            {['SKU', 'Item', 'Qty', 'Unit Price', 'Line Total'].map((h) => (
+                              <th key={h} style={{ ...styles.th, padding: '4px 8px', fontSize: 10.5 }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sale.items.map((l, i) => (
+                            <tr key={i}>
+                              <td style={{ padding: '4px 8px', fontFamily: "'Quicksand', sans-serif", fontSize: 12 }}>{l.sku}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12 }}>{l.name}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12 }}>{l.qty}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12, fontFamily: "'IBM Plex Mono', monospace" }}>{currency(l.unitPrice)}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{currency(l.lineTotal)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
+                );
+              })}
             </tbody>
+
           </table>
         </div>
       )}
