@@ -241,7 +241,7 @@ const PERMISSIONS = {
     manageCategories: true, manageSuppliers: true, manageLocations: true,
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
-    manageUsers: true, manageAllRoles: false, manageSystem: false,
+    manageUsers: false, manageAllRoles: false, manageSystem: false,
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
@@ -285,6 +285,53 @@ function resolveRole(profile) {
   return 'staff';
 }
 
+// Background/color scheme presets a Super Admin can pick from. Each key
+// matches a CSS custom property already used throughout the app, so
+// switching themes is just re-injecting this block into :root.
+const THEMES = {
+  cozyGrocery: {
+    label: 'Cozy Grocery', swatch: '#5C8A5A',
+    blueprint: '#2F4A32', blueprintDeep: '#16281C', line: '#C9A96A', lineDim: 'rgba(201,169,106,0.28)',
+    paper: '#F7EFDD', paperDim: '#EFE3C8', ink: '#3B2A1F', amber: '#D9A441', amberDeep: '#A9701D',
+    green: '#5C8A5A', red: '#C1503A',
+  },
+  oceanBlue: {
+    label: 'Ocean Blue', swatch: '#0F2A47',
+    blueprint: '#0F2A47', blueprintDeep: '#0A1F38', line: '#7FB3E0', lineDim: 'rgba(127,179,224,0.28)',
+    paper: '#F5F3EC', paperDim: '#EAE7DC', ink: '#14213D', amber: '#E8A33D', amberDeep: '#B87A1E',
+    green: '#4F8A63', red: '#C1543C',
+  },
+  sunsetAmber: {
+    label: 'Sunset Amber', swatch: '#E8823D',
+    blueprint: '#6B3A2E', blueprintDeep: '#4A2419', line: '#F0A868', lineDim: 'rgba(240,168,104,0.28)',
+    paper: '#FBF0E4', paperDim: '#F3E0C8', ink: '#3D2418', amber: '#E8823D', amberDeep: '#C05F1E',
+    green: '#6B8F5A', red: '#C1453A',
+  },
+  slateModern: {
+    label: 'Slate Modern', swatch: '#2A3441',
+    blueprint: '#2A3441', blueprintDeep: '#1A222C', line: '#8FA5BD', lineDim: 'rgba(143,165,189,0.28)',
+    paper: '#F2F4F6', paperDim: '#E4E8EC', ink: '#232B35', amber: '#4A7FB5', amberDeep: '#2F5C8A',
+    green: '#4F8A6E', red: '#C1543C',
+  },
+};
+const DEFAULT_THEME_KEY = 'cozyGrocery';
+
+function themeCssVars(theme) {
+  return `
+          --blueprint: ${theme.blueprint};
+          --blueprint-deep: ${theme.blueprintDeep};
+          --line: ${theme.line};
+          --line-dim: ${theme.lineDim};
+          --paper: ${theme.paper};
+          --paper-dim: ${theme.paperDim};
+          --ink: ${theme.ink};
+          --amber: ${theme.amber};
+          --amber-deep: ${theme.amberDeep};
+          --green: ${theme.green};
+          --red: ${theme.red};
+  `;
+}
+
 export default function InventorySystem() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -292,6 +339,7 @@ export default function InventorySystem() {
   const [profileChecked, setProfileChecked] = useState(false);
   const [pendingUsers, setPendingUsers] = useState([]);
   const [approvedUsers, setApprovedUsers] = useState([]);
+  const [branding, setBranding] = useState(null);
   const [items, setItems] = useState([]);
   const [movements, setMovements] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
@@ -325,6 +373,19 @@ export default function InventorySystem() {
     return unsub;
   }, []);
 
+  // Branding (custom logo + theme): public read, so this works even on the
+  // signed-out login screen. Applies live for everyone the moment a Super
+  // Admin changes it.
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, 'config', 'branding'), (d) => {
+      setBranding(d.exists() ? d.data() : {});
+    }, () => setBranding({}));
+    return unsub;
+  }, []);
+
+  const effectiveLogo = branding?.logoDataUri || LOGO_DATA_URI;
+  const activeTheme = THEMES[branding?.themeKey] || THEMES[DEFAULT_THEME_KEY];
+
   // Approval: ensure a users/{uid} profile exists, then subscribe to it live
   useEffect(() => {
     if (!user) { setMyProfile(null); setProfileChecked(false); return; }
@@ -353,19 +414,17 @@ export default function InventorySystem() {
   const myRole = resolveRole(myProfile);
   const isManager = myRole === 'superadmin' || myRole === 'client';
 
-  // Managers (Client + Super Admin) subscribe to the users list to run Team Access.
-  // Firestore rules only ever return docs this account is allowed to read.
+  // Only Super Admin manages Team Access now - Client no longer sees or
+  // manages other accounts, so there's no reason for Client to subscribe.
   useEffect(() => {
-    if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
+    if (!user || myRole !== 'superadmin') { setPendingUsers([]); setApprovedUsers([]); return; }
     const unsub = onSnapshot(collection(db, 'users'), (snap) => {
-      let all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
-      // A Client only manages Staff accounts - Super Admins and other Clients stay out of view.
-      if (myRole === 'client') all = all.filter((u) => u.role === 'staff');
+      const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
     });
     return unsub;
-  }, [user, isManager, myRole]);
+  }, [user, myRole]);
 
   const approveUser = async (uid) => {
     try {
@@ -403,6 +462,37 @@ export default function InventorySystem() {
       showToast('Could not update role — check your connection');
     }
   };
+
+  const saveLogo = async (dataUri) => {
+    if (myRole !== 'superadmin') return;
+    try {
+      await setDoc(doc(db, 'config', 'branding'), { logoDataUri: dataUri }, { merge: true });
+      showToast('Logo updated for everyone');
+    } catch (e) {
+      showToast('Could not save logo — check your connection');
+    }
+  };
+
+  const resetLogo = async () => {
+    if (myRole !== 'superadmin') return;
+    try {
+      await setDoc(doc(db, 'config', 'branding'), { logoDataUri: null }, { merge: true });
+      showToast('Reverted to the default logo');
+    } catch (e) {
+      showToast('Could not reset logo — check your connection');
+    }
+  };
+
+  const setThemeKey = async (key) => {
+    if (myRole !== 'superadmin') return;
+    try {
+      await setDoc(doc(db, 'config', 'branding'), { themeKey: key }, { merge: true });
+      showToast(`Theme changed to ${THEMES[key]?.label || key}`);
+    } catch (e) {
+      showToast('Could not change theme — check your connection');
+    }
+  };
+
 
   // Data: seed once if empty, then subscribe to live Firestore updates
   useEffect(() => {
@@ -796,7 +886,7 @@ export default function InventorySystem() {
   }
 
   if (!user) {
-    return <LoginScreen />;
+    return <LoginScreen logo={effectiveLogo} theme={activeTheme} />;
   }
 
   if (!profileChecked) {
@@ -831,17 +921,7 @@ export default function InventorySystem() {
         ${FONT_IMPORT}
         ${RESPONSIVE_CSS}
         :root {
-          --blueprint: #2F4A32;
-          --blueprint-deep: #16281C;
-          --line: #C9A96A;
-          --line-dim: rgba(201,169,106,0.28);
-          --paper: #F7EFDD;
-          --paper-dim: #EFE3C8;
-          --ink: #3B2A1F;
-          --amber: #D9A441;
-          --amber-deep: #A9701D;
-          --green: #5C8A5A;
-          --red: #C1503A;
+          ${themeCssVars(activeTheme)}
         }
         * { box-sizing: border-box; }
         .depot-btn { cursor: pointer; border: none; font-family: 'Nunito', sans-serif; transition: all 0.15s ease; }
@@ -862,7 +942,7 @@ export default function InventorySystem() {
 
       <BackgroundDecor variant="app" />
 
-      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} />
+      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} />
 
       <main style={styles.main} className="depot-scroll depot-main">
         <TopBar
@@ -956,6 +1036,10 @@ export default function InventorySystem() {
             onDeny={denyUser}
             onRevoke={revokeUser}
             onChangeRole={changeUserRole}
+            branding={branding}
+            onSaveLogo={saveLogo}
+            onResetLogo={resetLogo}
+            onSetTheme={setThemeKey}
           />
         )}
         </>
@@ -1049,7 +1133,8 @@ export default function InventorySystem() {
   );
 }
 
-function LoginScreen() {
+function LoginScreen({ logo, theme }) {
+  const t = theme || THEMES[DEFAULT_THEME_KEY];
   const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -1101,24 +1186,24 @@ function LoginScreen() {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'var(--paper, #F7EFDD)', fontFamily: "'Nunito', sans-serif", borderRadius: 8,
+      background: t.paper, fontFamily: "'Nunito', sans-serif", borderRadius: 8,
       position: 'relative', overflow: 'hidden',
     }}>
       <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
       <BackgroundDecor variant="login" />
       <form onSubmit={submit} className="depot-login-form" style={{
         background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 360,
-        boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(217,164,65,0.15)',
-        border: '1px solid rgba(217,164,65,0.35)', position: 'relative', zIndex: 1,
+        boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
+        border: `1px solid ${t.lineDim}`, position: 'relative', zIndex: 1,
       }}>
         <div style={{
-          background: 'linear-gradient(135deg, #FFFCF5 0%, #F7EFDD 100%)',
+          background: `linear-gradient(135deg, #FFFCF5 0%, ${t.paper} 100%)`,
           borderRadius: 10, padding: '14px 14px 10px', marginBottom: 20,
-          border: '1px solid rgba(217,164,65,0.25)',
+          border: `1px solid ${t.lineDim}`,
         }}>
-          <img src={LOGO_DATA_URI} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+          <img src={logo} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
         </div>
-        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: '#3B2A1F' }}>
+        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
           {mode === 'signup' ? 'Create Your Account' : 'Welcome Back!'}
         </div>
         <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 20 }}>
@@ -1143,9 +1228,9 @@ function LoginScreen() {
             />
           </>
         )}
-        {error && <div style={{ fontSize: 12.5, color: '#C1503A', marginBottom: 12 }}>{error}</div>}
+        {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
         <button type="submit" disabled={busy} style={{
-          width: '100%', background: '#2F4A32', color: '#fff', border: 'none', borderRadius: 6,
+          width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
           padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: busy ? 0.6 : 1,
         }}>
           {busy ? (mode === 'signup' ? 'Creating account…' : 'Signing in…') : (mode === 'signup' ? 'Sign Up' : 'Sign In')}
@@ -1153,7 +1238,7 @@ function LoginScreen() {
         <div style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>
           {mode === 'signup' ? 'Already have an account?' : "Don't have an account?"}{' '}
           <button type="button" onClick={switchMode} style={{
-            background: 'none', border: 'none', padding: 0, color: '#2F4A32', fontWeight: 600,
+            background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600,
             cursor: 'pointer', textDecoration: 'underline', fontSize: 12.5,
           }}>
             {mode === 'signup' ? 'Sign In' : 'Sign Up'}
@@ -1243,7 +1328,7 @@ function PendingApprovalScreen({ email, missingProfile }) {
   );
 }
 
-function Sidebar({ view, setView, lowCount, role, pendingCount }) {
+function Sidebar({ view, setView, lowCount, role, pendingCount, logo }) {
   const allItems = [
     { key: 'overview', label: 'Overview', icon: LayoutGrid },
     { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
@@ -1261,7 +1346,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount }) {
     <aside style={styles.sidebar} className="depot-sidebar">
       <div style={styles.brand} className="depot-brand">
         <div style={styles.logoCard}>
-          <img src={LOGO_DATA_URI} alt="Company logo" style={styles.logoImg} />
+          <img src={logo} alt="Company logo" style={styles.logoImg} />
         </div>
       </div>
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 28 }} className="depot-sidebar-nav">
@@ -1956,8 +2041,19 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole }) {
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, branding, onSaveLogo, onResetLogo, onSetTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
+  const [logoPreview, setLogoPreview] = useState(null);
+  const activeThemeKey = branding?.themeKey || DEFAULT_THEME_KEY;
+
+  const handleLogoFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setLogoPreview(reader.result);
+    reader.readAsDataURL(file);
+  };
+
   // A Client can only promote/demote within reach of their own permissions -
   // in practice that means they don't get a role selector at all; only
   // Super Admin can reassign roles (staff <-> client <-> superadmin).
@@ -2035,6 +2131,68 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
           </div>
         )}
       </div>
+
+      {isSuperAdmin && (
+        <div style={{ ...styles.panel, marginTop: 16 }}>
+          <div style={styles.panelHeader}>
+            <Package size={15} />
+            <span>APP BRANDING</span>
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Logo</div>
+            <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+              <div style={{ width: 180, background: '#fff', border: '1px solid rgba(20,33,61,0.1)', borderRadius: 8, padding: 10 }}>
+                <img src={logoPreview || branding?.logoDataUri || LOGO_DATA_URI} alt="Current logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <input type="file" accept="image/*" onChange={handleLogoFile} />
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button
+                    className="depot-btn"
+                    style={{ ...styles.smallAmberBtn, opacity: logoPreview ? 1 : 0.45 }}
+                    disabled={!logoPreview}
+                    onClick={() => { onSaveLogo(logoPreview); setLogoPreview(null); }}
+                  >
+                    Save Logo
+                  </button>
+                  <button
+                    className="depot-btn"
+                    style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--ink)', border: '1px solid rgba(20,33,61,0.2)' }}
+                    onClick={() => { onResetLogo(); setLogoPreview(null); }}
+                  >
+                    Reset to Default
+                  </button>
+                </div>
+                <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', maxWidth: 260 }}>
+                  Applies for everyone, including the sign-in screen.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Background / Color Scheme</div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              {Object.entries(THEMES).map(([key, theme]) => (
+                <button
+                  key={key}
+                  className="depot-btn"
+                  onClick={() => onSetTheme(key)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8,
+                    border: activeThemeKey === key ? '2px solid var(--ink)' : '1px solid rgba(20,33,61,0.15)',
+                    background: '#fff', fontSize: 12.5, fontWeight: 500,
+                  }}
+                >
+                  <span style={{ width: 16, height: 16, borderRadius: '50%', background: theme.swatch, display: 'inline-block' }} />
+                  {theme.label}
+                  {activeThemeKey === key && <CheckCircle2 size={13} color="var(--green)" />}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
