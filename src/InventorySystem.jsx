@@ -3,7 +3,7 @@ import { auth, db } from './firebase';
 import { initializeApp, deleteApp } from 'firebase/app';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth,
-  updatePassword, reauthenticateWithCredential, EmailAuthProvider,
+  updatePassword, reauthenticateWithCredential, EmailAuthProvider, sendPasswordResetEmail,
 } from 'firebase/auth';
 import {
   collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
@@ -1614,9 +1614,91 @@ export default function InventorySystem() {
   );
 }
 
+// Starting-point legal content, not legal advice — have a lawyer review
+// before relying on this for real clients, especially the fees/liability
+// and data-handling sections once your actual business terms are settled.
+const TERMS_SECTIONS = [
+  { title: '1. Ownership', body:
+    'Stock IT is developed and operated by Ralph Anthony Segador, doing business as Reliable Automation Solutions ("RAS", "we", "us", "the Developer"). All rights in the Stock IT application not otherwise granted to you under these terms are reserved by Ralph Anthony Segador / RAS.' },
+  { title: '2. Acceptance of Terms', body:
+    'By creating an account or using Stock IT ("the Service"), you agree to these Terms of Service. If you\u2019re signing up on behalf of a business, you\u2019re confirming you have the authority to bind that business to these terms.' },
+  { title: '3. What Stock IT Is', body:
+    'Stock IT is an inventory, point-of-sale, and business-management tool. Each Client Admin account represents an independent business ("tenant"); your inventory, sales, suppliers, and team are kept separate from every other tenant on the platform.' },
+  { title: '4. Accounts', body:
+    'You\u2019re responsible for keeping your login credentials confidential and for all activity under your account. A Client Admin is responsible for the staff accounts they create, including approving who has access and revoking it when appropriate. Notify us promptly if you suspect unauthorized access.' },
+  { title: '5. Acceptable Use', body:
+    'You agree not to use the Service to store or process unlawful content, attempt to access another tenant\u2019s data, interfere with the Service\u2019s operation, or reverse-engineer the platform beyond what\u2019s permitted by law.' },
+  { title: '6. Your Data', body:
+    'You own the business data you put into Stock IT (inventory, sales records, supplier details, and similar). We don\u2019t claim ownership of it, and we don\u2019t sell it. See the Privacy Policy for how it\u2019s handled and stored.' },
+  { title: '7. Fees', body:
+    'Any applicable fees, billing cycle, and payment terms will be communicated to you directly and are not currently defined within the app itself.' },
+  { title: '8. Termination', body:
+    'You may stop using the Service at any time. We may suspend or terminate an account that violates these terms or poses a security risk to the platform or other tenants. Where reasonably possible, we\u2019ll give notice first.' },
+  { title: '9. Service "As Is"', body:
+    'The Service is provided "as is" without warranties of any kind, express or implied, including fitness for a particular purpose or uninterrupted availability. We aim for reliability but can\u2019t guarantee the Service will be error-free at all times.' },
+  { title: '10. Limitation of Liability', body:
+    'To the extent permitted by law, Ralph Anthony Segador and RAS are not liable for indirect, incidental, or consequential damages arising from use of the Service, including loss of business data, revenue, or profits.' },
+  { title: '11. Changes', body:
+    'We may update these terms from time to time. Continued use of the Service after changes take effect constitutes acceptance of the revised terms.' },
+  { title: '12. Contact', body:
+    'Stock IT is developed and maintained by Ralph Anthony Segador of Reliable Automation Solutions (RAS). Questions about these terms can be directed to your Stock IT administrator, or to Ralph Anthony Segador / RAS directly.' },
+];
+
+const PRIVACY_SECTIONS = [
+  { title: '1. Information We Collect', body:
+    'Account information: name, email address, username, contact number, and address (address is optional). Business data you enter: inventory items, suppliers, purchase orders, sales transactions, and related records. Activity information: sign-in and sign-out timestamps, for security and audit purposes.' },
+  { title: '2. How We Use It', body:
+    'To provide and operate the Service, authenticate accounts, enforce role-based access within your business, generate the reports and summaries visible in the app, and maintain security (e.g. the login activity log available to admins).' },
+  { title: '3. Where It\u2019s Stored', body:
+    'Data is stored using Google Firebase (Firestore and Firebase Authentication), hosted on Google Cloud infrastructure. Access is restricted by tenant: your business\u2019s data is isolated from every other business using the Service, enforced at the database level, not just in the app\u2019s interface.' },
+  { title: '4. Data Sharing', body:
+    'We do not sell your data. We do not share it with third parties except: (a) Google/Firebase, as our infrastructure provider, (b) if required by law, or (c) with your explicit direction.' },
+  { title: '5. Data Retention', body:
+    'Your data is retained for as long as your account is active. If you\u2019d like your account and associated data removed, contact your Stock It administrator or Reliable Automation Solutions.' },
+  { title: '6. Your Rights', body:
+    'You can review and update your own profile information at any time from My Profile. You can request a copy of, correction to, or deletion of your data by contacting your administrator.' },
+  { title: '7. Cookies & Local Storage', body:
+    'The Service uses your browser\u2019s local storage only for maintaining your signed-in session (via Firebase Authentication) - not for advertising or third-party tracking.' },
+  { title: '8. Children\u2019s Privacy', body:
+    'Stock It is a business tool and is not directed at, or intended for use by, individuals under 18.' },
+  { title: '9. Changes to This Policy', body:
+    'We may update this policy from time to time. Material changes will be reflected here with an updated context; continued use of the Service after changes take effect constitutes acceptance.' },
+  { title: '10. Contact', body:
+    'Questions about this policy can be directed to your Stock It administrator or Reliable Automation Solutions directly.' },
+];
+
+function LegalModal({ kind, onClose }) {
+  const sections = kind === 'privacy' ? PRIVACY_SECTIONS : TERMS_SECTIONS;
+  const title = kind === 'privacy' ? 'PRIVACY POLICY' : 'TERMS OF SERVICE';
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={{ ...styles.modal, maxWidth: 560, maxHeight: '82vh', display: 'flex', flexDirection: 'column' }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>{title}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={{ ...styles.modalBody, overflowY: 'auto' }} className="depot-scroll">
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.5)', fontStyle: 'italic', marginBottom: 14 }}>
+            This is a general starting-point document and not a substitute for legal advice specific to your business.
+          </div>
+          {sections.map((s) => (
+            <div key={s.title} style={{ marginBottom: 14 }}>
+              <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 13.5, color: 'var(--ink)', marginBottom: 4 }}>{s.title}</div>
+              <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.75)', lineHeight: 1.6 }}>{s.body}</div>
+            </div>
+          ))}
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.primaryBtn} onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LoginScreen({ logo, theme }) {
   const t = theme || THEMES[DEFAULT_THEME_KEY];
-  const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
+  const [mode, setMode] = useState('signin'); // 'signin' | 'signup' | 'reset'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -1624,8 +1706,11 @@ function LoginScreen({ logo, theme }) {
   const [username, setUsername] = useState('');
   const [contactNumber, setContactNumber] = useState('');
   const [address, setAddress] = useState('');
+  const [agreeTerms, setAgreeTerms] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+  const [legalModal, setLegalModal] = useState(null); // 'terms' | 'privacy' | null
 
   const friendlyError = (err) => {
     const code = err?.code || '';
@@ -1646,6 +1731,10 @@ function LoginScreen({ logo, theme }) {
       setError('Passwords don\'t match.');
       return;
     }
+    if (mode === 'signup' && !agreeTerms) {
+      setError('Please agree to the Terms of Service and Privacy Policy to continue.');
+      return;
+    }
 
     setBusy(true);
     try {
@@ -1663,6 +1752,7 @@ function LoginScreen({ logo, theme }) {
             email: email.trim(), approved: false, isAdmin: false, role: 'client', createdAt: Date.now(),
             fullName: fullName.trim(), username: username.trim(), contactNumber: contactNumber.trim(),
             address: address.trim(), userIdNumber: generateUserIdNumber(),
+            agreedToTermsAt: Date.now(),
           }, { merge: true });
         } catch (profileErr) {
           console.error('Could not save signup profile details:', profileErr);
@@ -1677,11 +1767,44 @@ function LoginScreen({ logo, theme }) {
     }
   };
 
+  const submitReset = async (e) => {
+    e.preventDefault();
+    setError('');
+    setBusy(true);
+    try {
+      await sendPasswordResetEmail(auth, email.trim());
+      setResetSent(true);
+    } catch (err) {
+      if (err?.code === 'auth/invalid-email') setError('That email address doesn\'t look right.');
+      else if (err?.code === 'auth/too-many-requests') setError('Too many attempts — please wait a bit and try again.');
+      // Deliberately don't reveal auth/user-not-found - showing the same
+      // "sent" confirmation either way avoids leaking which emails have
+      // an account.
+      else setResetSent(true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const switchMode = () => {
     setMode(mode === 'signin' ? 'signup' : 'signin');
     setError('');
     setPassword('');
     setConfirmPassword('');
+    setAgreeTerms(false);
+  };
+
+  const goToReset = () => {
+    setMode('reset');
+    setError('');
+    setResetSent(false);
+  };
+
+  const backToSignIn = () => {
+    setMode('signin');
+    setError('');
+    setResetSent(false);
+    setPassword('');
   };
 
   return (
@@ -1692,6 +1815,63 @@ function LoginScreen({ logo, theme }) {
     }}>
       <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
       <BackgroundDecor variant="login" />
+      {mode === 'reset' ? (
+        <form onSubmit={submitReset} className="depot-login-form" style={{
+          background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 400,
+          boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
+          border: `1px solid ${t.lineDim}`, position: 'relative', zIndex: 1,
+        }}>
+          <div style={{
+            background: `linear-gradient(135deg, #FFFCF5 0%, ${t.paper} 100%)`,
+            borderRadius: 10, padding: '22px 20px 16px', marginBottom: 20,
+            border: `1px solid ${t.lineDim}`,
+          }}>
+            <img src={logo} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+          </div>
+          <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
+            Reset Your Password
+          </div>
+          {resetSent ? (
+            <>
+              <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.7)', lineHeight: 1.6, marginBottom: 20 }}>
+                If an account exists for <strong>{email.trim()}</strong>, a password reset link has been sent. Check your inbox (and spam folder).
+              </div>
+              <button type="button" onClick={backToSignIn} style={{
+                width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
+                padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer',
+              }}>
+                Back to Sign In
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 20 }}>
+                Enter the email on your account and we\u2019ll send you a link to reset your password.
+              </div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Email</label>
+              <input
+                type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
+                style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
+              />
+              {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
+              <button type="submit" disabled={busy} style={{
+                width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
+                padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: busy ? 0.6 : 1,
+              }}>
+                {busy ? 'Sending…' : 'Send Reset Link'}
+              </button>
+              <div style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>
+                <button type="button" onClick={backToSignIn} style={{
+                  background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600,
+                  cursor: 'pointer', textDecoration: 'underline', fontSize: 12.5,
+                }}>
+                  Back to Sign In
+                </button>
+              </div>
+            </>
+          )}
+        </form>
+      ) : (
       <form onSubmit={submit} className="depot-login-form" style={{
         background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 400,
         boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
@@ -1718,8 +1898,18 @@ function LoginScreen({ logo, theme }) {
         <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Password</label>
         <input
           type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
-          style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: mode === 'signup' ? 14 : 16, boxSizing: 'border-box' }}
+          style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: mode === 'signup' ? 14 : 6, boxSizing: 'border-box' }}
         />
+        {mode === 'signin' && (
+          <div style={{ textAlign: 'right', marginBottom: 14 }}>
+            <button type="button" onClick={goToReset} style={{
+              background: 'none', border: 'none', padding: 0, color: t.blueprint,
+              cursor: 'pointer', textDecoration: 'underline', fontSize: 11.5,
+            }}>
+              Forgot password?
+            </button>
+          </div>
+        )}
         {mode === 'signup' && (
           <>
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Confirm Password</label>
@@ -1747,6 +1937,15 @@ function LoginScreen({ logo, theme }) {
               type="text" value={address} onChange={(e) => setAddress(e.target.value)}
               style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
             />
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, color: 'rgba(59,42,31,0.7)', marginBottom: 16, cursor: 'pointer' }}>
+              <input type="checkbox" checked={agreeTerms} onChange={(e) => setAgreeTerms(e.target.checked)} style={{ marginTop: 2 }} />
+              <span>
+                I agree to the{' '}
+                <button type="button" onClick={() => setLegalModal('terms')} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}>Terms of Service</button>
+                {' '}and{' '}
+                <button type="button" onClick={() => setLegalModal('privacy')} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}>Privacy Policy</button>.
+              </span>
+            </label>
           </>
         )}
         {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
@@ -1765,7 +1964,14 @@ function LoginScreen({ logo, theme }) {
             {mode === 'signup' ? 'Sign In' : 'Sign Up'}
           </button>
         </div>
+        <div style={{ textAlign: 'center', marginTop: 10, fontSize: 11, color: 'rgba(59,42,31,0.45)' }}>
+          <button type="button" onClick={() => setLegalModal('terms')} style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>Terms of Service</button>
+          {' · '}
+          <button type="button" onClick={() => setLegalModal('privacy')} style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>Privacy Policy</button>
+        </div>
       </form>
+      )}
+      {legalModal && <LegalModal kind={legalModal} onClose={() => setLegalModal(null)} />}
     </div>
   );
 }
