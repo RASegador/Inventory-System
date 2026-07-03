@@ -177,7 +177,30 @@ function printPage() {
 // is wrapped in try/catch so a sound failure (e.g. an older browser, or a
 // browser blocking audio before any user gesture) can never interrupt the
 // actual save/sale it's celebrating.
+//
+// Browsers only allow creating/resuming an AudioContext synchronously
+// within a genuine user gesture (click/tap/keypress). Our sounds fire
+// *after* an `await` (once the Firestore save actually finishes), which by
+// then no longer counts as "inside" that gesture - so a context created at
+// that point would stay silently suspended. Fix: "unlock" one shared
+// context as early as possible, on the very first interaction anywhere in
+// the app (signing in counts), so it's already running by the time any
+// save/sale actually completes and wants to play a sound.
 let sharedAudioCtx = null;
+function unlockAudioCtx() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!sharedAudioCtx) sharedAudioCtx = new Ctx();
+    if (sharedAudioCtx.state === 'suspended') sharedAudioCtx.resume();
+  } catch (e) { /* ignore - sound just won't play */ }
+}
+if (typeof document !== 'undefined') {
+  ['pointerdown', 'keydown', 'touchstart'].forEach((evt) =>
+    document.addEventListener(evt, unlockAudioCtx, { once: true, passive: true })
+  );
+}
+
 function getAudioCtx() {
   try {
     if (!sharedAudioCtx) {
