@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { auth, db } from './firebase';
-import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
+import { initializeApp, deleteApp } from 'firebase/app';
+import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth } from 'firebase/auth';
 import {
   collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
 } from 'firebase/firestore';
@@ -9,7 +10,7 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -273,7 +274,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
-    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: true,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
@@ -281,7 +282,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
-    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: true,
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
@@ -289,7 +290,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: false,
     pos: true, viewReports: false, print: false, cancelSales: false,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
-    viewOwnSales: true, viewActivityLogs: false, manageUserProfiles: false,
+    viewOwnSales: true, viewActivityLogs: false, manageUserProfiles: false, createStaff: false,
   },
 };
 
@@ -453,51 +454,6 @@ export default function InventorySystem() {
     return unsub;
   }, []);
 
-  // Activity log: record a "login" entry each time a session starts. This is
-  // a client-side approximation - it can't distinguish "just signed in" from
-  // "reopened the app with a still-valid session," since both look the same
-  // to the client SDK. Logout is recorded explicitly via handleSignOut below.
-  useEffect(() => {
-    if (!user) return;
-    (async () => {
-      try {
-        const logId = 'l' + Math.random().toString(36).slice(2, 9);
-        await setDoc(doc(db, 'loginLogs', logId), {
-          uid: user.uid, email: user.email || '', type: 'login', timestamp: Date.now(),
-        });
-      } catch (e) {
-        console.error('Login log error:', e);
-      }
-    })();
-  }, [user?.uid]);
-
-  const handleSignOut = async () => {
-    if (user) {
-      try {
-        const logId = 'l' + Math.random().toString(36).slice(2, 9);
-        await setDoc(doc(db, 'loginLogs', logId), {
-          uid: user.uid, email: user.email || '', type: 'logout', timestamp: Date.now(),
-        });
-      } catch (e) {
-        console.error('Logout log error:', e);
-      }
-    }
-    await signOut(auth);
-  };
-
-  // Branding (custom logo + theme): public read, so this works even on the
-  // signed-out login screen. Applies live for everyone the moment a Super
-  // Admin changes it.
-  useEffect(() => {
-    const unsub = onSnapshot(doc(db, 'config', 'branding'), (d) => {
-      setBranding(d.exists() ? d.data() : {});
-    }, () => setBranding({}));
-    return unsub;
-  }, []);
-
-  const effectiveLogo = branding?.logoDataUri || LOGO_DATA_URI;
-  const activeTheme = THEMES[branding?.themeKey] || THEMES[DEFAULT_THEME_KEY];
-
   // Approval: ensure a users/{uid} profile exists, then subscribe to it live
   useEffect(() => {
     if (!user) { setMyProfile(null); setProfileChecked(false); return; }
@@ -526,18 +482,120 @@ export default function InventorySystem() {
   const myRole = resolveRole(myProfile);
   const isManager = myRole === 'superadmin' || myRole === 'client';
 
-  // Super Admin manages Team Access (everyone); Client subscribes too but
-  // only for the User Profiles view - Firestore rules mean a Client's query
-  // only ever returns Staff docs, never other Client/Super Admin accounts.
+  // Multi-tenancy: every piece of business data (items, suppliers, sales,
+  // categories, etc.) is stamped with the `ownerId` of the tenant it belongs
+  // to. A Client Admin IS a tenant, so their ownerId is their own uid. Staff
+  // don't own a tenant - they inherit the ownerId of whichever Client Admin
+  // created them (stored on their profile as `parentId`). Super Admin gets
+  // their own tenant too, so their own inventory/sales stay separate from
+  // every client's data, but they retain unscoped visibility into the
+  // `users` collection so they can approve/manage accounts platform-wide.
+  const ownerId = !user ? null
+    : myRole === 'staff' ? (myProfile?.parentId || null)
+    : user.uid;
+
+  // Activity log: record a "login" entry each time a session starts. This is
+  // a client-side approximation - it can't distinguish "just signed in" from
+  // "reopened the app with a still-valid session," since both look the same
+  // to the client SDK. Logout is recorded explicitly via handleSignOut below.
+  useEffect(() => {
+    // Wait for the tenant (ownerId) to resolve from the profile before
+    // logging, so the entry is correctly scoped to the right Client Admin.
+    if (!user || !ownerId) return;
+    (async () => {
+      try {
+        const logId = 'l' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'loginLogs', logId), {
+          uid: user.uid, email: user.email || '', type: 'login', timestamp: Date.now(), ownerId,
+        });
+      } catch (e) {
+        console.error('Login log error:', e);
+      }
+    })();
+  }, [user?.uid, ownerId]);
+
+  const handleSignOut = async () => {
+    if (user) {
+      try {
+        const logId = 'l' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'loginLogs', logId), {
+          uid: user.uid, email: user.email || '', type: 'logout', timestamp: Date.now(), ownerId,
+        });
+      } catch (e) {
+        console.error('Logout log error:', e);
+      }
+    }
+    await signOut(auth);
+  };
+
+  // Branding (custom logo + theme): public read, so this works even on the
+  // signed-out login screen. Applies live for everyone the moment a Super
+  // Admin changes it.
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, 'config', 'branding'), (d) => {
+      setBranding(d.exists() ? d.data() : {});
+    }, () => setBranding({}));
+    return unsub;
+  }, []);
+
+  const effectiveLogo = branding?.logoDataUri || LOGO_DATA_URI;
+  const activeTheme = THEMES[branding?.themeKey] || THEMES[DEFAULT_THEME_KEY];
+
+  // Super Admin manages Team Access for the whole platform (every account).
+  // A Client only ever subscribes to the staff THEY created - scoped via
+  // `parentId`, matching Firestore rules - so they can never see another
+  // Client's roster or other Client/Super Admin accounts.
   useEffect(() => {
     if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
-    const unsub = onSnapshot(collection(db, 'users'), (snap) => {
+    const usersQuery = myRole === 'superadmin'
+      ? collection(db, 'users')
+      : query(collection(db, 'users'), where('parentId', '==', user.uid));
+    const unsub = onSnapshot(usersQuery, (snap) => {
       const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
     });
     return unsub;
-  }, [user, isManager]);
+  }, [user, isManager, myRole]);
+
+  // Lets a Client Admin (or Super Admin, for support) provision a Staff
+  // account directly - no self-signup/approval step. Uses a throwaway
+  // secondary Firebase App instance so creating the new auth user doesn't
+  // sign the admin themselves out of their own session (the Firebase client
+  // SDK otherwise switches the active session to whichever user was most
+  // recently created).
+  const createStaffAccount = async ({ email, password, fullName, username, contactNumber, address }) => {
+    if (!can(myRole, 'createStaff') || !ownerId) {
+      showToast("You don't have permission to add staff");
+      return { ok: false };
+    }
+    let secondaryApp;
+    try {
+      secondaryApp = initializeApp(auth.app.options, 'staff-creation-' + Date.now());
+      const secondaryAuth = getAuth(secondaryApp);
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, email.trim(), password);
+      await setDoc(doc(db, 'users', cred.user.uid), {
+        email: email.trim(), approved: true, isAdmin: false, role: 'staff',
+        parentId: ownerId, createdAt: Date.now(), createdBy: user.uid,
+        fullName: (fullName || '').trim(), username: (username || '').trim(),
+        contactNumber: (contactNumber || '').trim(), address: (address || '').trim(),
+        userIdNumber: generateUserIdNumber(),
+      });
+      await signOut(secondaryAuth);
+      showToast(`Staff account created for ${email.trim()}`);
+      return { ok: true };
+    } catch (e) {
+      const msg = e?.code === 'auth/email-already-in-use'
+        ? 'That email already has an account'
+        : e?.code === 'auth/weak-password'
+        ? 'Password should be at least 6 characters'
+        : 'Could not create staff account — check your connection';
+      showToast(msg);
+      return { ok: false, error: e };
+    } finally {
+      if (secondaryApp) { try { await deleteApp(secondaryApp); } catch {} }
+    }
+  };
 
   const approveUser = async (uid) => {
     try {
@@ -634,34 +692,43 @@ export default function InventorySystem() {
   };
 
 
-  // Data: seed once if empty, then subscribe to live Firestore updates
+  // Data: seed once per tenant if empty, then subscribe to live Firestore
+  // updates - every query below is filtered by `ownerId` so one Client
+  // Admin's inventory, suppliers, movements, sales, and reports are never
+  // visible to another tenant. Staff inherit their tenant's ownerId, so the
+  // same filtered queries automatically give them exactly (and only) their
+  // Client Admin's data - nothing more.
   useEffect(() => {
-    if (!user || !myProfile?.approved) { setLoaded(false); return; }
+    if (!user || !myProfile?.approved || !ownerId) { setLoaded(false); return; }
     let unsubs = [];
     let cancelled = false;
+    const categoriesDocId = 'categories_' + ownerId;
+    const locationsDocId = 'locations_' + ownerId;
 
     (async () => {
       try {
+        // Only the tenant owner (Client Admin / Super Admin) seeds their own
+        // workspace - staff never trigger seeding, they just read it.
         if (isManager) {
-          const itemsSnap = await getDocs(collection(db, 'items'));
+          const itemsSnap = await getDocs(query(collection(db, 'items'), where('ownerId', '==', ownerId)));
           if (itemsSnap.empty) {
-            const seed = seedItems();
-            await Promise.all(seed.map((it) => setDoc(doc(db, 'items', it.id), it)));
-            const moves = seedMovements(seed);
-            await Promise.all(moves.map((m) => setDoc(doc(db, 'movements', m.id), m)));
+            const seed = seedItems().map((it) => ({ ...it, id: 'i' + Math.random().toString(36).slice(2, 9) }));
+            await Promise.all(seed.map((it) => setDoc(doc(db, 'items', it.id), { ...it, ownerId })));
+            const moves = seedMovements(seed).map((m) => ({ ...m, id: 'm' + Math.random().toString(36).slice(2, 9) }));
+            await Promise.all(moves.map((m) => setDoc(doc(db, 'movements', m.id), { ...m, ownerId })));
           }
-          const suppliersSnap = await getDocs(collection(db, 'suppliers'));
+          const suppliersSnap = await getDocs(query(collection(db, 'suppliers'), where('ownerId', '==', ownerId)));
           if (suppliersSnap.empty) {
-            const seedSup = seedSuppliers();
-            await Promise.all(seedSup.map((s) => setDoc(doc(db, 'suppliers', s.id), s)));
+            const seedSup = seedSuppliers().map((s) => ({ ...s, id: 's' + Math.random().toString(36).slice(2, 9) }));
+            await Promise.all(seedSup.map((s) => setDoc(doc(db, 'suppliers', s.id), { ...s, ownerId })));
           }
-          const catDoc = await getDoc(doc(db, 'config', 'categories'));
+          const catDoc = await getDoc(doc(db, 'config', categoriesDocId));
           if (!catDoc.exists()) {
-            await setDoc(doc(db, 'config', 'categories'), { list: DEFAULT_CATEGORIES });
+            await setDoc(doc(db, 'config', categoriesDocId), { list: DEFAULT_CATEGORIES, ownerId });
           }
-          const locDoc = await getDoc(doc(db, 'config', 'locations'));
+          const locDoc = await getDoc(doc(db, 'config', locationsDocId));
           if (!locDoc.exists()) {
-            await setDoc(doc(db, 'config', 'locations'), { list: DEFAULT_LOCATIONS });
+            await setDoc(doc(db, 'config', locationsDocId), { list: DEFAULT_LOCATIONS, ownerId });
           }
         }
       } catch (e) {
@@ -670,34 +737,39 @@ export default function InventorySystem() {
 
       if (cancelled) return;
 
-      unsubs.push(onSnapshot(collection(db, 'items'), (snap) => {
+      unsubs.push(onSnapshot(query(collection(db, 'items'), where('ownerId', '==', ownerId)), (snap) => {
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       }));
-      unsubs.push(onSnapshot(collection(db, 'suppliers'), (snap) => {
+      unsubs.push(onSnapshot(query(collection(db, 'suppliers'), where('ownerId', '==', ownerId)), (snap) => {
         setSuppliers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       }));
-      unsubs.push(onSnapshot(doc(db, 'config', 'categories'), (d) => {
+      unsubs.push(onSnapshot(doc(db, 'config', categoriesDocId), (d) => {
         setCategories(d.exists() ? (d.data().list || []) : DEFAULT_CATEGORIES.slice());
       }));
-      unsubs.push(onSnapshot(doc(db, 'config', 'locations'), (d) => {
+      unsubs.push(onSnapshot(doc(db, 'config', locationsDocId), (d) => {
         setLocations(d.exists() ? (d.data().list || []) : DEFAULT_LOCATIONS.slice());
       }));
 
       // Report-like data: only managers (Client + Super Admin) can read these under
       // the Firestore rules, so staff skip subscribing to avoid permission errors.
       if (isManager) {
-        unsubs.push(onSnapshot(collection(db, 'movements'), (snap) => {
+        unsubs.push(onSnapshot(query(collection(db, 'movements'), where('ownerId', '==', ownerId)), (snap) => {
           setMovements(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
         }));
-        unsubs.push(onSnapshot(collection(db, 'deliveryStatus'), (snap) => {
+        unsubs.push(onSnapshot(query(collection(db, 'deliveryStatus'), where('ownerId', '==', ownerId)), (snap) => {
           const map = {};
           snap.docs.forEach((d) => { map[d.id] = d.data(); });
           setDeliveryStatuses(map);
         }));
-        unsubs.push(onSnapshot(collection(db, 'sales'), (snap) => {
+        unsubs.push(onSnapshot(query(collection(db, 'sales'), where('ownerId', '==', ownerId)), (snap) => {
           setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
         }));
-        unsubs.push(onSnapshot(collection(db, 'loginLogs'), (snap) => {
+        // Super Admin monitors login activity platform-wide; a Client only
+        // sees activity for their own tenant (themselves + their staff).
+        const logsQuery = myRole === 'superadmin'
+          ? collection(db, 'loginLogs')
+          : query(collection(db, 'loginLogs'), where('ownerId', '==', ownerId));
+        unsubs.push(onSnapshot(logsQuery, (snap) => {
           setLoginLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
         }));
       } else {
@@ -715,7 +787,7 @@ export default function InventorySystem() {
     })();
 
     return () => { cancelled = true; unsubs.forEach((u) => u()); };
-  }, [user, myProfile?.approved, isManager]);
+  }, [user, myProfile?.approved, isManager, ownerId, myRole]);
 
   const showToast = (msg) => {
     setToast(msg);
@@ -726,7 +798,7 @@ export default function InventorySystem() {
     if (!can(myRole, 'editInventory')) { showToast("You don't have permission to edit inventory"); return; }
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId });
       showToast(draft.id ? `Updated ${draft.sku}` : `Added ${draft.sku} to the manifest`);
     } catch (e) {
       showToast('Could not save item — check your connection');
@@ -753,7 +825,7 @@ export default function InventorySystem() {
     if (!can(myRole, 'manageSuppliers')) { showToast("You don't have permission to manage suppliers"); return; }
     const id = draft.id || ('s' + Math.random().toString(36).slice(2, 9));
     try {
-      await setDoc(doc(db, 'suppliers', id), { ...draft, id });
+      await setDoc(doc(db, 'suppliers', id), { ...draft, id, ownerId });
       showToast(draft.id ? `Updated ${draft.name}` : `Added ${draft.name} to suppliers`);
     } catch (e) {
       showToast('Could not save supplier — check your connection');
@@ -784,7 +856,7 @@ export default function InventorySystem() {
       return;
     }
     try {
-      await setDoc(doc(db, 'config', 'categories'), { list: [...categories, trimmed] });
+      await setDoc(doc(db, 'config', 'categories_' + ownerId), { list: [...categories, trimmed], ownerId });
       showToast(`Added category "${trimmed}"`);
     } catch (e) {
       showToast('Could not add category — check your connection');
@@ -800,7 +872,7 @@ export default function InventorySystem() {
       return;
     }
     try {
-      await setDoc(doc(db, 'config', 'categories'), { list: categories.filter((c) => c !== name) });
+      await setDoc(doc(db, 'config', 'categories_' + ownerId), { list: categories.filter((c) => c !== name), ownerId });
       showToast(`Removed category "${name}"`);
     } catch (e) {
       showToast('Could not remove category — check your connection');
@@ -812,7 +884,7 @@ export default function InventorySystem() {
     if (!can(myRole, 'viewReports')) { showToast("You don't have permission to update delivery status"); return; }
     try {
       await setDoc(doc(db, 'deliveryStatus', itemId), {
-        status, note: note || '', orderDate: orderDate || null, updatedAt: Date.now(),
+        status, note: note || '', orderDate: orderDate || null, updatedAt: Date.now(), ownerId,
       });
       showToast(`Delivery status set to "${status}"`);
     } catch (e) {
@@ -841,7 +913,7 @@ export default function InventorySystem() {
       return;
     }
     try {
-      await setDoc(doc(db, 'config', 'locations'), { list: [...locations, trimmed] });
+      await setDoc(doc(db, 'config', 'locations_' + ownerId), { list: [...locations, trimmed], ownerId });
       showToast(`Added location "${trimmed}"`);
     } catch (e) {
       showToast('Could not add location — check your connection');
@@ -857,7 +929,7 @@ export default function InventorySystem() {
       return;
     }
     try {
-      await setDoc(doc(db, 'config', 'locations'), { list: locations.filter((l) => l !== name) });
+      await setDoc(doc(db, 'config', 'locations_' + ownerId), { list: locations.filter((l) => l !== name), ownerId });
       showToast(`Removed location "${name}"`);
     } catch (e) {
       showToast('Could not remove location — check your connection');
@@ -878,7 +950,7 @@ export default function InventorySystem() {
       await setDoc(doc(db, 'movements', mvId), {
         id: mvId, itemId, type, qty,
         reason: reason || (type === 'in' ? 'Stock received' : 'Stock issued'),
-        timestamp: Date.now(),
+        timestamp: Date.now(), ownerId,
       });
       showToast(`${type === 'in' ? 'Received' : 'Issued'} ${qty} × ${item.sku}`);
     } catch (e) {
@@ -909,7 +981,7 @@ export default function InventorySystem() {
     const total = subtotal;
     const sale = {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
-      subtotal, total, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '',
+      subtotal, total, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '', ownerId,
     };
 
     try {
@@ -921,7 +993,7 @@ export default function InventorySystem() {
         const mvId = 'm' + Math.random().toString(36).slice(2, 9);
         return setDoc(doc(db, 'movements', mvId), {
           id: mvId, itemId: line.itemId, type: 'out', qty: line.qty,
-          reason: `Sale ${receiptNo}`, timestamp: now,
+          reason: `Sale ${receiptNo}`, timestamp: now, ownerId,
         });
       }));
       await setDoc(doc(db, 'sales', sale.id), sale);
@@ -946,7 +1018,7 @@ export default function InventorySystem() {
         const mvId = 'm' + Math.random().toString(36).slice(2, 9);
         return setDoc(doc(db, 'movements', mvId), {
           id: mvId, itemId: line.itemId, type: 'in', qty: line.qty,
-          reason: `Sale ${sale.receiptNo} cancelled`, timestamp: now,
+          reason: `Sale ${sale.receiptNo} cancelled`, timestamp: now, ownerId,
         });
       }));
       await setDoc(doc(db, 'sales', sale.id), {
@@ -1189,6 +1261,8 @@ export default function InventorySystem() {
             approvedUsers={approvedUsers}
             currentUid={user.uid}
             myRole={myRole}
+            canCreateStaff={can(myRole, 'createStaff')}
+            onCreateStaff={createStaffAccount}
             onApprove={approveUser}
             onDeny={denyUser}
             onRevoke={revokeUser}
@@ -1340,8 +1414,12 @@ function LoginScreen({ logo, theme }) {
         // bootstrap effect, so whichever runs first or second, neither wipes
         // the other's fields.
         try {
+          // Self-signup always creates a new Client Admin account - i.e. a
+          // new tenant/business, still pending a Super Admin's approval.
+          // Staff accounts are created *by* a Client Admin from inside the
+          // app (Team Access), never through this public form.
           await setDoc(doc(db, 'users', cred.user.uid), {
-            email: email.trim(), approved: false, isAdmin: false, role: 'staff', createdAt: Date.now(),
+            email: email.trim(), approved: false, isAdmin: false, role: 'client', createdAt: Date.now(),
             fullName: fullName.trim(), username: username.trim(), contactNumber: contactNumber.trim(),
             address: address.trim(), userIdNumber: generateUserIdNumber(),
           }, { merge: true });
@@ -2766,7 +2844,80 @@ function MyProfileView({ profile, uid, onSave }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme }) {
+function AddStaffPanel({ onCreateStaff }) {
+  const [open, setOpen] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [username, setUsername] = useState('');
+  const [contactNumber, setContactNumber] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const reset = () => {
+    setEmail(''); setPassword(''); setFullName(''); setUsername(''); setContactNumber(''); setError('');
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (password.length < 6) { setError('Password should be at least 6 characters.'); return; }
+    setBusy(true);
+    const result = await onCreateStaff({ email, password, fullName, username, contactNumber });
+    setBusy(false);
+    if (result?.ok) {
+      reset();
+      setOpen(false);
+    }
+  };
+
+  return (
+    <div style={{ ...styles.panel, marginBottom: 16 }}>
+      <div style={{ ...styles.panelHeader, justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <UserPlus size={15} />
+          <span>STAFF ACCOUNTS</span>
+        </div>
+        <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setOpen((v) => !v)}>
+          {open ? 'Cancel' : '+ Add Staff'}
+        </button>
+      </div>
+      {!open ? (
+        <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginTop: 10 }}>
+          Staff accounts you create here are automatically linked to your inventory and only ever see your business data.
+        </div>
+      ) : (
+        <form onSubmit={submit} style={{ marginTop: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }} className="depot-form-grid">
+          <Field label="Email">
+            <input type="email" required className="depot-input" style={styles.modalInput} value={email} onChange={(e) => setEmail(e.target.value)} />
+          </Field>
+          <Field label="Temporary Password">
+            <input type="password" required className="depot-input" style={styles.modalInput} value={password} onChange={(e) => setPassword(e.target.value)} />
+          </Field>
+          <Field label="Full Name">
+            <input type="text" required className="depot-input" style={styles.modalInput} value={fullName} onChange={(e) => setFullName(e.target.value)} />
+          </Field>
+          <Field label="Username">
+            <input type="text" className="depot-input" style={styles.modalInput} value={username} onChange={(e) => setUsername(e.target.value)} />
+          </Field>
+          <Field label="Contact Number">
+            <input type="tel" className="depot-input" style={styles.modalInput} value={contactNumber} onChange={(e) => setContactNumber(e.target.value)} />
+          </Field>
+          <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+            <button type="submit" className="depot-btn" style={{ ...styles.primaryBtn, opacity: busy ? 0.6 : 1, width: '100%' }} disabled={busy}>
+              {busy ? 'Creating…' : 'Create Staff Account'}
+            </button>
+          </div>
+          {error && (
+            <div style={{ gridColumn: '1 / -1', fontSize: 12, color: 'var(--red)' }}>{error}</div>
+          )}
+        </form>
+      )}
+    </div>
+  );
+}
+
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
   const [editingUser, setEditingUser] = useState(null);
@@ -2789,6 +2940,8 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
   // extra to filter here.
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {canCreateStaff && <AddStaffPanel onCreateStaff={onCreateStaff} />}
+
       {isSuperAdmin && (
       <div style={styles.panel}>
         <div style={styles.panelHeader}>
