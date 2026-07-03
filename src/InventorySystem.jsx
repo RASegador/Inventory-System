@@ -809,11 +809,11 @@ export default function InventorySystem() {
     setConfirmModal(null);
   };
 
-  const updateDeliveryStatus = async (itemId, status, note) => {
+  const updateDeliveryStatus = async (itemId, status, note, orderDate) => {
     if (!can(myRole, 'viewReports')) { showToast("You don't have permission to update delivery status"); return; }
     try {
       await setDoc(doc(db, 'deliveryStatus', itemId), {
-        status, note: note || '', updatedAt: Date.now(),
+        status, note: note || '', orderDate: orderDate || null, updatedAt: Date.now(),
       });
       showToast(`Delivery status set to "${status}"`);
     } catch (e) {
@@ -1019,7 +1019,10 @@ export default function InventorySystem() {
         const autoStatus = it.quantity <= it.reorderPoint ? (overdue ? 'Delivery Overdue' : 'Reorder Now') : 'On Track';
         const override = deliveryStatuses[it.id];
         const status = override ? override.status : autoStatus;
-        return { item: it, supplier, lastDelivery, expectedNext, status, autoStatus, manual: !!override, note: override?.note || '' };
+        return {
+          item: it, supplier, lastDelivery, expectedNext, status, autoStatus,
+          manual: !!override, note: override?.note || '', orderDate: override?.orderDate || null,
+        };
       })
       .filter(Boolean);
   }, [items, suppliers, movements, deliveryStatuses]);
@@ -2051,9 +2054,9 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
   };
 
   const handleDownload = () => {
-    const headers = ['Supplier', 'SKU', 'Item', 'Lead Time (days)', 'Last Delivery', 'Expected Next', 'Status', 'Manually Set', 'Note'];
-    const csvRows = dateFiltered.map(({ item, supplier, lastDelivery, expectedNext, status, manual, note }) => [
-      supplier.name, item.sku, item.name, supplier.leadTimeDays, formatDate(lastDelivery), formatDate(expectedNext), status, manual ? 'Yes' : 'No', note,
+    const headers = ['Supplier', 'SKU', 'Item', 'Order Date', 'Receive Date', 'Status', 'Manually Set', 'Note'];
+    const csvRows = dateFiltered.map(({ item, supplier, lastDelivery, orderDate, status, manual, note }) => [
+      supplier.name, item.sku, item.name, formatDate(orderDate), formatDate(lastDelivery), status, manual ? 'Yes' : 'No', note,
     ]);
     downloadCSV('delivery-times.csv', headers, csvRows);
   };
@@ -2063,31 +2066,30 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
       <div style={{ ...styles.filterBar, marginBottom: 12 }} className="depot-no-print depot-filterbar">
         <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
-        <div style={{ ...styles.watchName, alignSelf: 'center' }}>filters by Last Delivery date</div>
+        <div style={{ ...styles.watchName, alignSelf: 'center' }}>filters by Receive Date</div>
       </div>
       <div style={styles.tableWrap} className="depot-scroll">
         <table style={styles.table} className="depot-table">
           <thead>
             <tr>
-              {['Supplier', 'Item', 'Lead Time', 'Last Delivery', 'Expected Next', 'Status', ''].map((h) => (
+              {['Supplier', 'Item', 'Order Date', 'Receive Date', 'Status', ''].map((h) => (
                 <th key={h} style={styles.th}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {dateFiltered.length === 0 && (
-              <tr><td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your filters.</td></tr>
+              <tr><td colSpan={6} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your filters.</td></tr>
             )}
             {dateFiltered.map((row) => {
-              const { item, supplier, lastDelivery, expectedNext, status, manual } = row;
+              const { item, supplier, lastDelivery, orderDate, status, manual } = row;
               const st = statusStyle(status);
               return (
                 <tr key={item.id} className="depot-row">
                   <td style={styles.td}>{supplier.name}</td>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif" }}>{item.sku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {item.name}</span></td>
-                  <td style={styles.td}>{supplier.leadTimeDays} days</td>
+                  <td style={styles.td}>{formatDate(orderDate)}</td>
                   <td style={styles.td}>{formatDate(lastDelivery)}</td>
-                  <td style={styles.td}>{formatDate(expectedNext)}</td>
                   <td style={styles.td}>
                     <span style={{ ...styles.statusPill, background: st.bg, color: st.color }}>
                       {status === 'On Track' && <CheckCircle2 size={12} />}
@@ -3288,9 +3290,10 @@ function MoveModal({ item, allowIssue, onClose, onSubmit }) {
 const DELIVERY_STATUS_OPTIONS = ['On Track', 'Ordered', 'In Transit', 'Delayed', 'Delivered', 'Reorder Now', 'Delivery Overdue'];
 
 function DeliveryStatusModal({ row, onClose, onSave, onClearOverride }) {
-  const { item, supplier, status, manual, note: existingNote } = row;
+  const { item, supplier, status, manual, note: existingNote, orderDate: existingOrderDate } = row;
   const [status_, setStatus] = useState(status);
   const [note, setNote] = useState(existingNote || '');
+  const [orderDate, setOrderDate] = useState(existingOrderDate || '');
 
   return (
     <div style={styles.overlay} onClick={onClose}>
@@ -3307,6 +3310,10 @@ function DeliveryStatusModal({ row, onClose, onSave, onClearOverride }) {
             <select className="depot-select" style={styles.modalInput} value={status_} onChange={(e) => setStatus(e.target.value)}>
               {DELIVERY_STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
+          </Field>
+          <Field label="Order Date">
+            <input type="date" className="depot-input" style={styles.modalInput} value={orderDate}
+              onChange={(e) => setOrderDate(e.target.value)} />
           </Field>
           <Field label="Note (optional)">
             <input className="depot-input" style={styles.modalInput} value={note}
@@ -3325,7 +3332,7 @@ function DeliveryStatusModal({ row, onClose, onSave, onClearOverride }) {
             </button>
           )}
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item.id, status_, note)}>
+          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item.id, status_, note, orderDate)}>
             Save
           </button>
         </div>
