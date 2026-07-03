@@ -156,6 +156,45 @@ function ExportBar({ onPrint, onDownload }) {
   );
 }
 
+// Returns true if `ts` (ms epoch) falls within the inclusive [from, to] date
+// range, where from/to are 'YYYY-MM-DD' strings or '' (no bound).
+function inDateRange(ts, from, to) {
+  if (!ts) return true;
+  if (from) {
+    const start = new Date(from + 'T00:00:00').getTime();
+    if (ts < start) return false;
+  }
+  if (to) {
+    const end = new Date(to + 'T23:59:59.999').getTime();
+    if (ts > end) return false;
+  }
+  return true;
+}
+
+function DateRangeFilter({ from, to, onFrom, onTo }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <label style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', fontWeight: 600 }}>From</label>
+      <input
+        type="date" className="depot-input" value={from} onChange={(e) => onFrom(e.target.value)}
+        style={{ padding: '7px 9px', borderRadius: 6, border: '1px solid rgba(20,33,61,0.15)', fontSize: 12.5, fontFamily: "'Nunito', sans-serif" }}
+      />
+      <label style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', fontWeight: 600 }}>To</label>
+      <input
+        type="date" className="depot-input" value={to} onChange={(e) => onTo(e.target.value)}
+        style={{ padding: '7px 9px', borderRadius: 6, border: '1px solid rgba(20,33,61,0.15)', fontSize: 12.5, fontFamily: "'Nunito', sans-serif" }}
+      />
+      {(from || to) && (
+        <button className="depot-btn" onClick={() => { onFrom(''); onTo(''); }} style={{
+          background: 'transparent', border: 'none', color: 'var(--red)', fontSize: 11.5, textDecoration: 'underline', cursor: 'pointer',
+        }}>
+          Clear
+        </button>
+      )}
+    </div>
+  );
+}
+
 const DECOR_SETS = {
   login: [
     { Icon: Leaf, top: '8%', left: '10%', size: 46, rotate: -18, color: '#5C8A5A' },
@@ -235,7 +274,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
-    viewOwnSales: false, viewActivityLogs: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
@@ -243,7 +282,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
-    viewOwnSales: false, viewActivityLogs: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true,
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
@@ -251,7 +290,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: false,
     pos: true, viewReports: false, print: false, cancelSales: false,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
-    viewOwnSales: true, viewActivityLogs: false,
+    viewOwnSales: true, viewActivityLogs: false, manageUserProfiles: false,
   },
 };
 
@@ -271,8 +310,9 @@ const VIEW_PERMISSIONS = {
   sales: 'viewReports',
   mysales: 'viewOwnSales',
   history: 'viewReports',
-  approvals: 'manageUsers',
+  approvals: 'manageUserProfiles',
   activity: 'viewActivityLogs',
+  myprofile: 'manageUserProfiles',
 };
 
 function canAccessView(role, viewKey) {
@@ -288,6 +328,41 @@ function resolveRole(profile) {
   if (profile.role && PERMISSIONS[profile.role]) return profile.role;
   if (profile.isAdmin) return 'superadmin';
   return 'staff';
+}
+
+// A short, human-readable ID distinct from the long Firebase account ID.
+// Timestamp + random suffix keeps collisions practically impossible without
+// needing a server-side counter.
+function generateUserIdNumber() {
+  return 'U-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 5).toUpperCase();
+}
+
+// Profile photos live inside the Firestore user doc (this app has no
+// separate file storage), so they need to be small. Downscale to a square
+// thumbnail and re-encode as compressed JPEG before it ever touches the
+// database - a raw phone photo could otherwise be several MB.
+function resizePhotoToDataUri(file, maxSize = 160, quality = 0.75) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read the file'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Could not read that image'));
+      img.onload = () => {
+        const side = Math.min(img.width, img.height);
+        const sx = (img.width - side) / 2;
+        const sy = (img.height - side) / 2;
+        const canvas = document.createElement('canvas');
+        canvas.width = maxSize;
+        canvas.height = maxSize;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, sx, sy, side, side, 0, 0, maxSize, maxSize);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 // Background/color scheme presets a Super Admin can pick from. Each key
@@ -436,7 +511,7 @@ export default function InventorySystem() {
         if (!snap.exists()) {
           await setDoc(ref, {
             email: user.email || '', approved: false, isAdmin: false, role: 'staff', createdAt: Date.now(),
-          });
+          }, { merge: true });
         }
       } catch (e) {
         console.error('Profile bootstrap error:', e);
@@ -452,17 +527,18 @@ export default function InventorySystem() {
   const myRole = resolveRole(myProfile);
   const isManager = myRole === 'superadmin' || myRole === 'client';
 
-  // Only Super Admin manages Team Access now - Client no longer sees or
-  // manages other accounts, so there's no reason for Client to subscribe.
+  // Super Admin manages Team Access (everyone); Client subscribes too but
+  // only for the User Profiles view - Firestore rules mean a Client's query
+  // only ever returns Staff docs, never other Client/Super Admin accounts.
   useEffect(() => {
-    if (!user || myRole !== 'superadmin') { setPendingUsers([]); setApprovedUsers([]); return; }
+    if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
     const unsub = onSnapshot(collection(db, 'users'), (snap) => {
       const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
     });
     return unsub;
-  }, [user, myRole]);
+  }, [user, isManager]);
 
   const approveUser = async (uid) => {
     try {
@@ -498,6 +574,33 @@ export default function InventorySystem() {
       showToast(`Role updated to ${ROLES[newRole] || newRole}`);
     } catch (e) {
       showToast('Could not update role — check your connection');
+    }
+  };
+
+  // Edits profile info (name/username/contact/address) - never role or
+  // approval status, which stay behind the separate Team Access controls.
+  // Anyone can edit their own; a manager can edit others' (Client limited to
+  // Staff by the UI list they're given and by the Firestore rules).
+  const updateUserProfile = async (uid, fields) => {
+    const isSelf = uid === user.uid;
+    if (!isSelf && !can(myRole, 'manageUserProfiles')) {
+      showToast("You don't have permission to edit this profile");
+      return;
+    }
+    try {
+      const payload = {
+        fullName: fields.fullName?.trim() || '',
+        username: fields.username?.trim() || '',
+        contactNumber: fields.contactNumber?.trim() || '',
+        address: fields.address?.trim() || '',
+      };
+      // Only include photoDataUri when a new photo was actually picked, so
+      // saving other fields never accidentally clears an existing photo.
+      if (fields.photoDataUri !== undefined) payload.photoDataUri = fields.photoDataUri;
+      await setDoc(doc(db, 'users', uid), payload, { merge: true });
+      showToast('Profile updated');
+    } catch (e) {
+      showToast('Could not update profile — check your connection');
     }
   };
 
@@ -1089,6 +1192,7 @@ export default function InventorySystem() {
             onDeny={denyUser}
             onRevoke={revokeUser}
             onChangeRole={changeUserRole}
+            onSaveProfile={updateUserProfile}
             branding={branding}
             onSaveLogo={saveLogo}
             onResetLogo={resetLogo}
@@ -1098,6 +1202,10 @@ export default function InventorySystem() {
 
         {view === 'activity' && (
           <ActivityLogView logs={loginLogs} myRole={myRole} approvedUsers={approvedUsers} pendingUsers={pendingUsers} />
+        )}
+
+        {view === 'myprofile' && (
+          <MyProfileView profile={myProfile} uid={user.uid} onSave={updateUserProfile} />
         )}
         </>
         )}
@@ -1196,6 +1304,10 @@ function LoginScreen({ logo, theme }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [username, setUsername] = useState('');
+  const [contactNumber, setContactNumber] = useState('');
+  const [address, setAddress] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -1222,7 +1334,19 @@ function LoginScreen({ logo, theme }) {
     setBusy(true);
     try {
       if (mode === 'signup') {
-        await createUserWithEmailAndPassword(auth, email.trim(), password);
+        const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        // Written separately from (and merged with) the app's own profile
+        // bootstrap effect, so whichever runs first or second, neither wipes
+        // the other's fields.
+        try {
+          await setDoc(doc(db, 'users', cred.user.uid), {
+            email: email.trim(), approved: false, isAdmin: false, role: 'staff', createdAt: Date.now(),
+            fullName: fullName.trim(), username: username.trim(), contactNumber: contactNumber.trim(),
+            address: address.trim(), userIdNumber: generateUserIdNumber(),
+          }, { merge: true });
+        } catch (profileErr) {
+          console.error('Could not save signup profile details:', profileErr);
+        }
       } else {
         await signInWithEmailAndPassword(auth, email.trim(), password);
       }
@@ -1281,6 +1405,26 @@ function LoginScreen({ logo, theme }) {
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Confirm Password</label>
             <input
               type="password" required value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Full Name</label>
+            <input
+              type="text" required value={fullName} onChange={(e) => setFullName(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Username</label>
+            <input
+              type="text" required value={username} onChange={(e) => setUsername(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Contact Number</label>
+            <input
+              type="tel" required value={contactNumber} onChange={(e) => setContactNumber(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Address <span style={{ fontWeight: 400 }}>(optional)</span></label>
+            <input
+              type="text" value={address} onChange={(e) => setAddress(e.target.value)}
               style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
             />
           </>
@@ -1386,21 +1530,46 @@ function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
 }
 
 function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
-  const allItems = [
-    { key: 'overview', label: 'Overview', icon: LayoutGrid },
-    { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
-    { key: 'inventory', label: 'Inventory', icon: Boxes },
-    { key: 'suppliers', label: 'Suppliers', icon: Truck },
-    { key: 'categories', label: 'Categories', icon: Tag },
-    { key: 'locations', label: 'Locations', icon: MapPin },
-    { key: 'delivery', label: 'Delivery Times', icon: Timer },
-    { key: 'sales', label: 'Sales History', icon: Receipt },
-    { key: 'mysales', label: 'My Sales', icon: Receipt },
-    { key: 'history', label: 'Transaction History', icon: ScrollText },
-    { key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount },
-    { key: 'activity', label: 'Activity Log', icon: Clock },
+  const structure = [
+    { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
+    { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
+    { type: 'group', label: 'Inventory', icon: Boxes, children: [
+      { key: 'inventory', label: 'Inventory', icon: Boxes },
+      { key: 'suppliers', label: 'Suppliers', icon: Truck },
+      { key: 'categories', label: 'Categories', icon: Tag },
+      { key: 'locations', label: 'Zonal Locations', icon: MapPin },
+    ] },
+    { type: 'item', key: 'mysales', label: 'My Sales', icon: Receipt },
+    { type: 'group', label: 'Reports', icon: ScrollText, children: [
+      { key: 'delivery', label: 'Delivery Times', icon: Timer },
+      { key: 'sales', label: 'Sales History', icon: Receipt },
+      { key: 'history', label: 'Transaction History', icon: ScrollText },
+      { key: 'activity', label: 'Activity Log', icon: Clock },
+    ] },
+    { type: 'group', label: 'User Profiles', icon: User, children: [
+      { key: 'approvals', label: 'Team', icon: User, badge: pendingCount },
+      { key: 'myprofile', label: 'My Profile', icon: User },
+    ] },
   ];
-  const items = allItems.filter((it) => canAccessView(role, it.key));
+
+  // Resolve visibility: flat items check their own permission; groups are
+  // shown only if at least one child is visible to this role, and only
+  // their visible children render.
+  const resolved = structure
+    .map((entry) => {
+      if (entry.type === 'item') {
+        return canAccessView(role, entry.key) ? entry : null;
+      }
+      const children = entry.children.filter((c) => canAccessView(role, c.key));
+      return children.length ? { ...entry, children } : null;
+    })
+    .filter(Boolean);
+
+  const activeGroupLabel = resolved.find((e) => e.type === 'group' && e.children.some((c) => c.key === view))?.label;
+  const [openGroup, setOpenGroup] = useState(activeGroupLabel || null);
+
+  const toggleGroup = (label) => setOpenGroup((prev) => (prev === label ? null : label));
+
   return (
     <aside style={styles.sidebar} className="depot-sidebar">
       <div style={styles.brand} className="depot-brand">
@@ -1409,28 +1578,71 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
         </div>
       </div>
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 28 }} className="depot-sidebar-nav">
-        {items.map(({ key, label, icon: Icon, badge }) => (
-          <button
-            key={key}
-            className={`depot-btn depot-nav-btn${view === key ? ' depot-nav-active' : ''}`}
-            onClick={() => setView(key)}
-            style={{
-              ...styles.navBtn,
-              background: view === key ? 'rgba(201,169,106,0.14)' : 'transparent',
-              color: view === key ? '#fff' : 'rgba(245,243,236,0.65)',
-              borderLeft: view === key ? '3px solid var(--amber)' : '3px solid transparent',
-            }}
-          >
-            <Icon size={16} strokeWidth={2} />
-            <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{label}</span>
-            {key === 'inventory' && lowCount > 0 && (
-              <span style={styles.navBadge}>{lowCount}</span>
-            )}
-            {key === 'approvals' && badge > 0 && (
-              <span style={styles.navBadge}>{badge}</span>
-            )}
-          </button>
-        ))}
+        {resolved.map((entry) => {
+          if (entry.type === 'item') {
+            const { key, label, icon: Icon } = entry;
+            return (
+              <button
+                key={key}
+                className={`depot-btn depot-nav-btn${view === key ? ' depot-nav-active' : ''}`}
+                onClick={() => setView(key)}
+                style={{
+                  ...styles.navBtn,
+                  background: view === key ? 'rgba(201,169,106,0.14)' : 'transparent',
+                  color: view === key ? '#fff' : 'rgba(245,243,236,0.65)',
+                  borderLeft: view === key ? '3px solid var(--amber)' : '3px solid transparent',
+                }}
+              >
+                <Icon size={16} strokeWidth={2} />
+                <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{label}</span>
+                {key === 'inventory' && lowCount > 0 && (
+                  <span style={styles.navBadge}>{lowCount}</span>
+                )}
+              </button>
+            );
+          }
+          const isOpen = openGroup === entry.label;
+          const GroupIcon = entry.icon;
+          const groupBadge = entry.children.reduce((sum, c) => sum + (c.badge || 0), 0);
+          return (
+            <div key={entry.label}>
+              <button
+                className="depot-btn depot-nav-btn"
+                onClick={() => toggleGroup(entry.label)}
+                style={{
+                  ...styles.navBtn,
+                  background: 'transparent', color: 'rgba(245,243,236,0.65)', borderLeft: '3px solid transparent',
+                }}
+              >
+                <GroupIcon size={16} strokeWidth={2} />
+                <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{entry.label}</span>
+                {groupBadge > 0 && <span style={styles.navBadge}>{groupBadge}</span>}
+                <ChevronDown size={13} style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s ease' }} />
+              </button>
+              {isOpen && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}>
+                  {entry.children.map(({ key, label, icon: Icon, badge }) => (
+                    <button
+                      key={key}
+                      className={`depot-btn depot-nav-btn${view === key ? ' depot-nav-active' : ''}`}
+                      onClick={() => setView(key)}
+                      style={{
+                        ...styles.navBtn, paddingLeft: 34, fontSize: 12.5,
+                        background: view === key ? 'rgba(201,169,106,0.14)' : 'transparent',
+                        color: view === key ? '#fff' : 'rgba(245,243,236,0.55)',
+                        borderLeft: view === key ? '3px solid var(--amber)' : '3px solid transparent',
+                      }}
+                    >
+                      <Icon size={14} strokeWidth={2} />
+                      <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{label}</span>
+                      {badge > 0 && <span style={styles.navBadge}>{badge}</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </nav>
       <div style={styles.sidebarFoot} className="depot-sidebar-foot">
         <Clock size={12} />
@@ -1457,13 +1669,14 @@ function TopBar({ view, role, onAdd }) {
     inventory: ['Inventory', 'Every SKU on the floor'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     categories: ['Categories', 'Organize items into your own groups'],
-    locations: ['Locations', 'Manage where stock is stored'],
+    locations: ['Zonal Locations', 'Manage where stock is stored'],
     delivery: ['Delivery Times', 'Lead times and expected restocks'],
     sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
-    approvals: ['Team Access', 'Approve sign-ups and manage accounts'],
+    approvals: ['Team', 'Manage your team roster, roles, and approvals'],
     mysales: ['My Sales', 'Transactions you\'ve processed'],
     activity: ['Activity Log', 'Sign-in and sign-out history'],
+    myprofile: ['My Profile', 'Your personal details'],
   };
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'));
@@ -1781,7 +1994,7 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
           <MapPin size={15} color="rgba(59,42,31,0.5)" />
           <input
             className="depot-input"
-            placeholder="New location name (e.g. D-01)…"
+            placeholder="New zonal location name (e.g. D-01)…"
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
@@ -1790,12 +2003,12 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
         </div>
         <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: name.trim() ? 1 : 0.45 }}
           disabled={!name.trim()} onClick={submit}>
-          <Plus size={16} /> Add Location
+          <Plus size={16} /> Add Zonal Location
         </button>
       </div>
 
       {locations.length === 0 ? (
-        <div style={styles.panel}><div style={styles.emptyState}>No locations yet. Add your first one above.</div></div>
+        <div style={styles.panel}><div style={styles.emptyState}>No zonal locations yet. Add your first one above.</div></div>
       ) : (
         <div style={styles.supplierGrid} className="depot-card-grid">
           {locations.map((loc) => {
@@ -1820,6 +2033,16 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
 }
 
 function DeliveryTimesView({ rows, onUpdateStatus }) {
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  // Rows without a recorded delivery yet (e.g. brand-new items) have nothing
+  // to compare against a date range, so they stay visible regardless -
+  // hiding them would make "Reorder Now" items disappear from a filtered view.
+  const dateFiltered = useMemo(
+    () => rows.filter((r) => !r.lastDelivery || inDateRange(r.lastDelivery, dateFrom, dateTo)),
+    [rows, dateFrom, dateTo]
+  );
+
   const statusStyle = (status) => {
     if (status === 'Reorder Now' || status === 'Delayed') return { bg: 'rgba(193,84,60,0.1)', color: 'var(--red)' };
     if (status === 'Delivery Overdue') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
@@ -1829,7 +2052,7 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
 
   const handleDownload = () => {
     const headers = ['Supplier', 'SKU', 'Item', 'Lead Time (days)', 'Last Delivery', 'Expected Next', 'Status', 'Manually Set', 'Note'];
-    const csvRows = rows.map(({ item, supplier, lastDelivery, expectedNext, status, manual, note }) => [
+    const csvRows = dateFiltered.map(({ item, supplier, lastDelivery, expectedNext, status, manual, note }) => [
       supplier.name, item.sku, item.name, supplier.leadTimeDays, formatDate(lastDelivery), formatDate(expectedNext), status, manual ? 'Yes' : 'No', note,
     ]);
     downloadCSV('delivery-times.csv', headers, csvRows);
@@ -1838,6 +2061,10 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: 12 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+        <div style={{ ...styles.watchName, alignSelf: 'center' }}>filters by Last Delivery date</div>
+      </div>
       <div style={styles.tableWrap} className="depot-scroll">
         <table style={styles.table} className="depot-table">
           <thead>
@@ -1848,10 +2075,10 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
-              <tr><td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items are linked to a supplier yet.</td></tr>
+            {dateFiltered.length === 0 && (
+              <tr><td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your filters.</td></tr>
             )}
-            {rows.map((row) => {
+            {dateFiltered.map((row) => {
               const { item, supplier, lastDelivery, expectedNext, status, manual } = row;
               const st = statusStyle(status);
               return (
@@ -2036,25 +2263,29 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   const canCancel = can(role, 'cancelSales');
   const [cashierFilter, setCashierFilter] = useState('All');
   const [expandedId, setExpandedId] = useState(null);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  const dateFiltered = useMemo(() => sales.filter((s) => inDateRange(s.timestamp, dateFrom, dateTo)), [sales, dateFrom, dateTo]);
 
   const cashiers = useMemo(() => {
-    const set = new Set(sales.map((s) => s.cashierEmail).filter(Boolean));
+    const set = new Set(dateFiltered.map((s) => s.cashierEmail).filter(Boolean));
     return Array.from(set).sort();
-  }, [sales]);
+  }, [dateFiltered]);
 
   const filtered = useMemo(() => {
-    if (cashierFilter === 'All') return sales;
-    return sales.filter((s) => s.cashierEmail === cashierFilter);
-  }, [sales, cashierFilter]);
+    if (cashierFilter === 'All') return dateFiltered;
+    return dateFiltered.filter((s) => s.cashierEmail === cashierFilter);
+  }, [dateFiltered, cashierFilter]);
 
   const overall = useMemo(() => {
-    const active = sales.filter((s) => !s.cancelled);
+    const active = dateFiltered.filter((s) => !s.cancelled);
     return { count: active.length, total: active.reduce((sum, s) => sum + s.total, 0) };
-  }, [sales]);
+  }, [dateFiltered]);
 
   const byCashier = useMemo(() => {
     const map = {};
-    sales.forEach((s) => {
+    dateFiltered.forEach((s) => {
       if (s.cancelled) return;
       const key = s.cashierEmail || 'Unknown';
       if (!map[key]) map[key] = { count: 0, total: 0 };
@@ -2064,7 +2295,7 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
     return Object.entries(map)
       .map(([email, v]) => ({ email, ...v }))
       .sort((a, b) => b.total - a.total);
-  }, [sales]);
+  }, [dateFiltered]);
 
   const handleDownload = () => {
     const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
@@ -2085,6 +2316,9 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: 12 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
 
       <div style={styles.statGrid} className="depot-stat-grid">
         <StatCard icon={Receipt} label="Sales (Overall)" value={overall.count} accent="var(--blueprint)" />
@@ -2275,18 +2509,22 @@ function MySalesView({ sales }) {
 
 function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   const [userFilter, setUserFilter] = useState('All');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
   const roleByUid = useMemo(() => {
     const map = {};
     [...approvedUsers, ...pendingUsers].forEach((u) => { map[u.id] = u.role; });
     return map;
   }, [approvedUsers, pendingUsers]);
 
-  const users = useMemo(() => {
-    const set = new Set(logs.map((l) => l.email).filter(Boolean));
-    return Array.from(set).sort();
-  }, [logs]);
+  const dateFiltered = useMemo(() => logs.filter((l) => inDateRange(l.timestamp, dateFrom, dateTo)), [logs, dateFrom, dateTo]);
 
-  const filtered = userFilter === 'All' ? logs : logs.filter((l) => l.email === userFilter);
+  const users = useMemo(() => {
+    const set = new Set(dateFiltered.map((l) => l.email).filter(Boolean));
+    return Array.from(set).sort();
+  }, [dateFiltered]);
+
+  const filtered = userFilter === 'All' ? dateFiltered : dateFiltered.filter((l) => l.email === userFilter);
 
   const handleDownload = () => {
     const headers = ['Email', 'Role', 'Type', 'Timestamp'];
@@ -2297,6 +2535,9 @@ function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: users.length > 0 ? 8 : 16 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
       {users.length > 0 && (
         <div style={styles.filterBar} className="depot-no-print depot-filterbar">
           <select className="depot-select" value={userFilter} onChange={(e) => setUserFilter(e.target.value)} style={styles.select}>
@@ -2342,9 +2583,196 @@ function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, branding, onSaveLogo, onResetLogo, onSetTheme }) {
+function ProfileEditModal({ user, onClose, onSave }) {
+  const [fullName, setFullName] = useState(user.fullName || '');
+  const [username, setUsername] = useState(user.username || '');
+  const [contactNumber, setContactNumber] = useState(user.contactNumber || '');
+  const [address, setAddress] = useState(user.address || '');
+  const [photoDataUri, setPhotoDataUri] = useState(undefined); // undefined = unchanged
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const [photoError, setPhotoError] = useState('');
+
+  const handlePhotoFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoError('');
+    setPhotoBusy(true);
+    try {
+      const resized = await resizePhotoToDataUri(file);
+      setPhotoDataUri(resized);
+    } catch (err) {
+      setPhotoError('Could not process that image. Try a different file.');
+    } finally {
+      setPhotoBusy(false);
+    }
+  };
+
+  const submit = () => {
+    onSave(user.id, { fullName, username, contactNumber, address, photoDataUri });
+    onClose();
+  };
+
+  const currentPhoto = photoDataUri !== undefined ? photoDataUri : user.photoDataUri;
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={{ ...styles.modal, maxWidth: 400 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>EDIT PROFILE — {user.email}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.5)', marginBottom: 14, fontFamily: "'IBM Plex Mono', monospace" }}>
+            ID: {user.userIdNumber || '—'} · Account: {user.id}
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
+            <Avatar src={currentPhoto} name={fullName || user.email} size={56} />
+            <div>
+              <input type="file" accept="image/*" onChange={handlePhotoFile} disabled={photoBusy} style={{ fontSize: 12 }} />
+              {photoBusy && <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Processing photo…</div>}
+              {photoError && <div style={{ fontSize: 11.5, color: 'var(--red)', marginTop: 4 }}>{photoError}</div>}
+              {currentPhoto && (
+                <button
+                  type="button"
+                  className="depot-btn"
+                  onClick={() => setPhotoDataUri(null)}
+                  style={{ background: 'transparent', border: 'none', padding: 0, marginTop: 4, fontSize: 11.5, color: 'var(--red)', textDecoration: 'underline', cursor: 'pointer' }}
+                >
+                  Remove photo
+                </button>
+              )}
+            </div>
+          </div>
+
+          <Field label="Full Name">
+            <input className="depot-input" style={styles.modalInput} value={fullName} onChange={(e) => setFullName(e.target.value)} />
+          </Field>
+          <Field label="Username">
+            <input className="depot-input" style={styles.modalInput} value={username} onChange={(e) => setUsername(e.target.value)} />
+          </Field>
+          <Field label="Contact Number">
+            <input className="depot-input" style={styles.modalInput} value={contactNumber} onChange={(e) => setContactNumber(e.target.value)} />
+          </Field>
+          <Field label="Address">
+            <input className="depot-input" style={styles.modalInput} value={address} onChange={(e) => setAddress(e.target.value)} />
+          </Field>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={styles.primaryBtn} onClick={submit} disabled={photoBusy}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UserProfilesView({ approvedUsers, myRole, onSave }) {
+  const [editingUser, setEditingUser] = useState(null);
+  // A Client's `approvedUsers` list is already scoped to Staff only by the
+  // Firestore rules (they can't read Client/Super Admin docs), so no extra
+  // client-side filtering is needed here.
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={styles.panel}>
+        <div style={styles.panelHeader}>
+          <User size={15} />
+          <span>{myRole === 'superadmin' ? 'ALL TEAM PROFILES' : 'STAFF PROFILES'} ({approvedUsers.length})</span>
+        </div>
+        {approvedUsers.length === 0 ? (
+          <div style={styles.emptyState}>No profiles to show yet.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+            {approvedUsers.map((u) => (
+              <div key={u.id} style={{ ...styles.watchRow, alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <Avatar src={u.photoDataUri} name={u.fullName || u.email} size={40} />
+                  <div>
+                    <div style={styles.watchSku}>{u.fullName || u.email}</div>
+                    <div style={styles.watchName}>
+                      {u.fullName ? u.email + ' · ' : ''}{ROLES[u.role] || 'Staff'}
+                      {u.contactNumber ? ` · ${u.contactNumber}` : ''}
+                    </div>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>
+                      ID: {u.userIdNumber || '—'}
+                    </div>
+                  </div>
+                </div>
+                <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setEditingUser(u)}>Edit</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {editingUser && (
+        <ProfileEditModal user={editingUser} onClose={() => setEditingUser(null)} onSave={onSave} />
+      )}
+    </div>
+  );
+}
+
+function MyProfileView({ profile, uid, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const me = { id: uid, ...(profile || {}) };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={{ ...styles.panel, maxWidth: 480 }}>
+        <div style={styles.panelHeader}>
+          <User size={15} />
+          <span>YOUR DETAILS</span>
+        </div>
+        <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 6 }}>
+            <Avatar src={me.photoDataUri} name={me.fullName || me.email} size={88} />
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Full Name</div>
+            <div style={{ fontSize: 14 }}>{me.fullName || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Username</div>
+            <div style={{ fontSize: 14 }}>{me.username || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Email</div>
+            <div style={{ fontSize: 14 }}>{me.email || '—'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Contact Number</div>
+            <div style={{ fontSize: 14 }}>{me.contactNumber || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Address</div>
+            <div style={{ fontSize: 14 }}>{me.address || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Unique ID Number</div>
+            <div style={{ fontSize: 13, fontFamily: "'IBM Plex Mono', monospace" }}>{me.userIdNumber || '—'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Role</div>
+            <div style={{ fontSize: 14 }}>{ROLES[me.role] || 'Staff'}</div>
+          </div>
+        </div>
+        <button className="depot-btn" style={{ ...styles.primaryBtn, marginTop: 18 }} onClick={() => setEditing(true)}>
+          Edit My Details
+        </button>
+      </div>
+
+      {editing && (
+        <ProfileEditModal user={me} onClose={() => setEditing(false)} onSave={onSave} />
+      )}
+    </div>
+  );
+}
+
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
+  const [editingUser, setEditingUser] = useState(null);
   const activeThemeKey = branding?.themeKey || DEFAULT_THEME_KEY;
 
   const handleLogoFile = (e) => {
@@ -2357,9 +2785,14 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
 
   // A Client can only promote/demote within reach of their own permissions -
   // in practice that means they don't get a role selector at all; only
-  // Super Admin can reassign roles (staff <-> client <-> superadmin).
+  // Super Admin can reassign roles (staff <-> client <-> superadmin). Both
+  // Super Admin and Client (whoever can reach this page at all) can edit
+  // profile info via the Edit button - a Client's `approvedUsers` list is
+  // already scoped to Staff only by the Firestore rules, so there's nothing
+  // extra to filter here.
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {isSuperAdmin && (
       <div style={styles.panel}>
         <div style={styles.panelHeader}>
           <User size={15} />
@@ -2370,12 +2803,15 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
             {pendingUsers.map((u) => (
-              <div key={u.id} style={styles.watchRow}>
-                <div>
-                  <div style={styles.watchSku}>{u.email}</div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
-                  <div style={styles.watchName}>
-                    {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
+              <div key={u.id} style={{ ...styles.watchRow, alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <Avatar src={u.photoDataUri} name={u.fullName || u.email} size={34} />
+                  <div>
+                    <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
+                    <div style={styles.watchName}>
+                      {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
+                    </div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -2397,6 +2833,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
           </div>
         )}
       </div>
+      )}
 
       <div style={{ ...styles.panel, marginTop: 16 }}>
         <div style={styles.panelHeader}>
@@ -2408,11 +2845,14 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
             {approvedUsers.map((u) => (
-              <div key={u.id} style={styles.watchRow}>
-                <div>
-                  <div style={styles.watchSku}>{u.email}</div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
-                  <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
+              <div key={u.id} style={{ ...styles.watchRow, alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <Avatar src={u.photoDataUri} name={u.fullName || u.email} size={34} />
+                  <div>
+                    <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
+                    <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
+                  </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                   {isSuperAdmin && u.id !== currentUid && (
@@ -2425,7 +2865,8 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
                       {Object.keys(ROLES).map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}
                     </select>
                   )}
-                  {u.id !== currentUid && (
+                  <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setEditingUser(u)}>Edit</button>
+                  {isSuperAdmin && u.id !== currentUid && (
                     <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onRevoke(u.id)}>Revoke</button>
                   )}
                 </div>
@@ -2434,6 +2875,10 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
           </div>
         )}
       </div>
+
+      {editingUser && (
+        <ProfileEditModal user={editingUser} onClose={() => setEditingUser(null)} onSave={onSaveProfile} />
+      )}
 
       {isSuperAdmin && (
         <div style={{ ...styles.panel, marginTop: 16 }}>
@@ -2502,10 +2947,13 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
 
 function TransactionHistoryView({ movements, items, histSearch, setHistSearch, histType, setHistType, histItem, setHistItem }) {
   const itemMap = useMemo(() => Object.fromEntries(items.map((i) => [i.id, i])), [items]);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const dateFiltered = useMemo(() => movements.filter((m) => inDateRange(m.timestamp, dateFrom, dateTo)), [movements, dateFrom, dateTo]);
 
   const handleDownload = () => {
     const headers = ['Date', 'Type', 'SKU', 'Item', 'Qty', 'Reason'];
-    const rows = movements.map((m) => {
+    const rows = dateFiltered.map((m) => {
       const it = itemMap[m.itemId];
       return [
         new Date(m.timestamp).toLocaleString('en-PH'),
@@ -2522,6 +2970,9 @@ function TransactionHistoryView({ movements, items, histSearch, setHistSearch, h
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: 8 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
       <div style={styles.filterBar} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
@@ -2545,8 +2996,8 @@ function TransactionHistoryView({ movements, items, histSearch, setHistSearch, h
       </div>
 
       <div style={styles.ledger}>
-        {movements.length === 0 && <div style={styles.panel}><div style={styles.emptyState}>No transactions match your filters.</div></div>}
-        {movements.map((m) => {
+        {dateFiltered.length === 0 && <div style={styles.panel}><div style={styles.emptyState}>No transactions match your filters.</div></div>}
+        {dateFiltered.map((m) => {
           const it = itemMap[m.itemId];
           const inbound = m.type === 'in';
           return (
@@ -2566,6 +3017,27 @@ function TransactionHistoryView({ movements, items, histSearch, setHistSearch, h
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function Avatar({ src, name, size = 36 }) {
+  const initials = (name || '?').trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
+  if (src) {
+    return (
+      <img src={src} alt="" style={{
+        width: size, height: size, borderRadius: '50%', objectFit: 'cover',
+        border: '1px solid rgba(59,42,31,0.15)', flexShrink: 0,
+      }} />
+    );
+  }
+  return (
+    <div style={{
+      width: size, height: size, borderRadius: '50%', background: 'var(--amber, #D9A441)',
+      color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: size * 0.4, fontWeight: 700, fontFamily: "'Quicksand', sans-serif", flexShrink: 0,
+    }}>
+      {initials}
     </div>
   );
 }
