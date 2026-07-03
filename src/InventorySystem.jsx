@@ -156,6 +156,45 @@ function ExportBar({ onPrint, onDownload }) {
   );
 }
 
+// Returns true if `ts` (ms epoch) falls within the inclusive [from, to] date
+// range, where from/to are 'YYYY-MM-DD' strings or '' (no bound).
+function inDateRange(ts, from, to) {
+  if (!ts) return true;
+  if (from) {
+    const start = new Date(from + 'T00:00:00').getTime();
+    if (ts < start) return false;
+  }
+  if (to) {
+    const end = new Date(to + 'T23:59:59.999').getTime();
+    if (ts > end) return false;
+  }
+  return true;
+}
+
+function DateRangeFilter({ from, to, onFrom, onTo }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+      <label style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', fontWeight: 600 }}>From</label>
+      <input
+        type="date" className="depot-input" value={from} onChange={(e) => onFrom(e.target.value)}
+        style={{ padding: '7px 9px', borderRadius: 6, border: '1px solid rgba(20,33,61,0.15)', fontSize: 12.5, fontFamily: "'Nunito', sans-serif" }}
+      />
+      <label style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', fontWeight: 600 }}>To</label>
+      <input
+        type="date" className="depot-input" value={to} onChange={(e) => onTo(e.target.value)}
+        style={{ padding: '7px 9px', borderRadius: 6, border: '1px solid rgba(20,33,61,0.15)', fontSize: 12.5, fontFamily: "'Nunito', sans-serif" }}
+      />
+      {(from || to) && (
+        <button className="depot-btn" onClick={() => { onFrom(''); onTo(''); }} style={{
+          background: 'transparent', border: 'none', color: 'var(--red)', fontSize: 11.5, textDecoration: 'underline', cursor: 'pointer',
+        }}>
+          Clear
+        </button>
+      )}
+    </div>
+  );
+}
+
 const DECOR_SETS = {
   login: [
     { Icon: Leaf, top: '8%', left: '10%', size: 46, rotate: -18, color: '#5C8A5A' },
@@ -271,10 +310,9 @@ const VIEW_PERMISSIONS = {
   sales: 'viewReports',
   mysales: 'viewOwnSales',
   history: 'viewReports',
-  approvals: 'manageUsers',
+  approvals: 'manageUserProfiles',
   activity: 'viewActivityLogs',
-  profiles: 'manageUserProfiles',
-  myprofile: null,
+  myprofile: 'manageUserProfiles',
 };
 
 function canAccessView(role, viewKey) {
@@ -1154,6 +1192,7 @@ export default function InventorySystem() {
             onDeny={denyUser}
             onRevoke={revokeUser}
             onChangeRole={changeUserRole}
+            onSaveProfile={updateUserProfile}
             branding={branding}
             onSaveLogo={saveLogo}
             onResetLogo={resetLogo}
@@ -1163,14 +1202,6 @@ export default function InventorySystem() {
 
         {view === 'activity' && (
           <ActivityLogView logs={loginLogs} myRole={myRole} approvedUsers={approvedUsers} pendingUsers={pendingUsers} />
-        )}
-
-        {view === 'profiles' && (
-          <UserProfilesView
-            approvedUsers={approvedUsers}
-            myRole={myRole}
-            onSave={updateUserProfile}
-          />
         )}
 
         {view === 'myprofile' && (
@@ -1499,23 +1530,46 @@ function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
 }
 
 function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
-  const allItems = [
-    { key: 'overview', label: 'Overview', icon: LayoutGrid },
-    { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
-    { key: 'inventory', label: 'Inventory', icon: Boxes },
-    { key: 'suppliers', label: 'Suppliers', icon: Truck },
-    { key: 'categories', label: 'Categories', icon: Tag },
-    { key: 'locations', label: 'Locations', icon: MapPin },
-    { key: 'delivery', label: 'Delivery Times', icon: Timer },
-    { key: 'sales', label: 'Sales History', icon: Receipt },
-    { key: 'mysales', label: 'My Sales', icon: Receipt },
-    { key: 'history', label: 'Transaction History', icon: ScrollText },
-    { key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount },
-    { key: 'activity', label: 'Activity Log', icon: Clock },
-    { key: 'profiles', label: 'User Profiles', icon: User },
-    { key: 'myprofile', label: 'My Profile', icon: User },
+  const structure = [
+    { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
+    { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
+    { type: 'group', label: 'Inventory', icon: Boxes, children: [
+      { key: 'inventory', label: 'Inventory', icon: Boxes },
+      { key: 'suppliers', label: 'Suppliers', icon: Truck },
+      { key: 'categories', label: 'Categories', icon: Tag },
+      { key: 'locations', label: 'Zonal Locations', icon: MapPin },
+    ] },
+    { type: 'item', key: 'mysales', label: 'My Sales', icon: Receipt },
+    { type: 'group', label: 'Reports', icon: ScrollText, children: [
+      { key: 'delivery', label: 'Delivery Times', icon: Timer },
+      { key: 'sales', label: 'Sales History', icon: Receipt },
+      { key: 'history', label: 'Transaction History', icon: ScrollText },
+      { key: 'activity', label: 'Activity Log', icon: Clock },
+    ] },
+    { type: 'group', label: 'User Profiles', icon: User, children: [
+      { key: 'approvals', label: 'Team', icon: User, badge: pendingCount },
+      { key: 'myprofile', label: 'My Profile', icon: User },
+    ] },
   ];
-  const items = allItems.filter((it) => canAccessView(role, it.key));
+
+  // Resolve visibility: flat items check their own permission; groups are
+  // shown only if at least one child is visible to this role, and only
+  // their visible children render.
+  const resolved = structure
+    .map((entry) => {
+      if (entry.type === 'item') {
+        return canAccessView(role, entry.key) ? entry : null;
+      }
+      const children = entry.children.filter((c) => canAccessView(role, c.key));
+      return children.length ? { ...entry, children } : null;
+    })
+    .filter(Boolean);
+
+  const activeGroupLabel = resolved.find((e) => e.type === 'group' && e.children.some((c) => c.key === view))?.label;
+  const [openGroup, setOpenGroup] = useState(activeGroupLabel || null);
+
+  const toggleGroup = (label) => setOpenGroup((prev) => (prev === label ? null : label));
+
   return (
     <aside style={styles.sidebar} className="depot-sidebar">
       <div style={styles.brand} className="depot-brand">
@@ -1524,28 +1578,71 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
         </div>
       </div>
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 28 }} className="depot-sidebar-nav">
-        {items.map(({ key, label, icon: Icon, badge }) => (
-          <button
-            key={key}
-            className={`depot-btn depot-nav-btn${view === key ? ' depot-nav-active' : ''}`}
-            onClick={() => setView(key)}
-            style={{
-              ...styles.navBtn,
-              background: view === key ? 'rgba(201,169,106,0.14)' : 'transparent',
-              color: view === key ? '#fff' : 'rgba(245,243,236,0.65)',
-              borderLeft: view === key ? '3px solid var(--amber)' : '3px solid transparent',
-            }}
-          >
-            <Icon size={16} strokeWidth={2} />
-            <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{label}</span>
-            {key === 'inventory' && lowCount > 0 && (
-              <span style={styles.navBadge}>{lowCount}</span>
-            )}
-            {key === 'approvals' && badge > 0 && (
-              <span style={styles.navBadge}>{badge}</span>
-            )}
-          </button>
-        ))}
+        {resolved.map((entry) => {
+          if (entry.type === 'item') {
+            const { key, label, icon: Icon } = entry;
+            return (
+              <button
+                key={key}
+                className={`depot-btn depot-nav-btn${view === key ? ' depot-nav-active' : ''}`}
+                onClick={() => setView(key)}
+                style={{
+                  ...styles.navBtn,
+                  background: view === key ? 'rgba(201,169,106,0.14)' : 'transparent',
+                  color: view === key ? '#fff' : 'rgba(245,243,236,0.65)',
+                  borderLeft: view === key ? '3px solid var(--amber)' : '3px solid transparent',
+                }}
+              >
+                <Icon size={16} strokeWidth={2} />
+                <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{label}</span>
+                {key === 'inventory' && lowCount > 0 && (
+                  <span style={styles.navBadge}>{lowCount}</span>
+                )}
+              </button>
+            );
+          }
+          const isOpen = openGroup === entry.label;
+          const GroupIcon = entry.icon;
+          const groupBadge = entry.children.reduce((sum, c) => sum + (c.badge || 0), 0);
+          return (
+            <div key={entry.label}>
+              <button
+                className="depot-btn depot-nav-btn"
+                onClick={() => toggleGroup(entry.label)}
+                style={{
+                  ...styles.navBtn,
+                  background: 'transparent', color: 'rgba(245,243,236,0.65)', borderLeft: '3px solid transparent',
+                }}
+              >
+                <GroupIcon size={16} strokeWidth={2} />
+                <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{entry.label}</span>
+                {groupBadge > 0 && <span style={styles.navBadge}>{groupBadge}</span>}
+                <ChevronDown size={13} style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s ease' }} />
+              </button>
+              {isOpen && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 2 }}>
+                  {entry.children.map(({ key, label, icon: Icon, badge }) => (
+                    <button
+                      key={key}
+                      className={`depot-btn depot-nav-btn${view === key ? ' depot-nav-active' : ''}`}
+                      onClick={() => setView(key)}
+                      style={{
+                        ...styles.navBtn, paddingLeft: 34, fontSize: 12.5,
+                        background: view === key ? 'rgba(201,169,106,0.14)' : 'transparent',
+                        color: view === key ? '#fff' : 'rgba(245,243,236,0.55)',
+                        borderLeft: view === key ? '3px solid var(--amber)' : '3px solid transparent',
+                      }}
+                    >
+                      <Icon size={14} strokeWidth={2} />
+                      <span style={{ flex: 1, textAlign: 'left' }} className="depot-nav-label">{label}</span>
+                      {badge > 0 && <span style={styles.navBadge}>{badge}</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </nav>
       <div style={styles.sidebarFoot} className="depot-sidebar-foot">
         <Clock size={12} />
@@ -1572,14 +1669,13 @@ function TopBar({ view, role, onAdd }) {
     inventory: ['Inventory', 'Every SKU on the floor'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     categories: ['Categories', 'Organize items into your own groups'],
-    locations: ['Locations', 'Manage where stock is stored'],
+    locations: ['Zonal Locations', 'Manage where stock is stored'],
     delivery: ['Delivery Times', 'Lead times and expected restocks'],
     sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
-    approvals: ['Team Access', 'Approve sign-ups and manage accounts'],
+    approvals: ['Team', 'Manage your team roster, roles, and approvals'],
     mysales: ['My Sales', 'Transactions you\'ve processed'],
     activity: ['Activity Log', 'Sign-in and sign-out history'],
-    profiles: ['User Profiles', 'Edit real name, contact, and address details'],
     myprofile: ['My Profile', 'Your personal details'],
   };
   const [title, sub] = titles[view];
@@ -1898,7 +1994,7 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
           <MapPin size={15} color="rgba(59,42,31,0.5)" />
           <input
             className="depot-input"
-            placeholder="New location name (e.g. D-01)…"
+            placeholder="New zonal location name (e.g. D-01)…"
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
@@ -1907,12 +2003,12 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
         </div>
         <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: name.trim() ? 1 : 0.45 }}
           disabled={!name.trim()} onClick={submit}>
-          <Plus size={16} /> Add Location
+          <Plus size={16} /> Add Zonal Location
         </button>
       </div>
 
       {locations.length === 0 ? (
-        <div style={styles.panel}><div style={styles.emptyState}>No locations yet. Add your first one above.</div></div>
+        <div style={styles.panel}><div style={styles.emptyState}>No zonal locations yet. Add your first one above.</div></div>
       ) : (
         <div style={styles.supplierGrid} className="depot-card-grid">
           {locations.map((loc) => {
@@ -1937,6 +2033,16 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
 }
 
 function DeliveryTimesView({ rows, onUpdateStatus }) {
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  // Rows without a recorded delivery yet (e.g. brand-new items) have nothing
+  // to compare against a date range, so they stay visible regardless -
+  // hiding them would make "Reorder Now" items disappear from a filtered view.
+  const dateFiltered = useMemo(
+    () => rows.filter((r) => !r.lastDelivery || inDateRange(r.lastDelivery, dateFrom, dateTo)),
+    [rows, dateFrom, dateTo]
+  );
+
   const statusStyle = (status) => {
     if (status === 'Reorder Now' || status === 'Delayed') return { bg: 'rgba(193,84,60,0.1)', color: 'var(--red)' };
     if (status === 'Delivery Overdue') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
@@ -1946,7 +2052,7 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
 
   const handleDownload = () => {
     const headers = ['Supplier', 'SKU', 'Item', 'Lead Time (days)', 'Last Delivery', 'Expected Next', 'Status', 'Manually Set', 'Note'];
-    const csvRows = rows.map(({ item, supplier, lastDelivery, expectedNext, status, manual, note }) => [
+    const csvRows = dateFiltered.map(({ item, supplier, lastDelivery, expectedNext, status, manual, note }) => [
       supplier.name, item.sku, item.name, supplier.leadTimeDays, formatDate(lastDelivery), formatDate(expectedNext), status, manual ? 'Yes' : 'No', note,
     ]);
     downloadCSV('delivery-times.csv', headers, csvRows);
@@ -1955,6 +2061,10 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: 12 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+        <div style={{ ...styles.watchName, alignSelf: 'center' }}>filters by Last Delivery date</div>
+      </div>
       <div style={styles.tableWrap} className="depot-scroll">
         <table style={styles.table} className="depot-table">
           <thead>
@@ -1965,10 +2075,10 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
-              <tr><td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items are linked to a supplier yet.</td></tr>
+            {dateFiltered.length === 0 && (
+              <tr><td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your filters.</td></tr>
             )}
-            {rows.map((row) => {
+            {dateFiltered.map((row) => {
               const { item, supplier, lastDelivery, expectedNext, status, manual } = row;
               const st = statusStyle(status);
               return (
@@ -2153,25 +2263,29 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   const canCancel = can(role, 'cancelSales');
   const [cashierFilter, setCashierFilter] = useState('All');
   const [expandedId, setExpandedId] = useState(null);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  const dateFiltered = useMemo(() => sales.filter((s) => inDateRange(s.timestamp, dateFrom, dateTo)), [sales, dateFrom, dateTo]);
 
   const cashiers = useMemo(() => {
-    const set = new Set(sales.map((s) => s.cashierEmail).filter(Boolean));
+    const set = new Set(dateFiltered.map((s) => s.cashierEmail).filter(Boolean));
     return Array.from(set).sort();
-  }, [sales]);
+  }, [dateFiltered]);
 
   const filtered = useMemo(() => {
-    if (cashierFilter === 'All') return sales;
-    return sales.filter((s) => s.cashierEmail === cashierFilter);
-  }, [sales, cashierFilter]);
+    if (cashierFilter === 'All') return dateFiltered;
+    return dateFiltered.filter((s) => s.cashierEmail === cashierFilter);
+  }, [dateFiltered, cashierFilter]);
 
   const overall = useMemo(() => {
-    const active = sales.filter((s) => !s.cancelled);
+    const active = dateFiltered.filter((s) => !s.cancelled);
     return { count: active.length, total: active.reduce((sum, s) => sum + s.total, 0) };
-  }, [sales]);
+  }, [dateFiltered]);
 
   const byCashier = useMemo(() => {
     const map = {};
-    sales.forEach((s) => {
+    dateFiltered.forEach((s) => {
       if (s.cancelled) return;
       const key = s.cashierEmail || 'Unknown';
       if (!map[key]) map[key] = { count: 0, total: 0 };
@@ -2181,7 +2295,7 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
     return Object.entries(map)
       .map(([email, v]) => ({ email, ...v }))
       .sort((a, b) => b.total - a.total);
-  }, [sales]);
+  }, [dateFiltered]);
 
   const handleDownload = () => {
     const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
@@ -2202,6 +2316,9 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: 12 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
 
       <div style={styles.statGrid} className="depot-stat-grid">
         <StatCard icon={Receipt} label="Sales (Overall)" value={overall.count} accent="var(--blueprint)" />
@@ -2392,18 +2509,22 @@ function MySalesView({ sales }) {
 
 function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   const [userFilter, setUserFilter] = useState('All');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
   const roleByUid = useMemo(() => {
     const map = {};
     [...approvedUsers, ...pendingUsers].forEach((u) => { map[u.id] = u.role; });
     return map;
   }, [approvedUsers, pendingUsers]);
 
-  const users = useMemo(() => {
-    const set = new Set(logs.map((l) => l.email).filter(Boolean));
-    return Array.from(set).sort();
-  }, [logs]);
+  const dateFiltered = useMemo(() => logs.filter((l) => inDateRange(l.timestamp, dateFrom, dateTo)), [logs, dateFrom, dateTo]);
 
-  const filtered = userFilter === 'All' ? logs : logs.filter((l) => l.email === userFilter);
+  const users = useMemo(() => {
+    const set = new Set(dateFiltered.map((l) => l.email).filter(Boolean));
+    return Array.from(set).sort();
+  }, [dateFiltered]);
+
+  const filtered = userFilter === 'All' ? dateFiltered : dateFiltered.filter((l) => l.email === userFilter);
 
   const handleDownload = () => {
     const headers = ['Email', 'Role', 'Type', 'Timestamp'];
@@ -2414,6 +2535,9 @@ function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: users.length > 0 ? 8 : 16 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
       {users.length > 0 && (
         <div style={styles.filterBar} className="depot-no-print depot-filterbar">
           <select className="depot-select" value={userFilter} onChange={(e) => setUserFilter(e.target.value)} style={styles.select}>
@@ -2645,9 +2769,10 @@ function MyProfileView({ profile, uid, onSave }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, branding, onSaveLogo, onResetLogo, onSetTheme }) {
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
+  const [editingUser, setEditingUser] = useState(null);
   const activeThemeKey = branding?.themeKey || DEFAULT_THEME_KEY;
 
   const handleLogoFile = (e) => {
@@ -2660,9 +2785,14 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
 
   // A Client can only promote/demote within reach of their own permissions -
   // in practice that means they don't get a role selector at all; only
-  // Super Admin can reassign roles (staff <-> client <-> superadmin).
+  // Super Admin can reassign roles (staff <-> client <-> superadmin). Both
+  // Super Admin and Client (whoever can reach this page at all) can edit
+  // profile info via the Edit button - a Client's `approvedUsers` list is
+  // already scoped to Staff only by the Firestore rules, so there's nothing
+  // extra to filter here.
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {isSuperAdmin && (
       <div style={styles.panel}>
         <div style={styles.panelHeader}>
           <User size={15} />
@@ -2703,6 +2833,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
           </div>
         )}
       </div>
+      )}
 
       <div style={{ ...styles.panel, marginTop: 16 }}>
         <div style={styles.panelHeader}>
@@ -2734,7 +2865,8 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
                       {Object.keys(ROLES).map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}
                     </select>
                   )}
-                  {u.id !== currentUid && (
+                  <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setEditingUser(u)}>Edit</button>
+                  {isSuperAdmin && u.id !== currentUid && (
                     <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onRevoke(u.id)}>Revoke</button>
                   )}
                 </div>
@@ -2743,6 +2875,10 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
           </div>
         )}
       </div>
+
+      {editingUser && (
+        <ProfileEditModal user={editingUser} onClose={() => setEditingUser(null)} onSave={onSaveProfile} />
+      )}
 
       {isSuperAdmin && (
         <div style={{ ...styles.panel, marginTop: 16 }}>
@@ -2811,10 +2947,13 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
 
 function TransactionHistoryView({ movements, items, histSearch, setHistSearch, histType, setHistType, histItem, setHistItem }) {
   const itemMap = useMemo(() => Object.fromEntries(items.map((i) => [i.id, i])), [items]);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const dateFiltered = useMemo(() => movements.filter((m) => inDateRange(m.timestamp, dateFrom, dateTo)), [movements, dateFrom, dateTo]);
 
   const handleDownload = () => {
     const headers = ['Date', 'Type', 'SKU', 'Item', 'Qty', 'Reason'];
-    const rows = movements.map((m) => {
+    const rows = dateFiltered.map((m) => {
       const it = itemMap[m.itemId];
       return [
         new Date(m.timestamp).toLocaleString('en-PH'),
@@ -2831,6 +2970,9 @@ function TransactionHistoryView({ movements, items, histSearch, setHistSearch, h
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={{ ...styles.filterBar, marginBottom: 8 }} className="depot-no-print depot-filterbar">
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
       <div style={styles.filterBar} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
@@ -2854,8 +2996,8 @@ function TransactionHistoryView({ movements, items, histSearch, setHistSearch, h
       </div>
 
       <div style={styles.ledger}>
-        {movements.length === 0 && <div style={styles.panel}><div style={styles.emptyState}>No transactions match your filters.</div></div>}
-        {movements.map((m) => {
+        {dateFiltered.length === 0 && <div style={styles.panel}><div style={styles.emptyState}>No transactions match your filters.</div></div>}
+        {dateFiltered.map((m) => {
           const it = itemMap[m.itemId];
           const inbound = m.type === 'in';
           return (
