@@ -77,7 +77,6 @@ const LOGO_DATA_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA+AAAAISCAI
 const DEFAULT_CATEGORIES = ['Raw Materials', 'Components', 'Packaging', 'Finished Goods', 'Tools & Equipment'];
 const DEFAULT_LOCATIONS = ['A-01', 'A-02', 'B-01', 'B-02', 'C-01', 'C-02', 'Dock'];
 const DAY_MS = 24 * 60 * 60 * 1000;
-const PAYMENT_METHODS = ['Cash', 'GCash'];
 
 function PesoIcon({ size = 18, color = 'currentColor', strokeWidth = 2.2 }) {
   return (
@@ -994,7 +993,7 @@ export default function InventorySystem() {
     setMoveModal(null);
   };
 
-  const completeSale = async (cartLines, paymentMethod) => {
+  const completeSale = async (cartLines) => {
     if (cartLines.length === 0) return;
     for (const line of cartLines) {
       const item = items.find((i) => i.id === line.itemId);
@@ -1023,7 +1022,7 @@ export default function InventorySystem() {
     const total = subtotal;
     const sale = {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
-      subtotal, total, totalCost, totalProfit, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '', ownerId,
+      subtotal, total, totalCost, totalProfit, cashierId: user.uid, cashierEmail: user.email || '', ownerId,
     };
 
     try {
@@ -1502,6 +1501,7 @@ export default function InventorySystem() {
           message={<>Cancel the order for <strong>{confirmModal.target.quantity} × {confirmModal.target.itemSku}</strong> from <strong>{confirmModal.target.supplierName}</strong>? This won't affect stock.</>}
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelOrder(confirmModal.target)}
+          confirmLabel="Cancel Order"
         />
       )}
 
@@ -1529,6 +1529,7 @@ export default function InventorySystem() {
           message={<>Cancel sale <strong>{confirmModal.target.receiptNo}</strong> for {currency(confirmModal.target.total)}? This restores the sold quantities back into stock and can't be undone.</>}
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelSale(confirmModal.target)}
+          confirmLabel="Cancel Sale"
         />
       )}
 
@@ -2532,8 +2533,8 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
 function POSView({ items, onCompleteSale }) {
   const [search, setSearch] = useState('');
   const [cart, setCart] = useState([]); // [{itemId, qty}]
-  const [paymentMethod, setPaymentMethod] = useState(PAYMENT_METHODS[0]);
   const [lastReceipt, setLastReceipt] = useState(null);
+  const [confirming, setConfirming] = useState(false);
 
   const sellable = useMemo(() => items.filter((it) => it.quantity > 0), [items]);
   const filtered = useMemo(() => {
@@ -2577,13 +2578,14 @@ function POSView({ items, onCompleteSale }) {
   const checkout = async () => {
     setBusy(true);
     try {
-      const sale = await onCompleteSale(cart, paymentMethod);
+      const sale = await onCompleteSale(cart);
       if (sale) {
         setLastReceipt(sale);
         setCart([]);
       }
     } finally {
       setBusy(false);
+      setConfirming(false);
     }
   };
 
@@ -2656,20 +2658,22 @@ function POSView({ items, onCompleteSale }) {
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(total)}</span></div>
         </div>
 
-        <div style={{ display: 'flex', gap: 6, marginTop: 12 }}>
-          {PAYMENT_METHODS.map((m) => (
-            <button key={m} className="depot-btn" onClick={() => setPaymentMethod(m)}
-              style={{ ...styles.paymentBtn, background: paymentMethod === m ? 'var(--blueprint)' : 'transparent', color: paymentMethod === m ? '#fff' : 'var(--ink)' }}>
-              {m}
-            </button>
-          ))}
-        </div>
-
         <button className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 12, opacity: cart.length && !busy ? 1 : 0.45 }}
-          disabled={!cart.length || busy} onClick={checkout}>
-          <Receipt size={16} /> {busy ? 'Processing…' : 'Complete Sale'}
+          disabled={!cart.length || busy} onClick={() => setConfirming(true)}>
+          <Receipt size={16} /> Confirm Sale
         </button>
       </div>
+
+      {confirming && (
+        <ConfirmModal
+          title="CONFIRM SALE"
+          message={<>Are you sure you want to complete this sale for <strong>{currency(total)}</strong>? This will deduct the sold quantities from stock.</>}
+          onCancel={() => setConfirming(false)}
+          onConfirm={checkout}
+          confirmLabel={busy ? 'Processing…' : 'Confirm Sale'}
+          danger={false}
+        />
+      )}
 
       {lastReceipt && (
         <SaleReceiptModal sale={lastReceipt} onClose={() => setLastReceipt(null)} />
@@ -2723,7 +2727,7 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
       new Date(sale.timestamp).toLocaleString('en-PH'),
       sale.cashierEmail || '—',
       sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
-      sale.paymentMethod,
+      sale.paymentMethod || '—',
       sale.subtotal.toFixed(2),
       sale.total.toFixed(2),
       sale.cancelled ? 'Cancelled' : 'Completed',
@@ -2815,7 +2819,7 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
                       {sale.items.length} item{sale.items.length === 1 ? '' : 's'}
                     </button>
                   </td>
-                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
+                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod || '—'}</span></td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
                   <td style={styles.td}>
                     {sale.cancelled ? (
@@ -2906,7 +2910,7 @@ function MySalesView({ sales }) {
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
                   <td style={styles.td}>{sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}</td>
-                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
+                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod || '—'}</span></td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
                   <td style={styles.td}>
                     {sale.cancelled ? (
@@ -3857,7 +3861,7 @@ function SaleReceiptModal({ sale, onClose }) {
           <div style={styles.cartTotalsRow}><span>Subtotal</span><span>{currency(sale.subtotal)}</span></div>
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(sale.total)}</span></div>
           <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.55)', marginTop: 10 }}>
-            Paid via {sale.paymentMethod}. Stock quantities have been updated.
+            {sale.paymentMethod ? `Paid via ${sale.paymentMethod}. ` : ''}Stock quantities have been updated.
           </div>
         </div>
         <div style={styles.modalFooter}>
@@ -3968,7 +3972,7 @@ function DeliveryStatusModal({ row, onClose, onSave, onClearOverride }) {
   );
 }
 
-function ConfirmModal({ title, message, onCancel, onConfirm }) {
+function ConfirmModal({ title, message, onCancel, onConfirm, confirmLabel = 'Remove', danger = true }) {
   return (
     <div style={styles.overlay} onClick={onCancel}>
       <div style={{ ...styles.modal, maxWidth: 360 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
@@ -3978,7 +3982,7 @@ function ConfirmModal({ title, message, onCancel, onConfirm }) {
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onCancel}>Cancel</button>
-          <button className="depot-btn" style={{ ...styles.primaryBtn, background: 'var(--red)' }} onClick={onConfirm}>Remove</button>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, ...(danger ? { background: 'var(--red)' } : {}) }} onClick={onConfirm}>{confirmLabel}</button>
         </div>
       </div>
     </div>
