@@ -810,8 +810,8 @@ export default function InventorySystem() {
     );
   }
 
-  if (myProfile && !myProfile.approved) {
-    return <PendingApprovalScreen email={user.email} />;
+  if (!myProfile || !myProfile.approved) {
+    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} />;
   }
 
   if (!loaded) {
@@ -1183,7 +1183,7 @@ function AccessDenied() {
   );
 }
 
-function PendingApprovalScreen({ email }) {
+function PendingApprovalScreen({ email, missingProfile }) {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1198,20 +1198,37 @@ function PendingApprovalScreen({ email }) {
         border: '1px solid rgba(217,164,65,0.35)', position: 'relative', zIndex: 1,
       }}>
         <div style={{
-          width: 52, height: 52, borderRadius: '50%', background: 'var(--amber, #D9A441)',
+          width: 52, height: 52, borderRadius: '50%', background: missingProfile ? 'var(--red, #C1503A)' : 'var(--amber, #D9A441)',
           display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px',
         }}>
-          <Clock size={26} color="#fff" />
+          {missingProfile ? <AlertTriangle size={26} color="#fff" /> : <Clock size={26} color="#fff" />}
         </div>
         <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 19, marginBottom: 8, color: '#3B2A1F' }}>
-          Awaiting Approval
+          {missingProfile ? "Couldn't Set Up Your Account" : 'Awaiting Approval'}
         </div>
-        <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
-          Your account (<strong>{email}</strong>) has been created, but an administrator needs to approve it before you can access Stock It.
-        </div>
+        {missingProfile ? (
+          <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
+            Your login (<strong>{email}</strong>) worked, but the app couldn't create your account profile in the database. This usually means the Firestore security rules haven't been published yet, or don't match what this app expects. Try again below, or check the browser console (F12) for the exact error.
+          </div>
+        ) : (
+          <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
+            Your account (<strong>{email}</strong>) has been created, but an administrator needs to approve it before you can access Stock It.
+          </div>
+        )}
         <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginTop: 10, marginBottom: 22 }}>
-          This page will update automatically once you're approved — no need to refresh.
+          {missingProfile ? 'Retrying will attempt to create your profile again.' : "This page will update automatically once you're approved — no need to refresh."}
         </div>
+        {missingProfile && (
+          <button
+            onClick={() => window.location.reload()}
+            style={{
+              width: '100%', background: '#2F4A32', color: '#fff', border: 'none',
+              borderRadius: 6, padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', marginBottom: 10,
+            }}
+          >
+            Try Again
+          </button>
+        )}
         <button
           onClick={() => signOut(auth)}
           style={{
