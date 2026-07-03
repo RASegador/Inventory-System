@@ -172,6 +172,68 @@ function printPage() {
   window.print();
 }
 
+// Lightweight, dependency-free sound effects using the Web Audio API - no
+// external audio files to host, license, or fetch. Every entry point below
+// is wrapped in try/catch so a sound failure (e.g. an older browser, or a
+// browser blocking audio before any user gesture) can never interrupt the
+// actual save/sale it's celebrating.
+let sharedAudioCtx = null;
+function getAudioCtx() {
+  try {
+    if (!sharedAudioCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      sharedAudioCtx = new Ctx();
+    }
+    if (sharedAudioCtx.state === 'suspended') sharedAudioCtx.resume();
+    return sharedAudioCtx;
+  } catch (e) {
+    return null;
+  }
+}
+
+function playTone(ctx, { freq, start, duration, type = 'sine', peakGain = 0.18 }) {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+  gain.gain.setValueAtTime(0, ctx.currentTime + start);
+  gain.gain.linearRampToValueAtTime(peakGain, ctx.currentTime + start + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + start + duration);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(ctx.currentTime + start);
+  osc.stop(ctx.currentTime + start + duration + 0.02);
+}
+
+// A short, pleasant two-note "added" chime - played whenever something new
+// is created: item, supplier, category, location, order, or staff account.
+function playAddSound() {
+  try {
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    playTone(ctx, { freq: 587.33, start: 0, duration: 0.11, type: 'sine', peakGain: 0.16 }); // D5
+    playTone(ctx, { freq: 880.00, start: 0.09, duration: 0.16, type: 'sine', peakGain: 0.18 }); // A5
+  } catch (e) { /* decorative - never break the app over a sound */ }
+}
+
+// A bright "cha-ching" cash-register flourish, reserved for completed sales
+// only - kept distinct from playAddSound() so it stays a meaningful signal
+// rather than blending into general background noise.
+function playSaleSound() {
+  try {
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    // "Cha" - a quick bright double-hit
+    playTone(ctx, { freq: 1046.50, start: 0, duration: 0.09, type: 'square', peakGain: 0.12 }); // C6
+    playTone(ctx, { freq: 1318.51, start: 0.06, duration: 0.09, type: 'square', peakGain: 0.12 }); // E6
+    // "Ching" - a longer bell-like ring with a couple of shimmering harmonics
+    playTone(ctx, { freq: 1760.00, start: 0.15, duration: 0.55, type: 'sine', peakGain: 0.20 }); // A6
+    playTone(ctx, { freq: 2637.02, start: 0.16, duration: 0.45, type: 'sine', peakGain: 0.10 }); // E7
+    playTone(ctx, { freq: 3520.00, start: 0.17, duration: 0.35, type: 'sine', peakGain: 0.06 }); // A7 shimmer
+  } catch (e) { /* decorative - never break the app over a sound */ }
+}
+
 // Items store suppliers as `supplierIds` (array - multi-supplier support).
 // Older items from before this change may still only have the single
 // `supplierId` field; this normalizes either shape into an array so every
@@ -660,6 +722,7 @@ export default function InventorySystem() {
         userIdNumber: generateUserIdNumber(),
       });
       await signOut(secondaryAuth);
+      playAddSound();
       showToast(`Staff account created for ${email.trim()}`);
       return { ok: true };
     } catch (e) {
@@ -921,6 +984,7 @@ export default function InventorySystem() {
     const sellingPrice = computeSellingPrice(unitCost, markupType, markupValue);
     try {
       await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, unitCost, markupType, markupValue, sellingPrice });
+      if (!draft.id) playAddSound();
       showToast(draft.id ? `Updated ${draft.sku}` : `Added ${draft.sku} to the manifest`);
     } catch (e) {
       showToast('Could not save item — check your connection');
@@ -948,6 +1012,7 @@ export default function InventorySystem() {
     const id = draft.id || ('s' + Math.random().toString(36).slice(2, 9));
     try {
       await setDoc(doc(db, 'suppliers', id), { ...draft, id, ownerId });
+      if (!draft.id) playAddSound();
       showToast(draft.id ? `Updated ${draft.name}` : `Added ${draft.name} to suppliers`);
     } catch (e) {
       showToast('Could not save supplier — check your connection');
@@ -981,6 +1046,7 @@ export default function InventorySystem() {
     }
     try {
       await setDoc(doc(db, 'config', 'categories_' + ownerId), { list: [...categories, trimmed], ownerId });
+      playAddSound();
       showToast(`Added category "${trimmed}"`);
     } catch (e) {
       showToast('Could not add category — check your connection');
@@ -1038,6 +1104,7 @@ export default function InventorySystem() {
     }
     try {
       await setDoc(doc(db, 'config', 'locations_' + ownerId), { list: [...locations, trimmed], ownerId });
+      playAddSound();
       showToast(`Added location "${trimmed}"`);
     } catch (e) {
       showToast('Could not add location — check your connection');
@@ -1128,6 +1195,7 @@ export default function InventorySystem() {
         });
       }));
       await setDoc(doc(db, 'sales', sale.id), sale);
+      playSaleSound();
       showToast(`Sale ${receiptNo} recorded — ${currency(total)}`);
       return sale;
     } catch (e) {
@@ -1185,6 +1253,7 @@ export default function InventorySystem() {
     };
     try {
       await setDoc(doc(db, 'orders', id), order);
+      playAddSound();
       showToast(`Order placed with ${supplier.name}`);
     } catch (e) {
       showToast('Could not place order — check your connection');
