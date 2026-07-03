@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { auth, db } from './firebase';
 import { initializeApp, deleteApp } from 'firebase/app';
-import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth } from 'firebase/auth';
+import {
+  onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth,
+  updatePassword, reauthenticateWithCredential, EmailAuthProvider,
+} from 'firebase/auth';
 import {
   collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
 } from 'firebase/firestore';
@@ -701,6 +704,30 @@ export default function InventorySystem() {
       showToast('Profile updated');
     } catch (e) {
       showToast('Could not update profile — check your connection');
+    }
+  };
+
+  // Firebase requires a recent sign-in before allowing a password change, so
+  // we re-authenticate with the user's current password first - this also
+  // doubles as confirming they actually know the current password before
+  // letting them set a new one.
+  const changePassword = async (currentPassword, newPassword) => {
+    try {
+      const credential = EmailAuthProvider.credential(user.email, currentPassword);
+      await reauthenticateWithCredential(auth.currentUser, credential);
+      await updatePassword(auth.currentUser, newPassword);
+      showToast('Password updated');
+      return { ok: true };
+    } catch (e) {
+      const msg = e?.code === 'auth/wrong-password' || e?.code === 'auth/invalid-credential'
+        ? 'Current password is incorrect'
+        : e?.code === 'auth/weak-password'
+        ? 'New password should be at least 6 characters'
+        : e?.code === 'auth/too-many-requests'
+        ? 'Too many attempts — please wait a bit and try again'
+        : 'Could not update password — check your connection';
+      showToast(msg);
+      return { ok: false, error: e };
     }
   };
 
@@ -1414,7 +1441,16 @@ export default function InventorySystem() {
         )}
 
         {view === 'delivery' && (
-          <DeliveryTimesView rows={deliveryRows} onUpdateStatus={(row) => setDeliveryStatusModal(row)} />
+          <DeliveryTimesView
+            rows={deliveryRows}
+            onUpdateStatus={(row) => setDeliveryStatusModal(row)}
+            onViewHistory={(itemId) => {
+              setHistItem(itemId);
+              setHistSearch('');
+              setHistType('All');
+              setView('history');
+            }}
+          />
         )}
 
         {view === 'pos' && (
@@ -1464,7 +1500,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'myprofile' && (
-          <MyProfileView profile={myProfile} uid={user.uid} onSave={updateUserProfile} />
+          <MyProfileView profile={myProfile} uid={user.uid} onSave={updateUserProfile} onChangePassword={changePassword} />
         )}
         </>
         )}
@@ -2489,7 +2525,7 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
   );
 }
 
-function DeliveryTimesView({ rows, onUpdateStatus }) {
+function DeliveryTimesView({ rows, onUpdateStatus, onViewHistory }) {
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   const [search, setSearch] = useState('');
@@ -2592,6 +2628,7 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
                     {manual && <span style={styles.manualBadge}>manually set</span>}
                   </td>
                   <td className="depot-no-print" style={{ ...styles.td, textAlign: 'right' }}>
+                    <IconBtn onClick={() => onViewHistory(item.id)} title="View full history for this item"><ScrollText size={13} /></IconBtn>
                     <IconBtn onClick={() => onUpdateStatus(row)} title="Update delivery status"><Pencil size={13} /></IconBtn>
                   </td>
                 </tr>
@@ -3274,7 +3311,7 @@ function UserProfilesView({ approvedUsers, myRole, onSave }) {
   );
 }
 
-function MyProfileView({ profile, uid, onSave }) {
+function MyProfileView({ profile, uid, onSave, onChangePassword }) {
   const [editing, setEditing] = useState(false);
   const me = { id: uid, ...(profile || {}) };
 
@@ -3323,8 +3360,75 @@ function MyProfileView({ profile, uid, onSave }) {
         </button>
       </div>
 
+      <ChangePasswordPanel onChangePassword={onChangePassword} />
+
       {editing && (
         <ProfileEditModal user={me} onClose={() => setEditing(false)} onSave={onSave} />
+      )}
+    </div>
+  );
+}
+
+function ChangePasswordPanel({ onChangePassword }) {
+  const [open, setOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const reset = () => {
+    setCurrentPassword(''); setNewPassword(''); setConfirmPassword(''); setError('');
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (newPassword.length < 6) { setError('New password should be at least 6 characters.'); return; }
+    if (newPassword !== confirmPassword) { setError('New passwords don\u2019t match.'); return; }
+    setBusy(true);
+    const result = await onChangePassword(currentPassword, newPassword);
+    setBusy(false);
+    if (result?.ok) {
+      reset();
+      setOpen(false);
+    }
+  };
+
+  return (
+    <div style={{ ...styles.panel, maxWidth: 480, marginTop: 16 }}>
+      <div style={{ ...styles.panelHeader, justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <CheckCircle2 size={15} />
+          <span>PASSWORD</span>
+        </div>
+        <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => { setOpen((v) => !v); if (open) reset(); }}>
+          {open ? 'Cancel' : 'Change Password'}
+        </button>
+      </div>
+      {!open ? (
+        <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginTop: 10 }}>
+          Change the password you use to sign in to your account.
+        </div>
+      ) : (
+        <form onSubmit={submit} style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <Field label="Current Password">
+            <input type="password" required autoComplete="current-password" className="depot-input" style={styles.modalInput}
+              value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} />
+          </Field>
+          <Field label="New Password">
+            <input type="password" required autoComplete="new-password" className="depot-input" style={styles.modalInput}
+              value={newPassword} onChange={(e) => setNewPassword(e.target.value)} />
+          </Field>
+          <Field label="Confirm New Password">
+            <input type="password" required autoComplete="new-password" className="depot-input" style={styles.modalInput}
+              value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
+          </Field>
+          {error && <div style={{ fontSize: 12, color: 'var(--red)' }}>{error}</div>}
+          <button type="submit" className="depot-btn" style={{ ...styles.primaryBtn, opacity: busy ? 0.6 : 1 }} disabled={busy}>
+            {busy ? 'Updating…' : 'Update Password'}
+          </button>
+        </form>
       )}
     </div>
   );
