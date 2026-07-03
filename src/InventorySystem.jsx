@@ -299,6 +299,34 @@ function generateUserIdNumber() {
   return 'U-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 5).toUpperCase();
 }
 
+// Profile photos live inside the Firestore user doc (this app has no
+// separate file storage), so they need to be small. Downscale to a square
+// thumbnail and re-encode as compressed JPEG before it ever touches the
+// database - a raw phone photo could otherwise be several MB.
+function resizePhotoToDataUri(file, maxSize = 160, quality = 0.75) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read the file'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Could not read that image'));
+      img.onload = () => {
+        const side = Math.min(img.width, img.height);
+        const sx = (img.width - side) / 2;
+        const sy = (img.height - side) / 2;
+        const canvas = document.createElement('canvas');
+        canvas.width = maxSize;
+        canvas.height = maxSize;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, sx, sy, side, side, 0, 0, maxSize, maxSize);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 // Background/color scheme presets a Super Admin can pick from. Each key
 // matches a CSS custom property already used throughout the app, so
 // switching themes is just re-injecting this block into :root.
@@ -522,12 +550,16 @@ export default function InventorySystem() {
       return;
     }
     try {
-      await setDoc(doc(db, 'users', uid), {
+      const payload = {
         fullName: fields.fullName?.trim() || '',
         username: fields.username?.trim() || '',
         contactNumber: fields.contactNumber?.trim() || '',
         address: fields.address?.trim() || '',
-      }, { merge: true });
+      };
+      // Only include photoDataUri when a new photo was actually picked, so
+      // saving other fields never accidentally clears an existing photo.
+      if (fields.photoDataUri !== undefined) payload.photoDataUri = fields.photoDataUri;
+      await setDoc(doc(db, 'users', uid), payload, { merge: true });
       showToast('Profile updated');
     } catch (e) {
       showToast('Could not update profile — check your connection');
@@ -2432,11 +2464,31 @@ function ProfileEditModal({ user, onClose, onSave }) {
   const [username, setUsername] = useState(user.username || '');
   const [contactNumber, setContactNumber] = useState(user.contactNumber || '');
   const [address, setAddress] = useState(user.address || '');
+  const [photoDataUri, setPhotoDataUri] = useState(undefined); // undefined = unchanged
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const [photoError, setPhotoError] = useState('');
+
+  const handlePhotoFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoError('');
+    setPhotoBusy(true);
+    try {
+      const resized = await resizePhotoToDataUri(file);
+      setPhotoDataUri(resized);
+    } catch (err) {
+      setPhotoError('Could not process that image. Try a different file.');
+    } finally {
+      setPhotoBusy(false);
+    }
+  };
 
   const submit = () => {
-    onSave(user.id, { fullName, username, contactNumber, address });
+    onSave(user.id, { fullName, username, contactNumber, address, photoDataUri });
     onClose();
   };
+
+  const currentPhoto = photoDataUri !== undefined ? photoDataUri : user.photoDataUri;
 
   return (
     <div style={styles.overlay} onClick={onClose}>
@@ -2449,6 +2501,26 @@ function ProfileEditModal({ user, onClose, onSave }) {
           <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.5)', marginBottom: 14, fontFamily: "'IBM Plex Mono', monospace" }}>
             ID: {user.userIdNumber || '—'} · Account: {user.id}
           </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 16 }}>
+            <Avatar src={currentPhoto} name={fullName || user.email} size={56} />
+            <div>
+              <input type="file" accept="image/*" onChange={handlePhotoFile} disabled={photoBusy} style={{ fontSize: 12 }} />
+              {photoBusy && <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Processing photo…</div>}
+              {photoError && <div style={{ fontSize: 11.5, color: 'var(--red)', marginTop: 4 }}>{photoError}</div>}
+              {currentPhoto && (
+                <button
+                  type="button"
+                  className="depot-btn"
+                  onClick={() => setPhotoDataUri(null)}
+                  style={{ background: 'transparent', border: 'none', padding: 0, marginTop: 4, fontSize: 11.5, color: 'var(--red)', textDecoration: 'underline', cursor: 'pointer' }}
+                >
+                  Remove photo
+                </button>
+              )}
+            </div>
+          </div>
+
           <Field label="Full Name">
             <input className="depot-input" style={styles.modalInput} value={fullName} onChange={(e) => setFullName(e.target.value)} />
           </Field>
@@ -2464,7 +2536,7 @@ function ProfileEditModal({ user, onClose, onSave }) {
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={styles.primaryBtn} onClick={submit}>Save</button>
+          <button className="depot-btn" style={styles.primaryBtn} onClick={submit} disabled={photoBusy}>Save</button>
         </div>
       </div>
     </div>
@@ -2489,15 +2561,18 @@ function UserProfilesView({ approvedUsers, myRole, onSave }) {
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
             {approvedUsers.map((u) => (
-              <div key={u.id} style={styles.watchRow}>
-                <div>
-                  <div style={styles.watchSku}>{u.fullName || u.email}</div>
-                  <div style={styles.watchName}>
-                    {u.fullName ? u.email + ' · ' : ''}{ROLES[u.role] || 'Staff'}
-                    {u.contactNumber ? ` · ${u.contactNumber}` : ''}
-                  </div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>
-                    ID: {u.userIdNumber || '—'}
+              <div key={u.id} style={{ ...styles.watchRow, alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <Avatar src={u.photoDataUri} name={u.fullName || u.email} size={40} />
+                  <div>
+                    <div style={styles.watchSku}>{u.fullName || u.email}</div>
+                    <div style={styles.watchName}>
+                      {u.fullName ? u.email + ' · ' : ''}{ROLES[u.role] || 'Staff'}
+                      {u.contactNumber ? ` · ${u.contactNumber}` : ''}
+                    </div>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>
+                      ID: {u.userIdNumber || '—'}
+                    </div>
                   </div>
                 </div>
                 <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setEditingUser(u)}>Edit</button>
@@ -2526,6 +2601,9 @@ function MyProfileView({ profile, uid, onSave }) {
           <span>YOUR DETAILS</span>
         </div>
         <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 6 }}>
+            <Avatar src={me.photoDataUri} name={me.fullName || me.email} size={88} />
+          </div>
           <div>
             <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Full Name</div>
             <div style={{ fontSize: 14 }}>{me.fullName || '— not set —'}</div>
@@ -2595,12 +2673,15 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
             {pendingUsers.map((u) => (
-              <div key={u.id} style={styles.watchRow}>
-                <div>
-                  <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
-                  <div style={styles.watchName}>
-                    {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
+              <div key={u.id} style={{ ...styles.watchRow, alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <Avatar src={u.photoDataUri} name={u.fullName || u.email} size={34} />
+                  <div>
+                    <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
+                    <div style={styles.watchName}>
+                      {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
+                    </div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -2633,11 +2714,14 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
             {approvedUsers.map((u) => (
-              <div key={u.id} style={styles.watchRow}>
-                <div>
-                  <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
-                  <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
+              <div key={u.id} style={{ ...styles.watchRow, alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <Avatar src={u.photoDataUri} name={u.fullName || u.email} size={34} />
+                  <div>
+                    <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
+                    <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
+                    <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
+                  </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                   {isSuperAdmin && u.id !== currentUid && (
@@ -2791,6 +2875,27 @@ function TransactionHistoryView({ movements, items, histSearch, setHistSearch, h
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function Avatar({ src, name, size = 36 }) {
+  const initials = (name || '?').trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
+  if (src) {
+    return (
+      <img src={src} alt="" style={{
+        width: size, height: size, borderRadius: '50%', objectFit: 'cover',
+        border: '1px solid rgba(59,42,31,0.15)', flexShrink: 0,
+      }} />
+    );
+  }
+  return (
+    <div style={{
+      width: size, height: size, borderRadius: '50%', background: 'var(--amber, #D9A441)',
+      color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: size * 0.4, fontWeight: 700, fontFamily: "'Quicksand', sans-serif", flexShrink: 0,
+    }}>
+      {initials}
     </div>
   );
 }
