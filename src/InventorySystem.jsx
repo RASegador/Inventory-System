@@ -2046,6 +2046,25 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
     return sales.filter((s) => s.cashierEmail === cashierFilter);
   }, [sales, cashierFilter]);
 
+  const overall = useMemo(() => {
+    const active = sales.filter((s) => !s.cancelled);
+    return { count: active.length, total: active.reduce((sum, s) => sum + s.total, 0) };
+  }, [sales]);
+
+  const byCashier = useMemo(() => {
+    const map = {};
+    sales.forEach((s) => {
+      if (s.cancelled) return;
+      const key = s.cashierEmail || 'Unknown';
+      if (!map[key]) map[key] = { count: 0, total: 0 };
+      map[key].count += 1;
+      map[key].total += s.total;
+    });
+    return Object.entries(map)
+      .map(([email, v]) => ({ email, ...v }))
+      .sort((a, b) => b.total - a.total);
+  }, [sales]);
+
   const handleDownload = () => {
     const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
     const rows = filtered.map((sale) => [
@@ -2065,6 +2084,34 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
+
+      <div style={styles.statGrid} className="depot-stat-grid">
+        <StatCard icon={Receipt} label="Sales (Overall)" value={overall.count} accent="var(--blueprint)" />
+        <StatCard icon={PesoIcon} label="Total Revenue (Overall)" value={currency(overall.total)} accent="var(--green)" />
+      </div>
+
+      {byCashier.length > 0 && (
+        <div style={{ ...styles.panel, marginBottom: 16 }}>
+          <div style={styles.panelHeader}>
+            <User size={15} />
+            <span>TOTAL SALES PER ACCOUNT</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+            {byCashier.map((c) => (
+              <div key={c.email} style={styles.watchRow}>
+                <div>
+                  <div style={styles.watchSku}>{c.email}</div>
+                  <div style={styles.watchName}>{c.count} sale{c.count === 1 ? '' : 's'}</div>
+                </div>
+                <div style={{ fontWeight: 700, fontFamily: "'Quicksand', sans-serif", color: 'var(--ink)' }}>
+                  {currency(c.total)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {cashiers.length > 0 && (
         <div style={styles.filterBar} className="depot-no-print depot-filterbar">
           <select className="depot-select" value={cashierFilter} onChange={(e) => setCashierFilter(e.target.value)} style={styles.select}>
