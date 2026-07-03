@@ -77,7 +77,6 @@ const DEFAULT_CATEGORIES = ['Raw Materials', 'Components', 'Packaging', 'Finishe
 const DEFAULT_LOCATIONS = ['A-01', 'A-02', 'B-01', 'B-02', 'C-01', 'C-02', 'Dock'];
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PAYMENT_METHODS = ['Cash', 'GCash'];
-const TAX_RATE = 0.12;
 
 function PesoIcon({ size = 18, color = 'currentColor', strokeWidth = 2.2 }) {
   return (
@@ -907,11 +906,10 @@ export default function InventorySystem() {
       };
     });
     const subtotal = saleLines.reduce((s, l) => s + l.lineTotal, 0);
-    const tax = subtotal * TAX_RATE;
-    const total = subtotal + tax;
+    const total = subtotal;
     const sale = {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
-      subtotal, tax, total, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '',
+      subtotal, total, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '',
     };
 
     try {
@@ -2151,8 +2149,7 @@ function POSView({ items, onCompleteSale }) {
   const removeLine = (itemId) => setCart((prev) => prev.filter((l) => l.itemId !== itemId));
 
   const subtotal = cart.reduce((s, l) => s + (itemMap[l.itemId]?.unitCost ?? 0) * l.qty, 0);
-  const tax = subtotal * TAX_RATE;
-  const total = subtotal + tax;
+  const total = subtotal;
 
   const [busy, setBusy] = useState(false);
 
@@ -2235,7 +2232,6 @@ function POSView({ items, onCompleteSale }) {
 
         <div style={styles.cartTotals}>
           <div style={styles.cartTotalsRow}><span>Subtotal</span><span>{currency(subtotal)}</span></div>
-          <div style={styles.cartTotalsRow}><span>VAT (12%)</span><span>{currency(tax)}</span></div>
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(total)}</span></div>
         </div>
 
@@ -2300,7 +2296,7 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   }, [dateFiltered]);
 
   const handleDownload = () => {
-    const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
+    const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Payment Method', 'Subtotal', 'Total', 'Status'];
     const rows = filtered.map((sale) => [
       sale.receiptNo,
       new Date(sale.timestamp).toLocaleString('en-PH'),
@@ -2308,7 +2304,6 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
       sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
       sale.paymentMethod,
       sale.subtotal.toFixed(2),
-      sale.tax.toFixed(2),
       sale.total.toFixed(2),
       sale.cancelled ? 'Cancelled' : 'Completed',
     ]);
@@ -3227,7 +3222,6 @@ function SaleReceiptModal({ sale, onClose }) {
           </div>
 
           <div style={styles.cartTotalsRow}><span>Subtotal</span><span>{currency(sale.subtotal)}</span></div>
-          <div style={styles.cartTotalsRow}><span>VAT (12%)</span><span>{currency(sale.tax)}</span></div>
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(sale.total)}</span></div>
           <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.55)', marginTop: 10 }}>
             Paid via {sale.paymentMethod}. Stock quantities have been updated.
