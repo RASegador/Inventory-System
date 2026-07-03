@@ -76,7 +76,7 @@ const LOGO_DATA_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA+AAAAISCAI
 const DEFAULT_CATEGORIES = ['Raw Materials', 'Components', 'Packaging', 'Finished Goods', 'Tools & Equipment'];
 const DEFAULT_LOCATIONS = ['A-01', 'A-02', 'B-01', 'B-02', 'C-01', 'C-02', 'Dock'];
 const DAY_MS = 24 * 60 * 60 * 1000;
-const PAYMENT_METHODS = ['Cash', 'Card', 'GCash'];
+const PAYMENT_METHODS = ['Cash', 'GCash'];
 const TAX_RATE = 0.12;
 
 function PesoIcon({ size = 18, color = 'currentColor', strokeWidth = 2.2 }) {
@@ -1536,7 +1536,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
   const structure = [
     { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
     { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
-    { type: 'group', label: 'Inventory', icon: Boxes, children: [
+    { type: 'group', label: 'Stock Management', icon: Boxes, children: [
       { key: 'inventory', label: 'Inventory', icon: Boxes },
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
       { key: 'categories', label: 'Categories', icon: Tag },
