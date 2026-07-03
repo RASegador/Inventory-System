@@ -1667,29 +1667,60 @@ const PRIVACY_SECTIONS = [
     'Questions about this policy can be directed to your Stock It administrator or Reliable Automation Solutions directly.' },
 ];
 
-function LegalModal({ kind, onClose }) {
+function LegalModal({ kind, onClose, theme }) {
+  const t = theme || THEMES[DEFAULT_THEME_KEY];
   const sections = kind === 'privacy' ? PRIVACY_SECTIONS : TERMS_SECTIONS;
   const title = kind === 'privacy' ? 'PRIVACY POLICY' : 'TERMS OF SERVICE';
   return (
-    <div style={styles.overlay} onClick={onClose}>
-      <div style={{ ...styles.modal, maxWidth: 560, maxHeight: '82vh', display: 'flex', flexDirection: 'column' }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
-        <div style={styles.modalHeader}>
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(10,20,35,0.55)', display: 'flex',
+        alignItems: 'center', justifyContent: 'center', zIndex: 50,
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: '#FFFCF5', borderRadius: 10, width: '90%', maxWidth: 560, maxHeight: '82vh',
+          display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+          border: `1px solid ${t.lineDim}`, overflow: 'hidden',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px 18px',
+          background: t.blueprint, color: '#fff', fontFamily: "'Quicksand', sans-serif",
+          fontSize: 12, letterSpacing: '0.08em', fontWeight: 600,
+        }}>
           <span>{title}</span>
-          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+          <button
+            onClick={onClose}
+            style={{ background: 'transparent', border: 'none', color: '#fff', width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
+          >
+            <X size={16} />
+          </button>
         </div>
-        <div style={{ ...styles.modalBody, overflowY: 'auto' }} className="depot-scroll">
+        <div style={{ padding: 18, overflowY: 'auto' }}>
           <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.5)', fontStyle: 'italic', marginBottom: 14 }}>
             This is a general starting-point document and not a substitute for legal advice specific to your business.
           </div>
           {sections.map((s) => (
             <div key={s.title} style={{ marginBottom: 14 }}>
-              <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 13.5, color: 'var(--ink)', marginBottom: 4 }}>{s.title}</div>
+              <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 13.5, color: t.ink, marginBottom: 4 }}>{s.title}</div>
               <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.75)', lineHeight: 1.6 }}>{s.body}</div>
             </div>
           ))}
         </div>
-        <div style={styles.modalFooter}>
-          <button className="depot-btn" style={styles.primaryBtn} onClick={onClose}>Close</button>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '14px 18px', borderTop: `1px solid ${t.lineDim}` }}>
+          <button
+            onClick={onClose}
+            style={{
+              background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
+              padding: '9px 18px', fontSize: 13, fontWeight: 500, cursor: 'pointer',
+            }}
+          >
+            Close
+          </button>
         </div>
       </div>
     </div>
@@ -1971,7 +2002,7 @@ function LoginScreen({ logo, theme }) {
         </div>
       </form>
       )}
-      {legalModal && <LegalModal kind={legalModal} onClose={() => setLegalModal(null)} />}
+      {legalModal && <LegalModal kind={legalModal} onClose={() => setLegalModal(null)} theme={t} />}
     </div>
   );
 }
