@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { auth, db } from './firebase';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import { initializeApp, deleteApp } from 'firebase/app';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth,
@@ -141,6 +143,31 @@ function downloadCSV(filename, headers, rows) {
   URL.revokeObjectURL(url);
 }
 
+// Same shape as downloadCSV (filename, headers, rows) so every report can
+// offer both formats from the exact same data with no duplicated logic.
+// Wide tables (many columns) render landscape so columns aren't squeezed.
+function downloadPDF(filename, title, headers, rows) {
+  const orientation = headers.length > 6 ? 'landscape' : 'portrait';
+  const doc = new jsPDF({ orientation, unit: 'pt' });
+  doc.setFontSize(14);
+  doc.setFont(undefined, 'bold');
+  doc.text(title, 32, 32);
+  doc.setFont(undefined, 'normal');
+  doc.setFontSize(9);
+  doc.setTextColor(120);
+  doc.text(`Stock IT \u2014 generated ${new Date().toLocaleString('en-PH')}`, 32, 48);
+  autoTable(doc, {
+    head: [headers],
+    body: rows.map((row) => row.map((cell) => (cell === null || cell === undefined ? '' : String(cell)))),
+    startY: 60,
+    margin: { left: 32, right: 32 },
+    styles: { fontSize: 8, cellPadding: 5 },
+    headStyles: { fillColor: [47, 74, 50], textColor: 255, fontStyle: 'bold' },
+    alternateRowStyles: { fillColor: [247, 239, 221] },
+  });
+  doc.save(filename);
+}
+
 function printPage() {
   window.print();
 }
@@ -167,7 +194,7 @@ function computeSellingPrice(baseCost, markupType, markupValue) {
   return Math.round(price * 100) / 100;
 }
 
-function ExportBar({ onPrint, onDownload }) {
+function ExportBar({ onPrint, onDownload, onDownloadPDF }) {
   return (
     <div className="depot-no-print depot-export-bar" style={styles.exportBar}>
       <button className="depot-btn" style={styles.exportBtn} onClick={onPrint}>
@@ -176,6 +203,11 @@ function ExportBar({ onPrint, onDownload }) {
       <button className="depot-btn" style={styles.exportBtn} onClick={onDownload}>
         <Download size={14} /> Download CSV
       </button>
+      {onDownloadPDF && (
+        <button className="depot-btn" style={styles.exportBtn} onClick={onDownloadPDF}>
+          <Download size={14} /> Download PDF
+        </button>
+      )}
     </div>
   );
 }
@@ -1844,7 +1876,16 @@ function LoginScreen({ logo, theme }) {
       background: t.paper, fontFamily: "'Nunito', sans-serif", borderRadius: 8,
       position: 'relative', overflow: 'hidden',
     }}>
-      <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
+      <style>{FONT_IMPORT}{RESPONSIVE_CSS}{`
+        @keyframes stockit-float {
+          0%, 100% { transform: translateY(0) scale(1); }
+          50% { transform: translateY(-6px) scale(1.02); }
+        }
+        .depot-logo-float { animation: stockit-float 3.6s ease-in-out infinite; }
+        @media (prefers-reduced-motion: reduce) {
+          .depot-logo-float { animation: none; }
+        }
+      `}</style>
       <BackgroundDecor variant="login" />
       {mode === 'reset' ? (
         <form onSubmit={submitReset} className="depot-login-form" style={{
@@ -1857,7 +1898,7 @@ function LoginScreen({ logo, theme }) {
             borderRadius: 10, padding: '22px 20px 16px', marginBottom: 20,
             border: `1px solid ${t.lineDim}`,
           }}>
-            <img src={logo} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+            <img src={logo} alt="RAS logo" className="depot-logo-float" style={{ width: '100%', height: 'auto', display: 'block' }} />
           </div>
           <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
             Reset Your Password
@@ -1913,7 +1954,7 @@ function LoginScreen({ logo, theme }) {
           borderRadius: 10, padding: '22px 20px 16px', marginBottom: 20,
           border: `1px solid ${t.lineDim}`,
         }}>
-          <img src={logo} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+          <img src={logo} alt="RAS logo" className="depot-logo-float" style={{ width: '100%', height: 'auto', display: 'block' }} />
         </div>
         <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
           {mode === 'signup' ? 'Create Your Account' : 'Welcome Back!'}
@@ -2405,14 +2446,13 @@ function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
 function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove }) {
   const supplierNames = (it) => getSupplierIds(it).map((sid) => supplierMap[sid]?.name).filter(Boolean);
 
-  const handleDownload = () => {
-    const headers = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Value'];
-    const rows = filtered.map((it) => [
-      it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
-      it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2), (it.quantity * it.unitCost).toFixed(2),
-    ]);
-    downloadCSV('inventory.csv', headers, rows);
-  };
+  const exportHeaders = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Value'];
+  const exportRows = () => filtered.map((it) => [
+    it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
+    it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2), (it.quantity * it.unitCost).toFixed(2),
+  ]);
+  const handleDownload = () => downloadCSV('inventory.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('inventory.pdf', 'Inventory', exportHeaders, exportRows());
   const canEdit = can(role, 'editInventory');
   const canDelete = can(role, 'deleteInventory');
   const canMove = can(role, 'stockReceive') || can(role, 'stockIssue');
@@ -2420,7 +2460,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      {can(role, 'print') && <ExportBar onPrint={printPage} onDownload={handleDownload} />}
+      {can(role, 'print') && <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />}
       <div style={styles.filterBar} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
@@ -2498,15 +2538,14 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
 function SuppliersView({ suppliers, items, onEdit, onDelete }) {
   const countFor = (sid) => items.filter((it) => getSupplierIds(it).includes(sid)).length;
 
-  const handleDownload = () => {
-    const headers = ['Name', 'Contact', 'Phone', 'Email', 'Lead Time (days)', 'Items Supplied', 'Notes'];
-    const rows = suppliers.map((s) => [s.name, s.contact, s.phone, s.email, s.leadTimeDays, countFor(s.id), s.notes]);
-    downloadCSV('suppliers.csv', headers, rows);
-  };
+  const exportHeaders = ['Name', 'Contact', 'Phone', 'Email', 'Lead Time (days)', 'Items Supplied', 'Notes'];
+  const exportRows = () => suppliers.map((s) => [s.name, s.contact, s.phone, s.email, s.leadTimeDays, countFor(s.id), s.notes]);
+  const handleDownload = () => downloadCSV('suppliers.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('suppliers.pdf', 'Suppliers', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       {suppliers.length === 0 ? (
         <div style={styles.panel}><div style={styles.emptyState}>No suppliers yet. Add your first one.</div></div>
       ) : (
@@ -2559,18 +2598,17 @@ function OrdersView({ orders, onReceive, onCancel }) {
     return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' }; // received
   };
 
-  const handleDownload = () => {
-    const headers = ['Order Date', 'Item', 'Supplier', 'Quantity', 'Unit Cost', 'Total', 'Expected By', 'Status', 'Notes'];
-    const rows = filtered.map((o) => [
-      formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName, o.quantity,
-      o.unitCost.toFixed(2), o.totalCost.toFixed(2), formatDate(o.expectedDate), o.status, o.notes || '',
-    ]);
-    downloadCSV('orders.csv', headers, rows);
-  };
+  const exportHeaders = ['Order Date', 'Item', 'Supplier', 'Quantity', 'Unit Cost', 'Total', 'Expected By', 'Status', 'Notes'];
+  const exportRows = () => filtered.map((o) => [
+    formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName, o.quantity,
+    o.unitCost.toFixed(2), o.totalCost.toFixed(2), formatDate(o.expectedDate), o.status, o.notes || '',
+  ]);
+  const handleDownload = () => downloadCSV('orders.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('orders.pdf', 'Orders', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       <div style={styles.filterBar} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
@@ -2649,15 +2687,14 @@ function CategoriesView({ categories, items, onAdd, onDelete }) {
     setName('');
   };
 
-  const handleDownload = () => {
-    const headers = ['Category', 'Item Count'];
-    const rows = categories.map((cat) => [cat, countFor(cat)]);
-    downloadCSV('categories.csv', headers, rows);
-  };
+  const exportHeaders = ['Category', 'Item Count'];
+  const exportRows = () => categories.map((cat) => [cat, countFor(cat)]);
+  const handleDownload = () => downloadCSV('categories.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('categories.pdf', 'Categories', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       <div style={styles.filterBar} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Tag size={15} color="rgba(59,42,31,0.5)" />
@@ -2710,15 +2747,14 @@ function LocationsView({ locations, items, onAdd, onDelete }) {
     setName('');
   };
 
-  const handleDownload = () => {
-    const headers = ['Location', 'Item Count'];
-    const rows = locations.map((loc) => [loc, countFor(loc)]);
-    downloadCSV('locations.csv', headers, rows);
-  };
+  const exportHeaders = ['Location', 'Item Count'];
+  const exportRows = () => locations.map((loc) => [loc, countFor(loc)]);
+  const handleDownload = () => downloadCSV('locations.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('locations.pdf', 'Zonal Locations', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       <div style={styles.filterBar} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <MapPin size={15} color="rgba(59,42,31,0.5)" />
@@ -2789,17 +2825,16 @@ function DeliveryTimesView({ rows, onUpdateStatus, onViewHistory }) {
     return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' };
   };
 
-  const handleDownload = () => {
-    const headers = ['Supplier', 'SKU', 'Item', 'Order Date', 'Receive Date', 'Qty Received', 'Status', 'Manually Set', 'Note'];
-    const csvRows = filtered.map(({ item, supplier, lastDelivery, lastDeliveryQty, orderDate, status, manual, note }) => [
-      supplier.name, item.sku, item.name, formatDate(orderDate), formatDate(lastDelivery), lastDeliveryQty ?? '', status, manual ? 'Yes' : 'No', note,
-    ]);
-    downloadCSV('delivery-times.csv', headers, csvRows);
-  };
+  const exportHeaders = ['Supplier', 'SKU', 'Item', 'Order Date', 'Receive Date', 'Qty Received', 'Status', 'Manually Set', 'Note'];
+  const exportRows = () => filtered.map(({ item, supplier, lastDelivery, lastDeliveryQty, orderDate, status, manual, note }) => [
+    supplier.name, item.sku, item.name, formatDate(orderDate), formatDate(lastDelivery), lastDeliveryQty ?? '', status, manual ? 'Yes' : 'No', note,
+  ]);
+  const handleDownload = () => downloadCSV('delivery-times.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('delivery-times.pdf', 'Delivery Times', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       <div style={{ ...styles.filterBar, marginBottom: 12 }} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
@@ -3121,25 +3156,24 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
       .sort((a, b) => b.total - a.total);
   }, [dateFiltered]);
 
-  const handleDownload = () => {
-    const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Qty Sold (matched)', 'Payment Method', 'Subtotal', 'Total', 'Status'];
-    const rows = filtered.map((sale) => [
-      sale.receiptNo,
-      new Date(sale.timestamp).toLocaleString('en-PH'),
-      sale.cashierEmail || '—',
-      sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
-      matchedQtyFor(sale) ?? '',
-      sale.paymentMethod || '—',
-      sale.subtotal.toFixed(2),
-      sale.total.toFixed(2),
-      sale.cancelled ? 'Cancelled' : 'Completed',
-    ]);
-    downloadCSV('sales-history.csv', headers, rows);
-  };
+  const exportHeaders = ['Receipt', 'Date', 'Cashier', 'Items', 'Qty Sold (matched)', 'Payment Method', 'Subtotal', 'Total', 'Status'];
+  const exportRows = () => filtered.map((sale) => [
+    sale.receiptNo,
+    new Date(sale.timestamp).toLocaleString('en-PH'),
+    sale.cashierEmail || '—',
+    sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
+    matchedQtyFor(sale) ?? '',
+    sale.paymentMethod || '—',
+    sale.subtotal.toFixed(2),
+    sale.total.toFixed(2),
+    sale.cancelled ? 'Cancelled' : 'Completed',
+  ]);
+  const handleDownload = () => downloadCSV('sales-history.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('sales-history.pdf', 'Sales History', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       <div style={{ ...styles.filterBar, marginBottom: 12 }} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
@@ -3361,15 +3395,14 @@ function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
 
   const filtered = userFilter === 'All' ? dateFiltered : dateFiltered.filter((l) => l.email === userFilter);
 
-  const handleDownload = () => {
-    const headers = ['Email', 'Role', 'Type', 'Timestamp'];
-    const rows = filtered.map((l) => [l.email, ROLES[roleByUid[l.uid]] || '—', l.type, new Date(l.timestamp).toLocaleString('en-PH')]);
-    downloadCSV('activity-log.csv', headers, rows);
-  };
+  const exportHeaders = ['Email', 'Role', 'Type', 'Timestamp'];
+  const exportRows = () => filtered.map((l) => [l.email, ROLES[roleByUid[l.uid]] || '—', l.type, new Date(l.timestamp).toLocaleString('en-PH')]);
+  const handleDownload = () => downloadCSV('activity-log.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('activity-log.pdf', 'Activity Log', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       <div style={{ ...styles.filterBar, marginBottom: users.length > 0 ? 8 : 16 }} className="depot-no-print depot-filterbar">
         <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
       </div>
@@ -3936,25 +3969,24 @@ function TransactionHistoryView({ movements, items, histSearch, setHistSearch, h
   const [dateTo, setDateTo] = useState('');
   const dateFiltered = useMemo(() => movements.filter((m) => inDateRange(m.timestamp, dateFrom, dateTo)), [movements, dateFrom, dateTo]);
 
-  const handleDownload = () => {
-    const headers = ['Date', 'Type', 'SKU', 'Item', 'Qty', 'Reason'];
-    const rows = dateFiltered.map((m) => {
-      const it = itemMap[m.itemId];
-      return [
-        new Date(m.timestamp).toLocaleString('en-PH'),
-        m.type === 'in' ? 'Received' : 'Issued',
-        it ? it.sku : '',
-        it ? it.name : 'Unknown item',
-        m.qty,
-        m.reason,
-      ];
-    });
-    downloadCSV('transaction-history.csv', headers, rows);
-  };
+  const exportHeaders = ['Date', 'Type', 'SKU', 'Item', 'Qty', 'Reason'];
+  const exportRows = () => dateFiltered.map((m) => {
+    const it = itemMap[m.itemId];
+    return [
+      new Date(m.timestamp).toLocaleString('en-PH'),
+      m.type === 'in' ? 'Received' : 'Issued',
+      it ? it.sku : '',
+      it ? it.name : 'Unknown item',
+      m.qty,
+      m.reason,
+    ];
+  });
+  const handleDownload = () => downloadCSV('transaction-history.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('transaction-history.pdf', 'Transaction History', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
       <div style={{ ...styles.filterBar, marginBottom: 8 }} className="depot-no-print depot-filterbar">
         <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
       </div>
