@@ -442,6 +442,7 @@ export default function InventorySystem() {
   const [pendingUsers, setPendingUsers] = useState([]);
   const [approvedUsers, setApprovedUsers] = useState([]);
   const [branding, setBranding] = useState(null);
+  const [tenantBranding, setTenantBranding] = useState(null);
   const [items, setItems] = useState([]);
   const [movements, setMovements] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
@@ -553,8 +554,8 @@ export default function InventorySystem() {
   };
 
   // Branding (custom logo + theme): public read, so this works even on the
-  // signed-out login screen. Applies live for everyone the moment a Super
-  // Admin changes it.
+  // signed-out login screen. This is the PLATFORM default - Super Admin
+  // only - applied at sign-in and to any tenant that hasn't set their own.
   useEffect(() => {
     const unsub = onSnapshot(doc(db, 'config', 'branding'), (d) => {
       setBranding(d.exists() ? d.data() : {});
@@ -562,8 +563,26 @@ export default function InventorySystem() {
     return unsub;
   }, []);
 
-  const effectiveLogo = branding?.logoDataUri || LOGO_DATA_URI;
-  const activeTheme = THEMES[branding?.themeKey] || THEMES[DEFAULT_THEME_KEY];
+  // Per-tenant branding override: each Client Admin can customize their own
+  // logo/theme independently, without affecting the platform default or any
+  // other tenant. Only meaningful once ownerId is known (i.e. after login),
+  // since it lives at config/branding_{ownerId}.
+  useEffect(() => {
+    if (!ownerId) { setTenantBranding(null); return; }
+    const unsub = onSnapshot(doc(db, 'config', 'branding_' + ownerId), (d) => {
+      setTenantBranding(d.exists() ? d.data() : {});
+    }, () => setTenantBranding({}));
+    return unsub;
+  }, [ownerId]);
+
+  // Effective branding: a tenant's own override wins field-by-field, falling
+  // back to the platform default for anything the tenant hasn't customized.
+  const effectiveBranding = {
+    logoDataUri: tenantBranding?.logoDataUri ?? branding?.logoDataUri,
+    themeKey: tenantBranding?.themeKey ?? branding?.themeKey,
+  };
+  const effectiveLogo = effectiveBranding.logoDataUri || LOGO_DATA_URI;
+  const activeTheme = THEMES[effectiveBranding.themeKey] || THEMES[DEFAULT_THEME_KEY];
 
   // Super Admin manages Team Access for the whole platform (every account).
   // A Client only ever subscribes to the staff THEY created - scoped via
@@ -685,20 +704,30 @@ export default function InventorySystem() {
     }
   };
 
+  // Super Admin edits the platform default (shown at sign-in and to any
+  // tenant without their own override). A Client Admin edits ONLY their own
+  // tenant's branding doc - it can never affect the platform default or any
+  // other Client Admin's portal.
+  const brandingDocFor = (role) => (role === 'superadmin' ? 'branding' : 'branding_' + ownerId);
+
   const saveLogo = async (dataUri) => {
-    if (myRole !== 'superadmin') return;
+    if (!isManager) return;
     try {
-      await setDoc(doc(db, 'config', 'branding'), { logoDataUri: dataUri }, { merge: true });
-      showToast('Logo updated for everyone');
+      await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
+        logoDataUri: dataUri, ...(myRole === 'superadmin' ? {} : { ownerId }),
+      }, { merge: true });
+      showToast(myRole === 'superadmin' ? 'Logo updated for everyone' : 'Logo updated for your inventory portal');
     } catch (e) {
       showToast('Could not save logo — check your connection');
     }
   };
 
   const resetLogo = async () => {
-    if (myRole !== 'superadmin') return;
+    if (!isManager) return;
     try {
-      await setDoc(doc(db, 'config', 'branding'), { logoDataUri: null }, { merge: true });
+      await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
+        logoDataUri: null, ...(myRole === 'superadmin' ? {} : { ownerId }),
+      }, { merge: true });
       showToast('Reverted to the default logo');
     } catch (e) {
       showToast('Could not reset logo — check your connection');
@@ -706,9 +735,11 @@ export default function InventorySystem() {
   };
 
   const setThemeKey = async (key) => {
-    if (myRole !== 'superadmin') return;
+    if (!isManager) return;
     try {
-      await setDoc(doc(db, 'config', 'branding'), { themeKey: key }, { merge: true });
+      await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
+        themeKey: key, ...(myRole === 'superadmin' ? {} : { ownerId }),
+      }, { merge: true });
       showToast(`Theme changed to ${THEMES[key]?.label || key}`);
     } catch (e) {
       showToast('Could not change theme — check your connection');
@@ -1417,7 +1448,7 @@ export default function InventorySystem() {
             onRevoke={revokeUser}
             onChangeRole={changeUserRole}
             onSaveProfile={updateUserProfile}
-            branding={branding}
+            branding={effectiveBranding}
             onSaveLogo={saveLogo}
             onResetLogo={resetLogo}
             onSetTheme={setThemeKey}
@@ -3377,12 +3408,18 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
         <ProfileEditModal user={editingUser} onClose={() => setEditingUser(null)} onSave={onSaveProfile} />
       )}
 
-      {isSuperAdmin && (
+      {(isSuperAdmin || myRole === 'client') && (
         <div style={{ ...styles.panel, marginTop: 16 }}>
           <div style={styles.panelHeader}>
             <Package size={15} />
-            <span>APP BRANDING</span>
+            <span>{isSuperAdmin ? 'PLATFORM BRANDING' : 'MY INVENTORY PORTAL BRANDING'}</span>
           </div>
+          {!isSuperAdmin && (
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 4, marginBottom: 4 }}>
+              Changes here apply only to your own inventory portal - other Client Admins never see them,
+              and they never see yours.
+            </div>
+          )}
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Logo</div>
             <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
@@ -3409,7 +3446,9 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
                   </button>
                 </div>
                 <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', maxWidth: 260 }}>
-                  Applies for everyone, including the sign-in screen.
+                  {isSuperAdmin
+                    ? 'Applies at the sign-in screen and to any tenant that hasn\u2019t set their own logo.'
+                    : 'Applies only when you\u2019re signed in - the sign-in screen and other tenants are unaffected.'}
                 </div>
               </div>
             </div>
