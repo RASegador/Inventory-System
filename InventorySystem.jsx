@@ -1977,10 +1977,20 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
                 <div>
                   <div style={styles.watchSku}>{u.email}</div>
                   <div style={styles.watchName}>
-                    {ROLES[u.role] || 'Staff'} · Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
+                    {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
                   </div>
                 </div>
-                <div style={{ display: 'flex', gap: 6 }}>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  {isSuperAdmin && (
+                    <select
+                      className="depot-select"
+                      value={u.role}
+                      onChange={(e) => onChangeRole(u.id, e.target.value)}
+                      style={{ ...styles.select, padding: '6px 8px', fontSize: 12 }}
+                    >
+                      {Object.keys(ROLES).map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}
+                    </select>
+                  )}
                   <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onApprove(u.id)}>Approve</button>
                   <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onDeny(u.id)}>Deny</button>
                 </div>
