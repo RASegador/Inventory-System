@@ -10,7 +10,7 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -143,6 +143,15 @@ function printPage() {
   window.print();
 }
 
+// Items store suppliers as `supplierIds` (array - multi-supplier support).
+// Older items from before this change may still only have the single
+// `supplierId` field; this normalizes either shape into an array so every
+// view can treat all items identically without caring which one they have.
+function getSupplierIds(item) {
+  if (Array.isArray(item?.supplierIds)) return item.supplierIds;
+  return item?.supplierId ? [item.supplierId] : [];
+}
+
 function ExportBar({ onPrint, onDownload }) {
   return (
     <div className="depot-no-print depot-export-bar" style={styles.exportBar}>
@@ -270,7 +279,7 @@ const ROLES = {
 const PERMISSIONS = {
   superadmin: {
     viewInventory: true, editInventory: true, deleteInventory: true,
-    manageCategories: true, manageSuppliers: true, manageLocations: true,
+    manageCategories: true, manageSuppliers: true, manageLocations: true, manageOrders: true,
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
@@ -278,7 +287,7 @@ const PERMISSIONS = {
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
-    manageCategories: true, manageSuppliers: true, manageLocations: true,
+    manageCategories: true, manageSuppliers: true, manageLocations: true, manageOrders: true,
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
@@ -286,7 +295,7 @@ const PERMISSIONS = {
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
-    manageCategories: false, manageSuppliers: false, manageLocations: false,
+    manageCategories: false, manageSuppliers: false, manageLocations: false, manageOrders: false,
     stockReceive: true, stockIssue: false,
     pos: true, viewReports: false, print: false, cancelSales: false,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
@@ -306,6 +315,7 @@ const VIEW_PERMISSIONS = {
   suppliers: 'manageSuppliers',
   categories: 'manageCategories',
   locations: 'manageLocations',
+  orders: 'manageOrders',
   delivery: 'viewReports',
   sales: 'viewReports',
   mysales: 'viewOwnSales',
@@ -427,6 +437,7 @@ export default function InventorySystem() {
   const [locations, setLocations] = useState([]);
   const [deliveryStatuses, setDeliveryStatuses] = useState({});
   const [sales, setSales] = useState([]);
+  const [orders, setOrders] = useState([]);
   const [loginLogs, setLoginLogs] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState('overview');
@@ -436,7 +447,8 @@ export default function InventorySystem() {
   const [itemModal, setItemModal] = useState(null);
   const [moveModal, setMoveModal] = useState(null);
   const [supplierModal, setSupplierModal] = useState(null);
-  const [confirmModal, setConfirmModal] = useState(null); // {kind: 'item'|'supplier', target}
+  const [orderModal, setOrderModal] = useState(null);
+  const [confirmModal, setConfirmModal] = useState(null); // {kind: 'item'|'supplier'|'order', target}
   const [deliveryStatusModal, setDeliveryStatusModal] = useState(null);
   const [toast, setToast] = useState(null);
 
@@ -764,6 +776,9 @@ export default function InventorySystem() {
         unsubs.push(onSnapshot(query(collection(db, 'sales'), where('ownerId', '==', ownerId)), (snap) => {
           setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
         }));
+        unsubs.push(onSnapshot(query(collection(db, 'orders'), where('ownerId', '==', ownerId)), (snap) => {
+          setOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.orderDate - a.orderDate));
+        }));
         // Super Admin monitors login activity platform-wide; a Client only
         // sees activity for their own tenant (themselves + their staff).
         const logsQuery = myRole === 'superadmin'
@@ -776,6 +791,7 @@ export default function InventorySystem() {
         setMovements([]);
         setDeliveryStatuses({});
         setLoginLogs([]);
+        setOrders([]);
         // Staff only ever see their own sales - the query itself (not just the
         // rule) scopes this, so there's no risk of over-fetching then hiding.
         unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
@@ -838,8 +854,10 @@ export default function InventorySystem() {
     const s = suppliers.find((x) => x.id === id);
     try {
       await deleteDoc(doc(db, 'suppliers', id));
-      const affected = items.filter((it) => it.supplierId === id);
-      await Promise.all(affected.map((it) => setDoc(doc(db, 'items', it.id), { ...it, supplierId: '' })));
+      const affected = items.filter((it) => getSupplierIds(it).includes(id));
+      await Promise.all(affected.map((it) => setDoc(doc(db, 'items', it.id), {
+        ...it, supplierIds: getSupplierIds(it).filter((sid) => sid !== id),
+      })));
       showToast(`Removed ${s?.name || 'supplier'}`);
     } catch (e) {
       showToast('Could not remove supplier — check your connection');
@@ -1031,6 +1049,71 @@ export default function InventorySystem() {
     setConfirmModal(null);
   };
 
+  const saveOrder = async (draft) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
+    const item = items.find((i) => i.id === draft.itemId);
+    const supplier = suppliers.find((s) => s.id === draft.supplierId);
+    if (!item || !supplier) { showToast('Pick an item and one of its suppliers'); return; }
+    const quantity = Math.max(1, Number(draft.quantity) || 0);
+    const unitCost = Math.max(0, Number(draft.unitCost) || 0);
+    const now = Date.now();
+    const id = 'o' + Math.random().toString(36).slice(2, 9);
+    const order = {
+      id, ownerId,
+      itemId: item.id, itemSku: item.sku, itemName: item.name,
+      supplierId: supplier.id, supplierName: supplier.name,
+      quantity, unitCost, totalCost: quantity * unitCost,
+      status: 'pending',
+      orderDate: now,
+      expectedDate: now + (supplier.leadTimeDays || 0) * DAY_MS,
+      receivedDate: null,
+      notes: (draft.notes || '').trim(),
+      createdBy: user.uid, createdByEmail: user.email || '',
+    };
+    try {
+      await setDoc(doc(db, 'orders', id), order);
+      showToast(`Order placed with ${supplier.name}`);
+    } catch (e) {
+      showToast('Could not place order — check your connection');
+    }
+    setOrderModal(null);
+  };
+
+  const receiveOrder = async (order) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
+    if (order.status !== 'pending') { showToast(`This order is already ${order.status}`); return; }
+    const item = items.find((i) => i.id === order.itemId);
+    const now = Date.now();
+    try {
+      if (item) {
+        await setDoc(doc(db, 'items', item.id), { ...item, quantity: item.quantity + order.quantity });
+        const mvId = 'm' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'movements', mvId), {
+          id: mvId, itemId: item.id, type: 'in', qty: order.quantity,
+          reason: `Order received from ${order.supplierName}`, timestamp: now, ownerId,
+        });
+      }
+      await setDoc(doc(db, 'orders', order.id), { status: 'received', receivedDate: now }, { merge: true });
+      showToast(item ? `Order received — ${order.quantity} × ${order.itemSku} added to stock` : 'Order marked received');
+    } catch (e) {
+      showToast('Could not mark order received — check your connection');
+    }
+  };
+
+  const cancelOrder = async (order) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
+    if (order.status !== 'pending') { showToast(`This order is already ${order.status}`); return; }
+    try {
+      await setDoc(doc(db, 'orders', order.id), {
+        status: 'cancelled', cancelledAt: Date.now(), cancelledBy: user.email || user.uid,
+      }, { merge: true });
+      showToast(`Order for ${order.itemSku} cancelled`);
+    } catch (e) {
+      showToast('Could not cancel order — check your connection');
+    }
+    setConfirmModal(null);
+  };
+
   const filtered = useMemo(() => {
     let list = items.filter((it) => {
       const matchesSearch =
@@ -1077,24 +1160,27 @@ export default function InventorySystem() {
   }, [movements, items, histSearch, histType, histItem]);
 
   const deliveryRows = useMemo(() => {
-    return items
-      .filter((it) => it.supplierId)
-      .map((it) => {
-        const supplier = suppliers.find((s) => s.id === it.supplierId);
-        if (!supplier) return null;
+    const rows = [];
+    items.forEach((it) => {
+      getSupplierIds(it).forEach((sid) => {
+        const supplier = suppliers.find((s) => s.id === sid);
+        if (!supplier) return;
         const inbound = movements.filter((m) => m.itemId === it.id && m.type === 'in');
         const lastDelivery = inbound.length ? Math.max(...inbound.map((m) => m.timestamp)) : null;
         const expectedNext = lastDelivery ? lastDelivery + supplier.leadTimeDays * DAY_MS : null;
         const overdue = expectedNext && expectedNext < Date.now() && it.quantity <= it.reorderPoint;
         const autoStatus = it.quantity <= it.reorderPoint ? (overdue ? 'Delivery Overdue' : 'Reorder Now') : 'On Track';
+        // A manual status override is set per-item (not per-supplier) - if an
+        // item has more than one supplier, both rows share the same override.
         const override = deliveryStatuses[it.id];
         const status = override ? override.status : autoStatus;
-        return {
+        rows.push({
           item: it, supplier, lastDelivery, expectedNext, status, autoStatus,
           manual: !!override, note: override?.note || '', orderDate: override?.orderDate || null,
-        };
-      })
-      .filter(Boolean);
+        });
+      });
+    });
+    return rows;
   }, [items, suppliers, movements, deliveryStatuses]);
 
   const supplierMap = useMemo(() => Object.fromEntries(suppliers.map((s) => [s.id, s])), [suppliers]);
@@ -1176,6 +1262,7 @@ export default function InventorySystem() {
           onAdd={() => {
             if (view === 'inventory') setItemModal('new');
             if (view === 'suppliers') setSupplierModal('new');
+            if (view === 'orders') setOrderModal('new');
           }}
         />
 
@@ -1208,6 +1295,14 @@ export default function InventorySystem() {
             items={items}
             onEdit={(s) => setSupplierModal(s)}
             onDelete={(s) => setConfirmModal({ kind: 'supplier', target: s })}
+          />
+        )}
+
+        {view === 'orders' && (
+          <OrdersView
+            orders={orders}
+            onReceive={receiveOrder}
+            onCancel={(o) => setConfirmModal({ kind: 'order', target: o })}
           />
         )}
 
@@ -1318,6 +1413,16 @@ export default function InventorySystem() {
         />
       )}
 
+      {orderModal && (
+        <OrderModal
+          draft={orderModal === 'new' ? null : orderModal}
+          items={items}
+          suppliers={suppliers}
+          onClose={() => setOrderModal(null)}
+          onSave={saveOrder}
+        />
+      )}
+
       {confirmModal && confirmModal.kind === 'item' && (
         <ConfirmModal
           title="REMOVE ITEM"
@@ -1333,6 +1438,15 @@ export default function InventorySystem() {
           message={<>Remove <strong>{confirmModal.target.name}</strong>? Items linked to this supplier will be unlinked, not deleted.</>}
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => deleteSupplier(confirmModal.target.id)}
+        />
+      )}
+
+      {confirmModal && confirmModal.kind === 'order' && (
+        <ConfirmModal
+          title="CANCEL ORDER"
+          message={<>Cancel the order for <strong>{confirmModal.target.quantity} × {confirmModal.target.itemSku}</strong> from <strong>{confirmModal.target.supplierName}</strong>? This won't affect stock.</>}
+          onCancel={() => setConfirmModal(null)}
+          onConfirm={() => cancelOrder(confirmModal.target)}
         />
       )}
 
@@ -1615,6 +1729,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
     { type: 'group', label: 'Stock Management', icon: Boxes, children: [
       { key: 'inventory', label: 'Inventory', icon: Boxes },
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
+      { key: 'orders', label: 'Orders', icon: ClipboardList },
       { key: 'categories', label: 'Categories', icon: Tag },
       { key: 'locations', label: 'Zonal Locations', icon: MapPin },
     ] },
@@ -1747,6 +1862,7 @@ function TopBar({ view, role, onAdd }) {
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
+    orders: ['Orders', 'Purchase orders placed with your suppliers'],
     categories: ['Categories', 'Organize items into your own groups'],
     locations: ['Zonal Locations', 'Manage where stock is stored'],
     delivery: ['Delivery Times', 'Lead times and expected restocks'],
@@ -1758,7 +1874,8 @@ function TopBar({ view, role, onAdd }) {
     myprofile: ['My Profile', 'Your personal details'],
   };
   const [title, sub] = titles[view];
-  const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'));
+  const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'))
+    || (view === 'orders' && can(role, 'manageOrders'));
   return (
     <div style={styles.topbar} className="depot-topbar">
       <div>
@@ -1767,7 +1884,7 @@ function TopBar({ view, role, onAdd }) {
       </div>
       {showAdd && (
         <button className="depot-btn depot-no-print depot-topbar-btn" style={styles.primaryBtn} onClick={onAdd}>
-          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : 'New Item'}
+          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : 'New Item'}
         </button>
       )}
     </div>
@@ -1856,10 +1973,12 @@ function Overview({ totals, categoryData, onQuickMove }) {
 }
 
 function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove }) {
+  const supplierNames = (it) => getSupplierIds(it).map((sid) => supplierMap[sid]?.name).filter(Boolean);
+
   const handleDownload = () => {
-    const headers = ['SKU', 'Name', 'Category', 'Supplier', 'Location', 'Quantity', 'Unit Cost', 'Value'];
+    const headers = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Unit Cost', 'Value'];
     const rows = filtered.map((it) => [
-      it.sku, it.name, it.category, supplierMap[it.supplierId]?.name || '', it.location,
+      it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
       it.quantity, it.unitCost.toFixed(2), (it.quantity * it.unitCost).toFixed(2),
     ]);
     downloadCSV('inventory.csv', headers, rows);
@@ -1899,7 +2018,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
         <table style={styles.table} className="depot-table">
           <thead>
             <tr>
-              {['SKU', 'Item', 'Category', 'Supplier', 'Location', 'Qty', 'Unit Cost', 'Value', ...(showActionsCol ? [''] : [])].map((h) => (
+              {['SKU', 'Item', 'Category', 'Suppliers', 'Location', 'Qty', 'Unit Cost', 'Value', ...(showActionsCol ? [''] : [])].map((h) => (
                 <th key={h} style={styles.th}>{h}</th>
               ))}
             </tr>
@@ -1910,14 +2029,14 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
             )}
             {filtered.map((it) => {
               const low = it.quantity <= it.reorderPoint;
-              const supplier = supplierMap[it.supplierId];
+              const names = supplierNames(it);
               return (
                 <tr key={it.id} className="depot-row">
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500 }}>{it.sku}</td>
                   <td style={styles.td}>{it.name}</td>
                   <td style={styles.td}><span style={styles.pill}>{it.category}</span></td>
-                  <td style={{ ...styles.td, fontSize: 12.5, color: supplier ? 'var(--ink)' : 'rgba(59,42,31,0.4)' }}>
-                    {supplier ? supplier.name : '— none —'}
+                  <td style={{ ...styles.td, fontSize: 12.5, color: names.length ? 'var(--ink)' : 'rgba(59,42,31,0.4)' }}>
+                    {names.length ? names.join(', ') : '— none —'}
                   </td>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12, color: 'rgba(59,42,31,0.6)' }}>
                     <MapPin size={11} style={{ marginRight: 3, verticalAlign: -1 }} />{it.location}
@@ -1946,7 +2065,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
 }
 
 function SuppliersView({ suppliers, items, onEdit, onDelete }) {
-  const countFor = (sid) => items.filter((it) => it.supplierId === sid).length;
+  const countFor = (sid) => items.filter((it) => getSupplierIds(it).includes(sid)).length;
 
   const handleDownload = () => {
     const headers = ['Name', 'Contact', 'Phone', 'Email', 'Lead Time (days)', 'Items Supplied', 'Notes'];
@@ -1985,6 +2104,107 @@ function SuppliersView({ suppliers, items, onEdit, onDelete }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function OrdersView({ orders, onReceive, onCancel }) {
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState('All');
+
+  const filtered = useMemo(() => {
+    return orders.filter((o) => {
+      const matchesStatus = statusFilter === 'All' || o.status === statusFilter.toLowerCase();
+      const q = search.toLowerCase();
+      const matchesSearch = !q || o.itemSku.toLowerCase().includes(q) || o.itemName.toLowerCase().includes(q)
+        || o.supplierName.toLowerCase().includes(q);
+      return matchesStatus && matchesSearch;
+    });
+  }, [orders, search, statusFilter]);
+
+  const statusStyle = (status) => {
+    if (status === 'pending') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
+    if (status === 'cancelled') return { bg: 'rgba(193,84,60,0.1)', color: 'var(--red)' };
+    return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' }; // received
+  };
+
+  const handleDownload = () => {
+    const headers = ['Order Date', 'Item', 'Supplier', 'Quantity', 'Unit Cost', 'Total', 'Expected By', 'Status', 'Notes'];
+    const rows = filtered.map((o) => [
+      formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName, o.quantity,
+      o.unitCost.toFixed(2), o.totalCost.toFixed(2), formatDate(o.expectedDate), o.status, o.notes || '',
+    ]);
+    downloadCSV('orders.csv', headers, rows);
+  };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+        <div style={styles.searchBox}>
+          <Search size={15} color="rgba(59,42,31,0.5)" />
+          <input
+            className="depot-input"
+            placeholder="Search by item or supplier…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={styles.searchInput}
+          />
+        </div>
+        <select className="depot-select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} style={styles.select}>
+          <option value="All">All Statuses</option>
+          <option value="Pending">Pending</option>
+          <option value="Received">Received</option>
+          <option value="Cancelled">Cancelled</option>
+        </select>
+      </div>
+
+      <div style={styles.tableWrap} className="depot-scroll">
+        <table style={styles.table} className="depot-table">
+          <thead>
+            <tr>
+              {['Order Date', 'Item', 'Supplier', 'Qty', 'Unit Cost', 'Total', 'Expected By', 'Status', ''].map((h) => (
+                <th key={h} style={styles.th}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 && (
+              <tr><td colSpan={9} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No orders match your filters.</td></tr>
+            )}
+            {filtered.map((o) => {
+              const st = statusStyle(o.status);
+              return (
+                <tr key={o.id} className="depot-row">
+                  <td style={styles.td}>{formatDate(o.orderDate)}</td>
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif" }}>
+                    {o.itemSku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {o.itemName}</span>
+                  </td>
+                  <td style={styles.td}>{o.supplierName}</td>
+                  <td style={styles.td}>{o.quantity}</td>
+                  <td style={styles.td}>{currency(o.unitCost)}</td>
+                  <td style={styles.td}>{currency(o.totalCost)}</td>
+                  <td style={styles.td}>{formatDate(o.expectedDate)}</td>
+                  <td style={styles.td}>
+                    <span style={{ ...styles.statusPill, background: st.bg, color: st.color }}>
+                      {o.status === 'received' && <CheckCircle2 size={12} />}
+                      {o.status.charAt(0).toUpperCase() + o.status.slice(1)}
+                    </span>
+                  </td>
+                  <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                    {o.status === 'pending' && (
+                      <>
+                        <IconBtn onClick={() => onReceive(o)} title="Mark received"><CheckCircle2 size={14} /></IconBtn>
+                        <IconBtn onClick={() => onCancel(o)} title="Cancel order" danger><X size={14} /></IconBtn>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -2161,7 +2381,7 @@ function DeliveryTimesView({ rows, onUpdateStatus }) {
               const { item, supplier, lastDelivery, orderDate, status, manual } = row;
               const st = statusStyle(status);
               return (
-                <tr key={item.id} className="depot-row">
+                <tr key={`${item.id}-${supplier.id}`} className="depot-row">
                   <td style={styles.td}>{supplier.name}</td>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif" }}>{item.sku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {item.name}</span></td>
                   <td style={styles.td}>{formatDate(orderDate)}</td>
@@ -3210,10 +3430,22 @@ function IconBtn({ children, onClick, title, danger, className }) {
 }
 
 function ItemModal({ draft, suppliers, categories, locations, onClose, onSave }) {
-  const [form, setForm] = useState(draft || {
-    sku: '', name: '', category: categories[0] || '', quantity: 0, reorderPoint: 10, unitCost: 0, location: locations[0] || '', supplierId: '',
+  const [form, setForm] = useState(() => {
+    if (!draft) {
+      return { sku: '', name: '', category: categories[0] || '', quantity: 0, reorderPoint: 10, unitCost: 0, location: locations[0] || '', supplierIds: [] };
+    }
+    const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
+    return { ...rest, supplierIds: getSupplierIds(draft) };
   });
   const valid = form.sku.trim() && form.name.trim();
+  const toggleSupplier = (sid) => {
+    setForm({
+      ...form,
+      supplierIds: form.supplierIds.includes(sid)
+        ? form.supplierIds.filter((id) => id !== sid)
+        : [...form.supplierIds, sid],
+    });
+  };
   return (
     <div style={styles.overlay} onClick={onClose}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
@@ -3244,12 +3476,25 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
               </select>
             </Field>
           </div>
-          <Field label="Supplier">
-            <select className="depot-select" style={styles.modalInput} value={form.supplierId}
-              onChange={(e) => setForm({ ...form, supplierId: e.target.value })}>
-              <option value="">— None —</option>
-              {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
+          <Field label="Suppliers">
+            {suppliers.length === 0 ? (
+              <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', padding: '4px 2px' }}>
+                No suppliers yet — add one from the Suppliers tab first.
+              </div>
+            ) : (
+              <div style={{
+                border: '1px solid rgba(59,42,31,0.18)', borderRadius: 6, padding: 10,
+                maxHeight: 140, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 7,
+              }} className="depot-scroll">
+                {suppliers.map((s) => (
+                  <label key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={form.supplierIds.includes(s.id)} onChange={() => toggleSupplier(s.id)} />
+                    {s.name}
+                    <span style={{ color: 'rgba(59,42,31,0.45)', fontSize: 11 }}>· {s.leadTimeDays}d lead time</span>
+                  </label>
+                ))}
+              </div>
+            )}
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Quantity" grow>
@@ -3325,6 +3570,92 @@ function SupplierModal({ draft, onClose, onSave }) {
           <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
             disabled={!valid} onClick={() => onSave(form)}>
             {draft ? 'Save Changes' : 'Add Supplier'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OrderModal({ draft, items, suppliers, onClose, onSave }) {
+  const [itemId, setItemId] = useState(draft?.itemId || '');
+  const [supplierId, setSupplierId] = useState(draft?.supplierId || '');
+  const [quantity, setQuantity] = useState(draft?.quantity ?? 1);
+  const [unitCost, setUnitCost] = useState(draft?.unitCost ?? 0);
+  const [notes, setNotes] = useState(draft?.notes || '');
+
+  const selectedItem = items.find((it) => it.id === itemId);
+  const availableSuppliers = selectedItem
+    ? getSupplierIds(selectedItem).map((sid) => suppliers.find((s) => s.id === sid)).filter(Boolean)
+    : [];
+
+  const handleItemChange = (id) => {
+    setItemId(id);
+    const it = items.find((i) => i.id === id);
+    const supplierIds = it ? getSupplierIds(it) : [];
+    // Reset the supplier choice if it doesn't belong to the newly picked
+    // item, and default the cost to the item's current catalog unit cost.
+    setSupplierId((prev) => (supplierIds.includes(prev) ? prev : (supplierIds[0] || '')));
+    if (it) setUnitCost(it.unitCost);
+  };
+
+  const valid = itemId && supplierId && Number(quantity) > 0;
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>NEW ORDER</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <Field label="Item">
+            <select className="depot-select" style={styles.modalInput} value={itemId}
+              onChange={(e) => handleItemChange(e.target.value)}>
+              <option value="">— Select an item —</option>
+              {items.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name}</option>)}
+            </select>
+          </Field>
+
+          {itemId && availableSuppliers.length === 0 && (
+            <div style={{ fontSize: 12, color: 'var(--red)', padding: '2px 2px 4px' }}>
+              This item has no suppliers assigned yet — edit it from Inventory to assign one first.
+            </div>
+          )}
+
+          <Field label="Supplier">
+            <select className="depot-select" style={styles.modalInput} value={supplierId} disabled={!itemId || availableSuppliers.length === 0}
+              onChange={(e) => setSupplierId(e.target.value)}>
+              <option value="">— Select a supplier —</option>
+              {availableSuppliers.map((s) => <option key={s.id} value={s.id}>{s.name} ({s.leadTimeDays}d lead time)</option>)}
+            </select>
+          </Field>
+
+          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+            <Field label="Quantity" grow>
+              <input className="depot-input" type="number" min="1" style={styles.modalInput} value={quantity}
+                onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
+            </Field>
+            <Field label="Unit Cost (₱)" grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={unitCost}
+                onChange={(e) => setUnitCost(Math.max(0, Number(e.target.value)))} />
+            </Field>
+          </div>
+
+          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', padding: '2px 2px 4px' }}>
+            Order total: <strong style={{ color: 'var(--ink)' }}>{currency((Number(quantity) || 0) * (Number(unitCost) || 0))}</strong>
+          </div>
+
+          <Field label="Notes">
+            <input className="depot-input" style={styles.modalInput} value={notes}
+              onChange={(e) => setNotes(e.target.value)} placeholder="Optional notes…" />
+          </Field>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
+            disabled={!valid} onClick={() => onSave({ itemId, supplierId, quantity, unitCost, notes })}>
+            Place Order
           </button>
         </div>
       </div>
