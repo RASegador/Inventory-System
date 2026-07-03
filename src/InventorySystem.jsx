@@ -235,7 +235,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
-    viewOwnSales: false, viewActivityLogs: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
@@ -243,7 +243,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
-    viewOwnSales: false, viewActivityLogs: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true,
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
@@ -251,7 +251,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: false,
     pos: true, viewReports: false, print: false, cancelSales: false,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
-    viewOwnSales: true, viewActivityLogs: false,
+    viewOwnSales: true, viewActivityLogs: false, manageUserProfiles: false,
   },
 };
 
@@ -273,6 +273,8 @@ const VIEW_PERMISSIONS = {
   history: 'viewReports',
   approvals: 'manageUsers',
   activity: 'viewActivityLogs',
+  profiles: 'manageUserProfiles',
+  myprofile: null,
 };
 
 function canAccessView(role, viewKey) {
@@ -288,6 +290,13 @@ function resolveRole(profile) {
   if (profile.role && PERMISSIONS[profile.role]) return profile.role;
   if (profile.isAdmin) return 'superadmin';
   return 'staff';
+}
+
+// A short, human-readable ID distinct from the long Firebase account ID.
+// Timestamp + random suffix keeps collisions practically impossible without
+// needing a server-side counter.
+function generateUserIdNumber() {
+  return 'U-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 5).toUpperCase();
 }
 
 // Background/color scheme presets a Super Admin can pick from. Each key
@@ -436,7 +445,7 @@ export default function InventorySystem() {
         if (!snap.exists()) {
           await setDoc(ref, {
             email: user.email || '', approved: false, isAdmin: false, role: 'staff', createdAt: Date.now(),
-          });
+          }, { merge: true });
         }
       } catch (e) {
         console.error('Profile bootstrap error:', e);
@@ -452,17 +461,18 @@ export default function InventorySystem() {
   const myRole = resolveRole(myProfile);
   const isManager = myRole === 'superadmin' || myRole === 'client';
 
-  // Only Super Admin manages Team Access now - Client no longer sees or
-  // manages other accounts, so there's no reason for Client to subscribe.
+  // Super Admin manages Team Access (everyone); Client subscribes too but
+  // only for the User Profiles view - Firestore rules mean a Client's query
+  // only ever returns Staff docs, never other Client/Super Admin accounts.
   useEffect(() => {
-    if (!user || myRole !== 'superadmin') { setPendingUsers([]); setApprovedUsers([]); return; }
+    if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
     const unsub = onSnapshot(collection(db, 'users'), (snap) => {
       const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
     });
     return unsub;
-  }, [user, myRole]);
+  }, [user, isManager]);
 
   const approveUser = async (uid) => {
     try {
@@ -498,6 +508,29 @@ export default function InventorySystem() {
       showToast(`Role updated to ${ROLES[newRole] || newRole}`);
     } catch (e) {
       showToast('Could not update role — check your connection');
+    }
+  };
+
+  // Edits profile info (name/username/contact/address) - never role or
+  // approval status, which stay behind the separate Team Access controls.
+  // Anyone can edit their own; a manager can edit others' (Client limited to
+  // Staff by the UI list they're given and by the Firestore rules).
+  const updateUserProfile = async (uid, fields) => {
+    const isSelf = uid === user.uid;
+    if (!isSelf && !can(myRole, 'manageUserProfiles')) {
+      showToast("You don't have permission to edit this profile");
+      return;
+    }
+    try {
+      await setDoc(doc(db, 'users', uid), {
+        fullName: fields.fullName?.trim() || '',
+        username: fields.username?.trim() || '',
+        contactNumber: fields.contactNumber?.trim() || '',
+        address: fields.address?.trim() || '',
+      }, { merge: true });
+      showToast('Profile updated');
+    } catch (e) {
+      showToast('Could not update profile — check your connection');
     }
   };
 
@@ -1099,6 +1132,18 @@ export default function InventorySystem() {
         {view === 'activity' && (
           <ActivityLogView logs={loginLogs} myRole={myRole} approvedUsers={approvedUsers} pendingUsers={pendingUsers} />
         )}
+
+        {view === 'profiles' && (
+          <UserProfilesView
+            approvedUsers={approvedUsers}
+            myRole={myRole}
+            onSave={updateUserProfile}
+          />
+        )}
+
+        {view === 'myprofile' && (
+          <MyProfileView profile={myProfile} uid={user.uid} onSave={updateUserProfile} />
+        )}
         </>
         )}
       </main>
@@ -1196,6 +1241,10 @@ function LoginScreen({ logo, theme }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [username, setUsername] = useState('');
+  const [contactNumber, setContactNumber] = useState('');
+  const [address, setAddress] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -1222,7 +1271,19 @@ function LoginScreen({ logo, theme }) {
     setBusy(true);
     try {
       if (mode === 'signup') {
-        await createUserWithEmailAndPassword(auth, email.trim(), password);
+        const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        // Written separately from (and merged with) the app's own profile
+        // bootstrap effect, so whichever runs first or second, neither wipes
+        // the other's fields.
+        try {
+          await setDoc(doc(db, 'users', cred.user.uid), {
+            email: email.trim(), approved: false, isAdmin: false, role: 'staff', createdAt: Date.now(),
+            fullName: fullName.trim(), username: username.trim(), contactNumber: contactNumber.trim(),
+            address: address.trim(), userIdNumber: generateUserIdNumber(),
+          }, { merge: true });
+        } catch (profileErr) {
+          console.error('Could not save signup profile details:', profileErr);
+        }
       } else {
         await signInWithEmailAndPassword(auth, email.trim(), password);
       }
@@ -1281,6 +1342,26 @@ function LoginScreen({ logo, theme }) {
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Confirm Password</label>
             <input
               type="password" required value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Full Name</label>
+            <input
+              type="text" required value={fullName} onChange={(e) => setFullName(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Username</label>
+            <input
+              type="text" required value={username} onChange={(e) => setUsername(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Contact Number</label>
+            <input
+              type="tel" required value={contactNumber} onChange={(e) => setContactNumber(e.target.value)}
+              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
+            />
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Address <span style={{ fontWeight: 400 }}>(optional)</span></label>
+            <input
+              type="text" value={address} onChange={(e) => setAddress(e.target.value)}
               style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
             />
           </>
@@ -1399,6 +1480,8 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
     { key: 'history', label: 'Transaction History', icon: ScrollText },
     { key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount },
     { key: 'activity', label: 'Activity Log', icon: Clock },
+    { key: 'profiles', label: 'User Profiles', icon: User },
+    { key: 'myprofile', label: 'My Profile', icon: User },
   ];
   const items = allItems.filter((it) => canAccessView(role, it.key));
   return (
@@ -1464,6 +1547,8 @@ function TopBar({ view, role, onAdd }) {
     approvals: ['Team Access', 'Approve sign-ups and manage accounts'],
     mysales: ['My Sales', 'Transactions you\'ve processed'],
     activity: ['Activity Log', 'Sign-in and sign-out history'],
+    profiles: ['User Profiles', 'Edit real name, contact, and address details'],
+    myprofile: ['My Profile', 'Your personal details'],
   };
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'));
@@ -2342,6 +2427,146 @@ function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   );
 }
 
+function ProfileEditModal({ user, onClose, onSave }) {
+  const [fullName, setFullName] = useState(user.fullName || '');
+  const [username, setUsername] = useState(user.username || '');
+  const [contactNumber, setContactNumber] = useState(user.contactNumber || '');
+  const [address, setAddress] = useState(user.address || '');
+
+  const submit = () => {
+    onSave(user.id, { fullName, username, contactNumber, address });
+    onClose();
+  };
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={{ ...styles.modal, maxWidth: 400 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>EDIT PROFILE — {user.email}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.5)', marginBottom: 14, fontFamily: "'IBM Plex Mono', monospace" }}>
+            ID: {user.userIdNumber || '—'} · Account: {user.id}
+          </div>
+          <Field label="Full Name">
+            <input className="depot-input" style={styles.modalInput} value={fullName} onChange={(e) => setFullName(e.target.value)} />
+          </Field>
+          <Field label="Username">
+            <input className="depot-input" style={styles.modalInput} value={username} onChange={(e) => setUsername(e.target.value)} />
+          </Field>
+          <Field label="Contact Number">
+            <input className="depot-input" style={styles.modalInput} value={contactNumber} onChange={(e) => setContactNumber(e.target.value)} />
+          </Field>
+          <Field label="Address">
+            <input className="depot-input" style={styles.modalInput} value={address} onChange={(e) => setAddress(e.target.value)} />
+          </Field>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={styles.primaryBtn} onClick={submit}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UserProfilesView({ approvedUsers, myRole, onSave }) {
+  const [editingUser, setEditingUser] = useState(null);
+  // A Client's `approvedUsers` list is already scoped to Staff only by the
+  // Firestore rules (they can't read Client/Super Admin docs), so no extra
+  // client-side filtering is needed here.
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={styles.panel}>
+        <div style={styles.panelHeader}>
+          <User size={15} />
+          <span>{myRole === 'superadmin' ? 'ALL TEAM PROFILES' : 'STAFF PROFILES'} ({approvedUsers.length})</span>
+        </div>
+        {approvedUsers.length === 0 ? (
+          <div style={styles.emptyState}>No profiles to show yet.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+            {approvedUsers.map((u) => (
+              <div key={u.id} style={styles.watchRow}>
+                <div>
+                  <div style={styles.watchSku}>{u.fullName || u.email}</div>
+                  <div style={styles.watchName}>
+                    {u.fullName ? u.email + ' · ' : ''}{ROLES[u.role] || 'Staff'}
+                    {u.contactNumber ? ` · ${u.contactNumber}` : ''}
+                  </div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>
+                    ID: {u.userIdNumber || '—'}
+                  </div>
+                </div>
+                <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setEditingUser(u)}>Edit</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {editingUser && (
+        <ProfileEditModal user={editingUser} onClose={() => setEditingUser(null)} onSave={onSave} />
+      )}
+    </div>
+  );
+}
+
+function MyProfileView({ profile, uid, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const me = { id: uid, ...(profile || {}) };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={{ ...styles.panel, maxWidth: 480 }}>
+        <div style={styles.panelHeader}>
+          <User size={15} />
+          <span>YOUR DETAILS</span>
+        </div>
+        <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Full Name</div>
+            <div style={{ fontSize: 14 }}>{me.fullName || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Username</div>
+            <div style={{ fontSize: 14 }}>{me.username || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Email</div>
+            <div style={{ fontSize: 14 }}>{me.email || '—'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Contact Number</div>
+            <div style={{ fontSize: 14 }}>{me.contactNumber || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Address</div>
+            <div style={{ fontSize: 14 }}>{me.address || '— not set —'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Unique ID Number</div>
+            <div style={{ fontSize: 13, fontFamily: "'IBM Plex Mono', monospace" }}>{me.userIdNumber || '—'}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.5)' }}>Role</div>
+            <div style={{ fontSize: 14 }}>{ROLES[me.role] || 'Staff'}</div>
+          </div>
+        </div>
+        <button className="depot-btn" style={{ ...styles.primaryBtn, marginTop: 18 }} onClick={() => setEditing(true)}>
+          Edit My Details
+        </button>
+      </div>
+
+      {editing && (
+        <ProfileEditModal user={me} onClose={() => setEditing(false)} onSave={onSave} />
+      )}
+    </div>
+  );
+}
+
 function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, branding, onSaveLogo, onResetLogo, onSetTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
@@ -2372,8 +2597,8 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
             {pendingUsers.map((u) => (
               <div key={u.id} style={styles.watchRow}>
                 <div>
-                  <div style={styles.watchSku}>{u.email}</div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
+                  <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
                   <div style={styles.watchName}>
                     {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
                   </div>
@@ -2410,8 +2635,8 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
             {approvedUsers.map((u) => (
               <div key={u.id} style={styles.watchRow}>
                 <div>
-                  <div style={styles.watchSku}>{u.email}</div>
-                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
+                  <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
                   <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
