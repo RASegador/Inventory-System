@@ -1844,7 +1844,16 @@ function LoginScreen({ logo, theme }) {
       background: t.paper, fontFamily: "'Nunito', sans-serif", borderRadius: 8,
       position: 'relative', overflow: 'hidden',
     }}>
-      <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
+      <style>{FONT_IMPORT}{RESPONSIVE_CSS}{`
+        @keyframes stockit-float {
+          0%, 100% { transform: translateY(0) scale(1); }
+          50% { transform: translateY(-6px) scale(1.02); }
+        }
+        .depot-logo-float { animation: stockit-float 3.6s ease-in-out infinite; }
+        @media (prefers-reduced-motion: reduce) {
+          .depot-logo-float { animation: none; }
+        }
+      `}</style>
       <BackgroundDecor variant="login" />
       {mode === 'reset' ? (
         <form onSubmit={submitReset} className="depot-login-form" style={{
@@ -1857,7 +1866,7 @@ function LoginScreen({ logo, theme }) {
             borderRadius: 10, padding: '22px 20px 16px', marginBottom: 20,
             border: `1px solid ${t.lineDim}`,
           }}>
-            <img src={logo} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+            <img src={logo} alt="RAS logo" className="depot-logo-float" style={{ width: '100%', height: 'auto', display: 'block' }} />
           </div>
           <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
             Reset Your Password
@@ -1913,7 +1922,7 @@ function LoginScreen({ logo, theme }) {
           borderRadius: 10, padding: '22px 20px 16px', marginBottom: 20,
           border: `1px solid ${t.lineDim}`,
         }}>
-          <img src={logo} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+          <img src={logo} alt="RAS logo" className="depot-logo-float" style={{ width: '100%', height: 'auto', display: 'block' }} />
         </div>
         <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
           {mode === 'signup' ? 'Create Your Account' : 'Welcome Back!'}
