@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { auth, db } from './firebase';
 import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
-  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot,
+  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
 } from 'firebase/firestore';
 import {
   Package, AlertTriangle, Search, Plus, Pencil, Trash2, X,
@@ -235,6 +235,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
+    viewOwnSales: false, viewActivityLogs: true,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
@@ -242,6 +243,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
+    viewOwnSales: false, viewActivityLogs: true,
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
@@ -249,6 +251,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: false,
     pos: true, viewReports: false, print: false, cancelSales: false,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
+    viewOwnSales: true, viewActivityLogs: false,
   },
 };
 
@@ -266,8 +269,10 @@ const VIEW_PERMISSIONS = {
   locations: 'manageLocations',
   delivery: 'viewReports',
   sales: 'viewReports',
+  mysales: 'viewOwnSales',
   history: 'viewReports',
   approvals: 'manageUsers',
+  activity: 'viewActivityLogs',
 };
 
 function canAccessView(role, viewKey) {
@@ -347,6 +352,7 @@ export default function InventorySystem() {
   const [locations, setLocations] = useState([]);
   const [deliveryStatuses, setDeliveryStatuses] = useState({});
   const [sales, setSales] = useState([]);
+  const [loginLogs, setLoginLogs] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState('overview');
   const [search, setSearch] = useState('');
@@ -372,6 +378,38 @@ export default function InventorySystem() {
     });
     return unsub;
   }, []);
+
+  // Activity log: record a "login" entry each time a session starts. This is
+  // a client-side approximation - it can't distinguish "just signed in" from
+  // "reopened the app with a still-valid session," since both look the same
+  // to the client SDK. Logout is recorded explicitly via handleSignOut below.
+  useEffect(() => {
+    if (!user) return;
+    (async () => {
+      try {
+        const logId = 'l' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'loginLogs', logId), {
+          uid: user.uid, email: user.email || '', type: 'login', timestamp: Date.now(),
+        });
+      } catch (e) {
+        console.error('Login log error:', e);
+      }
+    })();
+  }, [user?.uid]);
+
+  const handleSignOut = async () => {
+    if (user) {
+      try {
+        const logId = 'l' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'loginLogs', logId), {
+          uid: user.uid, email: user.email || '', type: 'logout', timestamp: Date.now(),
+        });
+      } catch (e) {
+        console.error('Logout log error:', e);
+      }
+    }
+    await signOut(auth);
+  };
 
   // Branding (custom logo + theme): public read, so this works even on the
   // signed-out login screen. Applies live for everyone the moment a Super
@@ -557,10 +595,18 @@ export default function InventorySystem() {
         unsubs.push(onSnapshot(collection(db, 'sales'), (snap) => {
           setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
         }));
+        unsubs.push(onSnapshot(collection(db, 'loginLogs'), (snap) => {
+          setLoginLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
+        }));
       } else {
         setMovements([]);
         setDeliveryStatuses({});
-        setSales([]);
+        setLoginLogs([]);
+        // Staff only ever see their own sales - the query itself (not just the
+        // rule) scopes this, so there's no risk of over-fetching then hiding.
+        unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
+          setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
+        }));
       }
 
       setLoaded(true);
@@ -760,7 +806,10 @@ export default function InventorySystem() {
     const subtotal = saleLines.reduce((s, l) => s + l.lineTotal, 0);
     const tax = subtotal * TAX_RATE;
     const total = subtotal + tax;
-    const sale = { id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines, subtotal, tax, total, paymentMethod };
+    const sale = {
+      id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
+      subtotal, tax, total, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '',
+    };
 
     try {
       await Promise.all(cartLines.map((line) => {
@@ -901,7 +950,7 @@ export default function InventorySystem() {
   }
 
   if (!myProfile || !myProfile.approved) {
-    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} />;
+    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} onSignOut={handleSignOut} />;
   }
 
   if (!loaded) {
@@ -942,7 +991,7 @@ export default function InventorySystem() {
 
       <BackgroundDecor variant="app" />
 
-      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} />
+      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} onSignOut={handleSignOut} />
 
       <main style={styles.main} className="depot-scroll depot-main">
         <TopBar
@@ -1016,6 +1065,10 @@ export default function InventorySystem() {
           <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} />
         )}
 
+        {view === 'mysales' && (
+          <MySalesView sales={sales} />
+        )}
+
         {view === 'history' && (
           <TransactionHistoryView
             movements={filteredMovements}
@@ -1041,6 +1094,10 @@ export default function InventorySystem() {
             onResetLogo={resetLogo}
             onSetTheme={setThemeKey}
           />
+        )}
+
+        {view === 'activity' && (
+          <ActivityLogView logs={loginLogs} myRole={myRole} approvedUsers={approvedUsers} pendingUsers={pendingUsers} />
         )}
         </>
         )}
@@ -1268,7 +1325,7 @@ function AccessDenied() {
   );
 }
 
-function PendingApprovalScreen({ email, missingProfile }) {
+function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1315,7 +1372,7 @@ function PendingApprovalScreen({ email, missingProfile }) {
           </button>
         )}
         <button
-          onClick={() => signOut(auth)}
+          onClick={onSignOut}
           style={{
             width: '100%', background: 'transparent', border: '1px solid rgba(59,42,31,0.2)', color: '#3B2A1F',
             borderRadius: 6, padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer',
@@ -1328,7 +1385,7 @@ function PendingApprovalScreen({ email, missingProfile }) {
   );
 }
 
-function Sidebar({ view, setView, lowCount, role, pendingCount, logo }) {
+function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
   const allItems = [
     { key: 'overview', label: 'Overview', icon: LayoutGrid },
     { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
@@ -1338,8 +1395,10 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo }) {
     { key: 'locations', label: 'Locations', icon: MapPin },
     { key: 'delivery', label: 'Delivery Times', icon: Timer },
     { key: 'sales', label: 'Sales History', icon: Receipt },
+    { key: 'mysales', label: 'My Sales', icon: Receipt },
     { key: 'history', label: 'Transaction History', icon: ScrollText },
     { key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount },
+    { key: 'activity', label: 'Activity Log', icon: Clock },
   ];
   const items = allItems.filter((it) => canAccessView(role, it.key));
   return (
@@ -1379,7 +1438,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo }) {
       </div>
       <button
         className="depot-btn depot-signout-btn"
-        onClick={() => signOut(auth)}
+        onClick={onSignOut}
         style={{
           marginTop: 8, background: 'transparent', border: '1px solid rgba(245,243,236,0.2)',
           color: 'rgba(245,243,236,0.7)', fontSize: 11.5, borderRadius: 5, padding: '7px 12px',
@@ -1403,6 +1462,8 @@ function TopBar({ view, role, onAdd }) {
     sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
     approvals: ['Team Access', 'Approve sign-ups and manage accounts'],
+    mysales: ['My Sales', 'Transactions you\'ve processed'],
+    activity: ['Activity Log', 'Sign-in and sign-out history'],
   };
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'));
@@ -1973,11 +2034,24 @@ function POSView({ items, onCompleteSale }) {
 
 function SalesHistoryView({ sales, role, onCancelSale }) {
   const canCancel = can(role, 'cancelSales');
+  const [cashierFilter, setCashierFilter] = useState('All');
+
+  const cashiers = useMemo(() => {
+    const set = new Set(sales.map((s) => s.cashierEmail).filter(Boolean));
+    return Array.from(set).sort();
+  }, [sales]);
+
+  const filtered = useMemo(() => {
+    if (cashierFilter === 'All') return sales;
+    return sales.filter((s) => s.cashierEmail === cashierFilter);
+  }, [sales, cashierFilter]);
+
   const handleDownload = () => {
-    const headers = ['Receipt', 'Date', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
-    const rows = sales.map((sale) => [
+    const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
+    const rows = filtered.map((sale) => [
       sale.receiptNo,
       new Date(sale.timestamp).toLocaleString('en-PH'),
+      sale.cashierEmail || '—',
       sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
       sale.paymentMethod,
       sale.subtotal.toFixed(2),
@@ -1991,25 +2065,39 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
-      {sales.length === 0 ? (
+      {cashiers.length > 0 && (
+        <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+          <select className="depot-select" value={cashierFilter} onChange={(e) => setCashierFilter(e.target.value)} style={styles.select}>
+            <option value="All">All Staff</option>
+            {cashiers.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          {cashierFilter !== 'All' && (
+            <div style={{ ...styles.watchName, alignSelf: 'center' }}>
+              {filtered.length} sale{filtered.length === 1 ? '' : 's'} · {currency(filtered.reduce((s, x) => s + (x.cancelled ? 0 : x.total), 0))} total
+            </div>
+          )}
+        </div>
+      )}
+      {filtered.length === 0 ? (
         <div style={styles.panel}><div style={styles.emptyState}>No sales recorded yet. Ring one up in Point of Sale.</div></div>
       ) : (
         <div style={styles.tableWrap} className="depot-scroll">
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Receipt', 'Date', 'Items', 'Payment', 'Total', 'Status', ...(canCancel ? [''] : [])].map((h) => (
+                {['Receipt', 'Date', 'Cashier', 'Items', 'Payment', 'Total', 'Status', ...(canCancel ? [''] : [])].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {sales.map((sale) => (
+              {filtered.map((sale) => (
                 <tr key={sale.id} className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{sale.receiptNo}</td>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
+                  <td style={{ ...styles.td, fontSize: 12.5 }}>{sale.cashierEmail || '—'}</td>
                   <td style={styles.td}>
                     {sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}
                   </td>
@@ -2031,6 +2119,128 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
                       )}
                     </td>
                   )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MySalesView({ sales }) {
+  const totalToday = useMemo(() => {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    return sales.filter((s) => !s.cancelled && s.timestamp >= start.getTime()).reduce((s, x) => s + x.total, 0);
+  }, [sales]);
+  const totalAll = useMemo(() => sales.filter((s) => !s.cancelled).reduce((s, x) => s + x.total, 0), [sales]);
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={styles.statGrid} className="depot-stat-grid">
+        <StatCard icon={Receipt} label="Sales Recorded" value={sales.length} accent="var(--blueprint)" />
+        <StatCard icon={PesoIcon} label="Total Today" value={currency(totalToday)} accent="var(--green)" />
+        <StatCard icon={PesoIcon} label="Total All-Time" value={currency(totalAll)} accent="var(--amber-deep)" />
+      </div>
+      {sales.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>You haven't processed any sales yet. Ring one up in Point of Sale.</div></div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table} className="depot-table">
+            <thead>
+              <tr>
+                {['Receipt', 'Date', 'Items', 'Payment', 'Total', 'Status'].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sales.map((sale) => (
+                <tr key={sale.id} className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{sale.receiptNo}</td>
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
+                    {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </td>
+                  <td style={styles.td}>{sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}</td>
+                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
+                  <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
+                  <td style={styles.td}>
+                    {sale.cancelled ? (
+                      <span style={{ ...styles.statusPill, background: 'rgba(193,80,58,0.1)', color: 'var(--red)' }}>Cancelled</span>
+                    ) : (
+                      <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Completed</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
+  const [userFilter, setUserFilter] = useState('All');
+  const roleByUid = useMemo(() => {
+    const map = {};
+    [...approvedUsers, ...pendingUsers].forEach((u) => { map[u.id] = u.role; });
+    return map;
+  }, [approvedUsers, pendingUsers]);
+
+  const users = useMemo(() => {
+    const set = new Set(logs.map((l) => l.email).filter(Boolean));
+    return Array.from(set).sort();
+  }, [logs]);
+
+  const filtered = userFilter === 'All' ? logs : logs.filter((l) => l.email === userFilter);
+
+  const handleDownload = () => {
+    const headers = ['Email', 'Role', 'Type', 'Timestamp'];
+    const rows = filtered.map((l) => [l.email, ROLES[roleByUid[l.uid]] || '—', l.type, new Date(l.timestamp).toLocaleString('en-PH')]);
+    downloadCSV('activity-log.csv', headers, rows);
+  };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      {users.length > 0 && (
+        <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+          <select className="depot-select" value={userFilter} onChange={(e) => setUserFilter(e.target.value)} style={styles.select}>
+            <option value="All">All Users</option>
+            {users.map((u) => <option key={u} value={u}>{u}</option>)}
+          </select>
+        </div>
+      )}
+      {filtered.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>No activity recorded yet.</div></div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table} className="depot-table">
+            <thead>
+              <tr>
+                {['Email', 'Role', 'Event', 'Timestamp'].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((l) => (
+                <tr key={l.id} className="depot-row">
+                  <td style={styles.td}>{l.email}</td>
+                  <td style={styles.td}><span style={styles.pill}>{ROLES[roleByUid[l.uid]] || '—'}</span></td>
+                  <td style={styles.td}>
+                    {l.type === 'login' ? (
+                      <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Login</span>
+                    ) : (
+                      <span style={{ ...styles.statusPill, background: 'rgba(20,33,61,0.08)', color: 'var(--ink)' }}>Logout</span>
+                    )}
+                  </td>
+                  <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
+                    {new Date(l.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -2072,6 +2282,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
               <div key={u.id} style={styles.watchRow}>
                 <div>
                   <div style={styles.watchSku}>{u.email}</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
                   <div style={styles.watchName}>
                     {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
                   </div>
@@ -2109,6 +2320,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
               <div key={u.id} style={styles.watchRow}>
                 <div>
                   <div style={styles.watchSku}>{u.email}</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
                   <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
