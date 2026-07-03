@@ -218,6 +218,73 @@ function BackgroundDecor({ variant = 'app' }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// RBAC: centralized roles + permissions. Add a new role here and it's
+// automatically available everywhere permission checks happen.
+// ---------------------------------------------------------------------------
+const ROLES = {
+  superadmin: 'Super Admin',
+  client: 'Client',
+  staff: 'Staff',
+};
+
+const PERMISSIONS = {
+  superadmin: {
+    viewInventory: true, editInventory: true, deleteInventory: true,
+    manageCategories: true, manageSuppliers: true, manageLocations: true,
+    stockReceive: true, stockIssue: true,
+    pos: true, viewReports: true, print: true, cancelSales: true,
+    manageUsers: true, manageAllRoles: true, manageSystem: true,
+  },
+  client: {
+    viewInventory: true, editInventory: true, deleteInventory: true,
+    manageCategories: true, manageSuppliers: true, manageLocations: true,
+    stockReceive: true, stockIssue: true,
+    pos: true, viewReports: true, print: true, cancelSales: true,
+    manageUsers: true, manageAllRoles: false, manageSystem: false,
+  },
+  staff: {
+    viewInventory: true, editInventory: false, deleteInventory: false,
+    manageCategories: false, manageSuppliers: false, manageLocations: false,
+    stockReceive: true, stockIssue: false,
+    pos: true, viewReports: false, print: false, cancelSales: false,
+    manageUsers: false, manageAllRoles: false, manageSystem: false,
+  },
+};
+
+function can(role, permission) {
+  return !!PERMISSIONS[role]?.[permission];
+}
+
+// Which permission (if any) gates each sidebar view. `null` = any approved user.
+const VIEW_PERMISSIONS = {
+  overview: null,
+  pos: 'pos',
+  inventory: 'viewInventory',
+  suppliers: 'manageSuppliers',
+  categories: 'manageCategories',
+  locations: 'manageLocations',
+  delivery: 'viewReports',
+  sales: 'viewReports',
+  history: 'viewReports',
+  approvals: 'manageUsers',
+};
+
+function canAccessView(role, viewKey) {
+  const perm = VIEW_PERMISSIONS[viewKey];
+  return perm === null || perm === undefined || can(role, perm);
+}
+
+// Backward-compatible role resolver: older accounts only have `isAdmin`, not
+// `role`. Treat isAdmin:true as superadmin, everyone else defaults to staff
+// (the lowest-privilege role) until a manager assigns something higher.
+function resolveRole(profile) {
+  if (!profile) return 'staff';
+  if (profile.role && PERMISSIONS[profile.role]) return profile.role;
+  if (profile.isAdmin) return 'superadmin';
+  return 'staff';
+}
+
 export default function InventorySystem() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -269,7 +336,7 @@ export default function InventorySystem() {
         const snap = await getDoc(ref);
         if (!snap.exists()) {
           await setDoc(ref, {
-            email: user.email || '', approved: false, isAdmin: false, createdAt: Date.now(),
+            email: user.email || '', approved: false, isAdmin: false, role: 'staff', createdAt: Date.now(),
           });
         }
       } catch (e) {
@@ -283,16 +350,22 @@ export default function InventorySystem() {
     return () => { if (unsub) unsub(); };
   }, [user]);
 
-  // Admin: subscribe to the full users list (Firestore rules only return docs this account can read)
+  const myRole = resolveRole(myProfile);
+  const isManager = myRole === 'superadmin' || myRole === 'client';
+
+  // Managers (Client + Super Admin) subscribe to the users list to run Team Access.
+  // Firestore rules only ever return docs this account is allowed to read.
   useEffect(() => {
-    if (!user || !myProfile?.isAdmin) { setPendingUsers([]); setApprovedUsers([]); return; }
+    if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
     const unsub = onSnapshot(collection(db, 'users'), (snap) => {
-      const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      let all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
+      // A Client only manages Staff accounts - Super Admins and other Clients stay out of view.
+      if (myRole === 'client') all = all.filter((u) => u.role === 'staff');
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
     });
     return unsub;
-  }, [user, myProfile?.isAdmin]);
+  }, [user, isManager, myRole]);
 
   const approveUser = async (uid) => {
     try {
@@ -321,6 +394,16 @@ export default function InventorySystem() {
     }
   };
 
+  const changeUserRole = async (uid, newRole) => {
+    if (myRole !== 'superadmin') return;
+    try {
+      await setDoc(doc(db, 'users', uid), { role: newRole }, { merge: true });
+      showToast(`Role updated to ${ROLES[newRole] || newRole}`);
+    } catch (e) {
+      showToast('Could not update role — check your connection');
+    }
+  };
+
   // Data: seed once if empty, then subscribe to live Firestore updates
   useEffect(() => {
     if (!user || !myProfile?.approved) { setLoaded(false); return; }
@@ -329,25 +412,27 @@ export default function InventorySystem() {
 
     (async () => {
       try {
-        const itemsSnap = await getDocs(collection(db, 'items'));
-        if (itemsSnap.empty) {
-          const seed = seedItems();
-          await Promise.all(seed.map((it) => setDoc(doc(db, 'items', it.id), it)));
-          const moves = seedMovements(seed);
-          await Promise.all(moves.map((m) => setDoc(doc(db, 'movements', m.id), m)));
-        }
-        const suppliersSnap = await getDocs(collection(db, 'suppliers'));
-        if (suppliersSnap.empty) {
-          const seedSup = seedSuppliers();
-          await Promise.all(seedSup.map((s) => setDoc(doc(db, 'suppliers', s.id), s)));
-        }
-        const catDoc = await getDoc(doc(db, 'config', 'categories'));
-        if (!catDoc.exists()) {
-          await setDoc(doc(db, 'config', 'categories'), { list: DEFAULT_CATEGORIES });
-        }
-        const locDoc = await getDoc(doc(db, 'config', 'locations'));
-        if (!locDoc.exists()) {
-          await setDoc(doc(db, 'config', 'locations'), { list: DEFAULT_LOCATIONS });
+        if (isManager) {
+          const itemsSnap = await getDocs(collection(db, 'items'));
+          if (itemsSnap.empty) {
+            const seed = seedItems();
+            await Promise.all(seed.map((it) => setDoc(doc(db, 'items', it.id), it)));
+            const moves = seedMovements(seed);
+            await Promise.all(moves.map((m) => setDoc(doc(db, 'movements', m.id), m)));
+          }
+          const suppliersSnap = await getDocs(collection(db, 'suppliers'));
+          if (suppliersSnap.empty) {
+            const seedSup = seedSuppliers();
+            await Promise.all(seedSup.map((s) => setDoc(doc(db, 'suppliers', s.id), s)));
+          }
+          const catDoc = await getDoc(doc(db, 'config', 'categories'));
+          if (!catDoc.exists()) {
+            await setDoc(doc(db, 'config', 'categories'), { list: DEFAULT_CATEGORIES });
+          }
+          const locDoc = await getDoc(doc(db, 'config', 'locations'));
+          if (!locDoc.exists()) {
+            await setDoc(doc(db, 'config', 'locations'), { list: DEFAULT_LOCATIONS });
+          }
         }
       } catch (e) {
         console.error('Seeding error:', e);
@@ -358,9 +443,6 @@ export default function InventorySystem() {
       unsubs.push(onSnapshot(collection(db, 'items'), (snap) => {
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       }));
-      unsubs.push(onSnapshot(collection(db, 'movements'), (snap) => {
-        setMovements(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-      }));
       unsubs.push(onSnapshot(collection(db, 'suppliers'), (snap) => {
         setSuppliers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       }));
@@ -370,20 +452,32 @@ export default function InventorySystem() {
       unsubs.push(onSnapshot(doc(db, 'config', 'locations'), (d) => {
         setLocations(d.exists() ? (d.data().list || []) : DEFAULT_LOCATIONS.slice());
       }));
-      unsubs.push(onSnapshot(collection(db, 'deliveryStatus'), (snap) => {
-        const map = {};
-        snap.docs.forEach((d) => { map[d.id] = d.data(); });
-        setDeliveryStatuses(map);
-      }));
-      unsubs.push(onSnapshot(collection(db, 'sales'), (snap) => {
-        setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-      }));
+
+      // Report-like data: only managers (Client + Super Admin) can read these under
+      // the Firestore rules, so staff skip subscribing to avoid permission errors.
+      if (isManager) {
+        unsubs.push(onSnapshot(collection(db, 'movements'), (snap) => {
+          setMovements(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
+        }));
+        unsubs.push(onSnapshot(collection(db, 'deliveryStatus'), (snap) => {
+          const map = {};
+          snap.docs.forEach((d) => { map[d.id] = d.data(); });
+          setDeliveryStatuses(map);
+        }));
+        unsubs.push(onSnapshot(collection(db, 'sales'), (snap) => {
+          setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
+        }));
+      } else {
+        setMovements([]);
+        setDeliveryStatuses({});
+        setSales([]);
+      }
 
       setLoaded(true);
     })();
 
     return () => { cancelled = true; unsubs.forEach((u) => u()); };
-  }, [user, myProfile?.approved]);
+  }, [user, myProfile?.approved, isManager]);
 
   const showToast = (msg) => {
     setToast(msg);
@@ -391,6 +485,7 @@ export default function InventorySystem() {
   };
 
   const saveItem = async (draft) => {
+    if (!can(myRole, 'editInventory')) { showToast("You don't have permission to edit inventory"); return; }
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     try {
       await setDoc(doc(db, 'items', id), { ...draft, id });
@@ -402,6 +497,7 @@ export default function InventorySystem() {
   };
 
   const deleteItem = async (id) => {
+    if (!can(myRole, 'deleteInventory')) { showToast("You don't have permission to delete inventory"); return; }
     const it = items.find((i) => i.id === id);
     try {
       await deleteDoc(doc(db, 'items', id));
@@ -416,6 +512,7 @@ export default function InventorySystem() {
   };
 
   const saveSupplier = async (draft) => {
+    if (!can(myRole, 'manageSuppliers')) { showToast("You don't have permission to manage suppliers"); return; }
     const id = draft.id || ('s' + Math.random().toString(36).slice(2, 9));
     try {
       await setDoc(doc(db, 'suppliers', id), { ...draft, id });
@@ -427,6 +524,7 @@ export default function InventorySystem() {
   };
 
   const deleteSupplier = async (id) => {
+    if (!can(myRole, 'manageSuppliers')) { showToast("You don't have permission to manage suppliers"); return; }
     const s = suppliers.find((x) => x.id === id);
     try {
       await deleteDoc(doc(db, 'suppliers', id));
@@ -440,6 +538,7 @@ export default function InventorySystem() {
   };
 
   const addCategory = async (name) => {
+    if (!can(myRole, 'manageCategories')) { showToast("You don't have permission to manage categories"); return; }
     const trimmed = name.trim();
     if (!trimmed) return;
     if (categories.some((c) => c.toLowerCase() === trimmed.toLowerCase())) {
@@ -455,6 +554,7 @@ export default function InventorySystem() {
   };
 
   const deleteCategory = async (name) => {
+    if (!can(myRole, 'manageCategories')) { showToast("You don't have permission to manage categories"); return; }
     const inUse = items.filter((it) => it.category === name).length;
     if (inUse > 0) {
       showToast(`Can't remove "${name}" — ${inUse} item${inUse === 1 ? '' : 's'} still use it`);
@@ -471,6 +571,7 @@ export default function InventorySystem() {
   };
 
   const updateDeliveryStatus = async (itemId, status, note) => {
+    if (!can(myRole, 'viewReports')) { showToast("You don't have permission to update delivery status"); return; }
     try {
       await setDoc(doc(db, 'deliveryStatus', itemId), {
         status, note: note || '', updatedAt: Date.now(),
@@ -483,6 +584,7 @@ export default function InventorySystem() {
   };
 
   const clearDeliveryStatus = async (itemId) => {
+    if (!can(myRole, 'viewReports')) { showToast("You don't have permission to update delivery status"); return; }
     try {
       await deleteDoc(doc(db, 'deliveryStatus', itemId));
       showToast('Reverted to automatic status');
@@ -493,6 +595,7 @@ export default function InventorySystem() {
   };
 
   const addLocation = async (name) => {
+    if (!can(myRole, 'manageLocations')) { showToast("You don't have permission to manage locations"); return; }
     const trimmed = name.trim();
     if (!trimmed) return;
     if (locations.some((l) => l.toLowerCase() === trimmed.toLowerCase())) {
@@ -508,6 +611,7 @@ export default function InventorySystem() {
   };
 
   const deleteLocation = async (name) => {
+    if (!can(myRole, 'manageLocations')) { showToast("You don't have permission to manage locations"); return; }
     const inUse = items.filter((it) => it.location === name).length;
     if (inUse > 0) {
       showToast(`Can't remove "${name}" — ${inUse} item${inUse === 1 ? '' : 's'} still use it`);
@@ -524,6 +628,8 @@ export default function InventorySystem() {
   };
 
   const recordMovement = async (itemId, type, qty, reason) => {
+    if (type === 'in' && !can(myRole, 'stockReceive')) { showToast("You don't have permission to receive stock"); return; }
+    if (type === 'out' && !can(myRole, 'stockIssue')) { showToast("You don't have permission to issue stock"); return; }
     const item = items.find((i) => i.id === itemId);
     if (!item) return;
     const delta = type === 'in' ? qty : -qty;
@@ -584,6 +690,33 @@ export default function InventorySystem() {
     } catch (e) {
       showToast('Could not complete sale — check your connection');
     }
+  };
+
+  const cancelSale = async (sale) => {
+    if (!can(myRole, 'cancelSales')) { showToast("You don't have permission to cancel sales"); return; }
+    if (sale.cancelled) { showToast('This sale is already cancelled'); return; }
+    const now = Date.now();
+    try {
+      await Promise.all(sale.items.map((line) => {
+        const item = items.find((i) => i.id === line.itemId);
+        if (!item) return Promise.resolve(); // item was deleted since the sale; nothing to restore
+        return setDoc(doc(db, 'items', line.itemId), { ...item, quantity: item.quantity + line.qty });
+      }));
+      await Promise.all(sale.items.map((line) => {
+        const mvId = 'm' + Math.random().toString(36).slice(2, 9);
+        return setDoc(doc(db, 'movements', mvId), {
+          id: mvId, itemId: line.itemId, type: 'in', qty: line.qty,
+          reason: `Sale ${sale.receiptNo} cancelled`, timestamp: now,
+        });
+      }));
+      await setDoc(doc(db, 'sales', sale.id), {
+        cancelled: true, cancelledAt: now, cancelledBy: user.email || user.uid,
+      }, { merge: true });
+      showToast(`Sale ${sale.receiptNo} cancelled — stock restored`);
+    } catch (e) {
+      showToast('Could not cancel sale — check your connection');
+    }
+    setConfirmModal(null);
   };
 
   const filtered = useMemo(() => {
@@ -677,8 +810,8 @@ export default function InventorySystem() {
     );
   }
 
-  if (myProfile && !myProfile.approved) {
-    return <PendingApprovalScreen email={user.email} />;
+  if (!myProfile || !myProfile.approved) {
+    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} />;
   }
 
   if (!loaded) {
@@ -729,17 +862,22 @@ export default function InventorySystem() {
 
       <BackgroundDecor variant="app" />
 
-      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} isAdmin={!!myProfile?.isAdmin} pendingCount={pendingUsers.length} />
+      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} />
 
       <main style={styles.main} className="depot-scroll depot-main">
         <TopBar
           view={view}
+          role={myRole}
           onAdd={() => {
             if (view === 'inventory') setItemModal('new');
             if (view === 'suppliers') setSupplierModal('new');
           }}
         />
 
+        {!canAccessView(myRole, view) ? (
+          <AccessDenied />
+        ) : (
+        <>
         {view === 'overview' && (
           <Overview totals={totals} categoryData={categoryData} onQuickMove={(it) => setMoveModal(it)} />
         )}
@@ -749,6 +887,7 @@ export default function InventorySystem() {
             filtered={filtered}
             supplierMap={supplierMap}
             categories={categories}
+            role={myRole}
             search={search} setSearch={setSearch}
             categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter}
             sortKey={sortKey} setSortKey={setSortKey}
@@ -794,7 +933,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'sales' && (
-          <SalesHistoryView sales={sales} />
+          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} />
         )}
 
         {view === 'history' && (
@@ -807,15 +946,19 @@ export default function InventorySystem() {
           />
         )}
 
-        {view === 'approvals' && myProfile?.isAdmin && (
+        {view === 'approvals' && (
           <TeamAccessView
             pendingUsers={pendingUsers}
             approvedUsers={approvedUsers}
             currentUid={user.uid}
+            myRole={myRole}
             onApprove={approveUser}
             onDeny={denyUser}
             onRevoke={revokeUser}
+            onChangeRole={changeUserRole}
           />
+        )}
+        </>
         )}
       </main>
 
@@ -831,7 +974,7 @@ export default function InventorySystem() {
       )}
 
       {moveModal && (
-        <MoveModal item={moveModal} onClose={() => setMoveModal(null)} onSubmit={recordMovement} />
+        <MoveModal item={moveModal} allowIssue={can(myRole, 'stockIssue')} onClose={() => setMoveModal(null)} onSubmit={recordMovement} />
       )}
 
       {deliveryStatusModal && (
@@ -884,6 +1027,15 @@ export default function InventorySystem() {
           message={<>Remove the location <strong>{confirmModal.target.name}</strong>? This only works if no items currently use it.</>}
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => deleteLocation(confirmModal.target.name)}
+        />
+      )}
+
+      {confirmModal && confirmModal.kind === 'sale' && (
+        <ConfirmModal
+          title="CANCEL SALE"
+          message={<>Cancel sale <strong>{confirmModal.target.receiptNo}</strong> for {currency(confirmModal.target.total)}? This restores the sold quantities back into stock and can't be undone.</>}
+          onCancel={() => setConfirmModal(null)}
+          onConfirm={() => cancelSale(confirmModal.target)}
         />
       )}
 
@@ -1012,7 +1164,26 @@ function LoginScreen() {
   );
 }
 
-function PendingApprovalScreen({ email }) {
+function AccessDenied() {
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', textAlign: 'center' }}>
+      <div style={{
+        width: 56, height: 56, borderRadius: '50%', background: 'var(--red)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 16,
+      }}>
+        <AlertTriangle size={28} color="#fff" />
+      </div>
+      <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 19, marginBottom: 6, color: 'var(--ink)' }}>
+        Access Denied
+      </div>
+      <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.6)', maxWidth: 360 }}>
+        Your account doesn't have permission to view this page. If you think that's wrong, ask an admin to check your role in Team Access.
+      </div>
+    </div>
+  );
+}
+
+function PendingApprovalScreen({ email, missingProfile }) {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1027,20 +1198,37 @@ function PendingApprovalScreen({ email }) {
         border: '1px solid rgba(217,164,65,0.35)', position: 'relative', zIndex: 1,
       }}>
         <div style={{
-          width: 52, height: 52, borderRadius: '50%', background: 'var(--amber, #D9A441)',
+          width: 52, height: 52, borderRadius: '50%', background: missingProfile ? 'var(--red, #C1503A)' : 'var(--amber, #D9A441)',
           display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px',
         }}>
-          <Clock size={26} color="#fff" />
+          {missingProfile ? <AlertTriangle size={26} color="#fff" /> : <Clock size={26} color="#fff" />}
         </div>
         <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 19, marginBottom: 8, color: '#3B2A1F' }}>
-          Awaiting Approval
+          {missingProfile ? "Couldn't Set Up Your Account" : 'Awaiting Approval'}
         </div>
-        <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
-          Your account (<strong>{email}</strong>) has been created, but an administrator needs to approve it before you can access Stock It.
-        </div>
+        {missingProfile ? (
+          <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
+            Your login (<strong>{email}</strong>) worked, but the app couldn't create your account profile in the database. This usually means the Firestore security rules haven't been published yet, or don't match what this app expects. Try again below, or check the browser console (F12) for the exact error.
+          </div>
+        ) : (
+          <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
+            Your account (<strong>{email}</strong>) has been created, but an administrator needs to approve it before you can access Stock It.
+          </div>
+        )}
         <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginTop: 10, marginBottom: 22 }}>
-          This page will update automatically once you're approved — no need to refresh.
+          {missingProfile ? 'Retrying will attempt to create your profile again.' : "This page will update automatically once you're approved — no need to refresh."}
         </div>
+        {missingProfile && (
+          <button
+            onClick={() => window.location.reload()}
+            style={{
+              width: '100%', background: '#2F4A32', color: '#fff', border: 'none',
+              borderRadius: 6, padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', marginBottom: 10,
+            }}
+          >
+            Try Again
+          </button>
+        )}
         <button
           onClick={() => signOut(auth)}
           style={{
@@ -1055,8 +1243,8 @@ function PendingApprovalScreen({ email }) {
   );
 }
 
-function Sidebar({ view, setView, lowCount, isAdmin, pendingCount }) {
-  const items = [
+function Sidebar({ view, setView, lowCount, role, pendingCount }) {
+  const allItems = [
     { key: 'overview', label: 'Overview', icon: LayoutGrid },
     { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
     { key: 'inventory', label: 'Inventory', icon: Boxes },
@@ -1066,8 +1254,9 @@ function Sidebar({ view, setView, lowCount, isAdmin, pendingCount }) {
     { key: 'delivery', label: 'Delivery Times', icon: Timer },
     { key: 'sales', label: 'Sales History', icon: Receipt },
     { key: 'history', label: 'Transaction History', icon: ScrollText },
-    ...(isAdmin ? [{ key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount }] : []),
+    { key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount },
   ];
+  const items = allItems.filter((it) => canAccessView(role, it.key));
   return (
     <aside style={styles.sidebar} className="depot-sidebar">
       <div style={styles.brand} className="depot-brand">
@@ -1117,7 +1306,7 @@ function Sidebar({ view, setView, lowCount, isAdmin, pendingCount }) {
   );
 }
 
-function TopBar({ view, onAdd }) {
+function TopBar({ view, role, onAdd }) {
   const titles = {
     overview: ['Overview', 'Warehouse status at a glance'],
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
@@ -1131,7 +1320,7 @@ function TopBar({ view, onAdd }) {
     approvals: ['Team Access', 'Approve sign-ups and manage accounts'],
   };
   const [title, sub] = titles[view];
-  const showAdd = view === 'inventory' || view === 'suppliers';
+  const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'));
   return (
     <div style={styles.topbar} className="depot-topbar">
       <div>
@@ -1228,7 +1417,7 @@ function Overview({ totals, categoryData, onQuickMove }) {
   );
 }
 
-function InventoryView({ filtered, supplierMap, categories, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove }) {
+function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove }) {
   const handleDownload = () => {
     const headers = ['SKU', 'Name', 'Category', 'Supplier', 'Location', 'Quantity', 'Unit Cost', 'Value'];
     const rows = filtered.map((it) => [
@@ -1237,10 +1426,14 @@ function InventoryView({ filtered, supplierMap, categories, search, setSearch, c
     ]);
     downloadCSV('inventory.csv', headers, rows);
   };
+  const canEdit = can(role, 'editInventory');
+  const canDelete = can(role, 'deleteInventory');
+  const canMove = can(role, 'stockReceive') || can(role, 'stockIssue');
+  const showActionsCol = canEdit || canDelete || canMove;
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      {can(role, 'print') && <ExportBar onPrint={printPage} onDownload={handleDownload} />}
       <div style={styles.filterBar} className="depot-no-print depot-filterbar">
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
@@ -1268,7 +1461,7 @@ function InventoryView({ filtered, supplierMap, categories, search, setSearch, c
         <table style={styles.table} className="depot-table">
           <thead>
             <tr>
-              {['SKU', 'Item', 'Category', 'Supplier', 'Location', 'Qty', 'Unit Cost', 'Value', ''].map((h) => (
+              {['SKU', 'Item', 'Category', 'Supplier', 'Location', 'Qty', 'Unit Cost', 'Value', ...(showActionsCol ? [''] : [])].map((h) => (
                 <th key={h} style={styles.th}>{h}</th>
               ))}
             </tr>
@@ -1297,11 +1490,13 @@ function InventoryView({ filtered, supplierMap, categories, search, setSearch, c
                   </td>
                   <td style={styles.td}>{currency(it.unitCost)}</td>
                   <td style={styles.td}>{currency(it.quantity * it.unitCost)}</td>
-                  <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                    <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>
-                    <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>
-                    <IconBtn onClick={() => onDelete(it)} title="Delete" danger><Trash2 size={14} /></IconBtn>
-                  </td>
+                  {showActionsCol && (
+                    <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                      {canMove && <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>}
+                      {canEdit && <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>}
+                      {canDelete && <IconBtn onClick={() => onDelete(it)} title="Delete" danger><Trash2 size={14} /></IconBtn>}
+                    </td>
+                  )}
                 </tr>
               );
             })}
@@ -1691,9 +1886,10 @@ function POSView({ items, onCompleteSale }) {
   );
 }
 
-function SalesHistoryView({ sales }) {
+function SalesHistoryView({ sales, role, onCancelSale }) {
+  const canCancel = can(role, 'cancelSales');
   const handleDownload = () => {
-    const headers = ['Receipt', 'Date', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total'];
+    const headers = ['Receipt', 'Date', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
     const rows = sales.map((sale) => [
       sale.receiptNo,
       new Date(sale.timestamp).toLocaleString('en-PH'),
@@ -1702,6 +1898,7 @@ function SalesHistoryView({ sales }) {
       sale.subtotal.toFixed(2),
       sale.tax.toFixed(2),
       sale.total.toFixed(2),
+      sale.cancelled ? 'Cancelled' : 'Completed',
     ]);
     downloadCSV('sales-history.csv', headers, rows);
   };
@@ -1716,15 +1913,15 @@ function SalesHistoryView({ sales }) {
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Receipt', 'Date', 'Items', 'Payment', 'Total'].map((h) => (
+                {['Receipt', 'Date', 'Items', 'Payment', 'Total', 'Status', ...(canCancel ? [''] : [])].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
               {sales.map((sale) => (
-                <tr key={sale.id} className="depot-row">
-                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500 }}>{sale.receiptNo}</td>
+                <tr key={sale.id} className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{sale.receiptNo}</td>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
@@ -1732,7 +1929,23 @@ function SalesHistoryView({ sales }) {
                     {sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}
                   </td>
                   <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
-                  <td style={{ ...styles.td, fontWeight: 600 }}>{currency(sale.total)}</td>
+                  <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
+                  <td style={styles.td}>
+                    {sale.cancelled ? (
+                      <span style={{ ...styles.statusPill, background: 'rgba(193,80,58,0.1)', color: 'var(--red)' }}>Cancelled</span>
+                    ) : (
+                      <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Completed</span>
+                    )}
+                  </td>
+                  {canCancel && (
+                    <td className="depot-no-print" style={{ ...styles.td, textAlign: 'right' }}>
+                      {!sale.cancelled && (
+                        <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onCancelSale(sale)}>
+                          Cancel
+                        </button>
+                      )}
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
@@ -1743,7 +1956,11 @@ function SalesHistoryView({ sales }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, onApprove, onDeny, onRevoke }) {
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole }) {
+  const isSuperAdmin = myRole === 'superadmin';
+  // A Client can only promote/demote within reach of their own permissions -
+  // in practice that means they don't get a role selector at all; only
+  // Super Admin can reassign roles (staff <-> client <-> superadmin).
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <div style={styles.panel}>
@@ -1759,9 +1976,21 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, onApprove, on
               <div key={u.id} style={styles.watchRow}>
                 <div>
                   <div style={styles.watchSku}>{u.email}</div>
-                  <div style={styles.watchName}>Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}</div>
+                  <div style={styles.watchName}>
+                    {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
+                  </div>
                 </div>
-                <div style={{ display: 'flex', gap: 6 }}>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  {isSuperAdmin && (
+                    <select
+                      className="depot-select"
+                      value={u.role}
+                      onChange={(e) => onChangeRole(u.id, e.target.value)}
+                      style={{ ...styles.select, padding: '6px 8px', fontSize: 12 }}
+                    >
+                      {Object.keys(ROLES).map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}
+                    </select>
+                  )}
                   <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onApprove(u.id)}>Approve</button>
                   <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onDeny(u.id)}>Deny</button>
                 </div>
@@ -1784,11 +2013,23 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, onApprove, on
               <div key={u.id} style={styles.watchRow}>
                 <div>
                   <div style={styles.watchSku}>{u.email}</div>
-                  <div style={styles.watchName}>{u.isAdmin ? 'Administrator' : 'Team member'}{u.id === currentUid ? ' (you)' : ''}</div>
+                  <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
                 </div>
-                {u.id !== currentUid && (
-                  <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onRevoke(u.id)}>Revoke</button>
-                )}
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  {isSuperAdmin && u.id !== currentUid && (
+                    <select
+                      className="depot-select"
+                      value={u.role}
+                      onChange={(e) => onChangeRole(u.id, e.target.value)}
+                      style={{ ...styles.select, padding: '6px 8px', fontSize: 12 }}
+                    >
+                      {Object.keys(ROLES).map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}
+                    </select>
+                  )}
+                  {u.id !== currentUid && (
+                    <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onRevoke(u.id)}>Revoke</button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
@@ -2067,7 +2308,7 @@ function SaleReceiptModal({ sale, onClose }) {
   );
 }
 
-function MoveModal({ item, onClose, onSubmit }) {
+function MoveModal({ item, allowIssue, onClose, onSubmit }) {
   const [type, setType] = useState('in');
   const [qty, setQty] = useState(1);
   const [reason, setReason] = useState('');
@@ -2084,10 +2325,12 @@ function MoveModal({ item, onClose, onSubmit }) {
               style={{ ...styles.toggleBtn, background: type === 'in' ? 'var(--green)' : 'transparent', color: type === 'in' ? '#fff' : 'var(--ink)' }}>
               <ArrowUpCircle size={14} /> Receive
             </button>
-            <button className="depot-btn" onClick={() => setType('out')}
-              style={{ ...styles.toggleBtn, background: type === 'out' ? 'var(--amber-deep)' : 'transparent', color: type === 'out' ? '#fff' : 'var(--ink)' }}>
-              <ArrowDownCircle size={14} /> Issue
-            </button>
+            {allowIssue && (
+              <button className="depot-btn" onClick={() => setType('out')}
+                style={{ ...styles.toggleBtn, background: type === 'out' ? 'var(--amber-deep)' : 'transparent', color: type === 'out' ? '#fff' : 'var(--ink)' }}>
+                <ArrowDownCircle size={14} /> Issue
+              </button>
+            )}
           </div>
           <Field label={`Quantity (currently ${item.quantity} on hand)`}>
             <input className="depot-input" type="number" min="1" style={styles.modalInput} value={qty}
