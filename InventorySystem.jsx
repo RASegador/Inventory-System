@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { auth, db } from './firebase';
 import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import {
-  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot,
+  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
 } from 'firebase/firestore';
 import {
   Package, AlertTriangle, Search, Plus, Pencil, Trash2, X,
@@ -235,13 +235,15 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
+    viewOwnSales: false, viewActivityLogs: true,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
     manageCategories: true, manageSuppliers: true, manageLocations: true,
     stockReceive: true, stockIssue: true,
     pos: true, viewReports: true, print: true, cancelSales: true,
-    manageUsers: true, manageAllRoles: false, manageSystem: false,
+    manageUsers: false, manageAllRoles: false, manageSystem: false,
+    viewOwnSales: false, viewActivityLogs: true,
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
@@ -249,6 +251,7 @@ const PERMISSIONS = {
     stockReceive: true, stockIssue: false,
     pos: true, viewReports: false, print: false, cancelSales: false,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
+    viewOwnSales: true, viewActivityLogs: false,
   },
 };
 
@@ -266,8 +269,10 @@ const VIEW_PERMISSIONS = {
   locations: 'manageLocations',
   delivery: 'viewReports',
   sales: 'viewReports',
+  mysales: 'viewOwnSales',
   history: 'viewReports',
   approvals: 'manageUsers',
+  activity: 'viewActivityLogs',
 };
 
 function canAccessView(role, viewKey) {
@@ -285,6 +290,53 @@ function resolveRole(profile) {
   return 'staff';
 }
 
+// Background/color scheme presets a Super Admin can pick from. Each key
+// matches a CSS custom property already used throughout the app, so
+// switching themes is just re-injecting this block into :root.
+const THEMES = {
+  cozyGrocery: {
+    label: 'Cozy Grocery', swatch: '#5C8A5A',
+    blueprint: '#2F4A32', blueprintDeep: '#16281C', line: '#C9A96A', lineDim: 'rgba(201,169,106,0.28)',
+    paper: '#F7EFDD', paperDim: '#EFE3C8', ink: '#3B2A1F', amber: '#D9A441', amberDeep: '#A9701D',
+    green: '#5C8A5A', red: '#C1503A',
+  },
+  oceanBlue: {
+    label: 'Ocean Blue', swatch: '#0F2A47',
+    blueprint: '#0F2A47', blueprintDeep: '#0A1F38', line: '#7FB3E0', lineDim: 'rgba(127,179,224,0.28)',
+    paper: '#F5F3EC', paperDim: '#EAE7DC', ink: '#14213D', amber: '#E8A33D', amberDeep: '#B87A1E',
+    green: '#4F8A63', red: '#C1543C',
+  },
+  sunsetAmber: {
+    label: 'Sunset Amber', swatch: '#E8823D',
+    blueprint: '#6B3A2E', blueprintDeep: '#4A2419', line: '#F0A868', lineDim: 'rgba(240,168,104,0.28)',
+    paper: '#FBF0E4', paperDim: '#F3E0C8', ink: '#3D2418', amber: '#E8823D', amberDeep: '#C05F1E',
+    green: '#6B8F5A', red: '#C1453A',
+  },
+  slateModern: {
+    label: 'Slate Modern', swatch: '#2A3441',
+    blueprint: '#2A3441', blueprintDeep: '#1A222C', line: '#8FA5BD', lineDim: 'rgba(143,165,189,0.28)',
+    paper: '#F2F4F6', paperDim: '#E4E8EC', ink: '#232B35', amber: '#4A7FB5', amberDeep: '#2F5C8A',
+    green: '#4F8A6E', red: '#C1543C',
+  },
+};
+const DEFAULT_THEME_KEY = 'cozyGrocery';
+
+function themeCssVars(theme) {
+  return `
+          --blueprint: ${theme.blueprint};
+          --blueprint-deep: ${theme.blueprintDeep};
+          --line: ${theme.line};
+          --line-dim: ${theme.lineDim};
+          --paper: ${theme.paper};
+          --paper-dim: ${theme.paperDim};
+          --ink: ${theme.ink};
+          --amber: ${theme.amber};
+          --amber-deep: ${theme.amberDeep};
+          --green: ${theme.green};
+          --red: ${theme.red};
+  `;
+}
+
 export default function InventorySystem() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -292,6 +344,7 @@ export default function InventorySystem() {
   const [profileChecked, setProfileChecked] = useState(false);
   const [pendingUsers, setPendingUsers] = useState([]);
   const [approvedUsers, setApprovedUsers] = useState([]);
+  const [branding, setBranding] = useState(null);
   const [items, setItems] = useState([]);
   const [movements, setMovements] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
@@ -299,6 +352,7 @@ export default function InventorySystem() {
   const [locations, setLocations] = useState([]);
   const [deliveryStatuses, setDeliveryStatuses] = useState({});
   const [sales, setSales] = useState([]);
+  const [loginLogs, setLoginLogs] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState('overview');
   const [search, setSearch] = useState('');
@@ -324,6 +378,51 @@ export default function InventorySystem() {
     });
     return unsub;
   }, []);
+
+  // Activity log: record a "login" entry each time a session starts. This is
+  // a client-side approximation - it can't distinguish "just signed in" from
+  // "reopened the app with a still-valid session," since both look the same
+  // to the client SDK. Logout is recorded explicitly via handleSignOut below.
+  useEffect(() => {
+    if (!user) return;
+    (async () => {
+      try {
+        const logId = 'l' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'loginLogs', logId), {
+          uid: user.uid, email: user.email || '', type: 'login', timestamp: Date.now(),
+        });
+      } catch (e) {
+        console.error('Login log error:', e);
+      }
+    })();
+  }, [user?.uid]);
+
+  const handleSignOut = async () => {
+    if (user) {
+      try {
+        const logId = 'l' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'loginLogs', logId), {
+          uid: user.uid, email: user.email || '', type: 'logout', timestamp: Date.now(),
+        });
+      } catch (e) {
+        console.error('Logout log error:', e);
+      }
+    }
+    await signOut(auth);
+  };
+
+  // Branding (custom logo + theme): public read, so this works even on the
+  // signed-out login screen. Applies live for everyone the moment a Super
+  // Admin changes it.
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, 'config', 'branding'), (d) => {
+      setBranding(d.exists() ? d.data() : {});
+    }, () => setBranding({}));
+    return unsub;
+  }, []);
+
+  const effectiveLogo = branding?.logoDataUri || LOGO_DATA_URI;
+  const activeTheme = THEMES[branding?.themeKey] || THEMES[DEFAULT_THEME_KEY];
 
   // Approval: ensure a users/{uid} profile exists, then subscribe to it live
   useEffect(() => {
@@ -353,19 +452,17 @@ export default function InventorySystem() {
   const myRole = resolveRole(myProfile);
   const isManager = myRole === 'superadmin' || myRole === 'client';
 
-  // Managers (Client + Super Admin) subscribe to the users list to run Team Access.
-  // Firestore rules only ever return docs this account is allowed to read.
+  // Only Super Admin manages Team Access now - Client no longer sees or
+  // manages other accounts, so there's no reason for Client to subscribe.
   useEffect(() => {
-    if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
+    if (!user || myRole !== 'superadmin') { setPendingUsers([]); setApprovedUsers([]); return; }
     const unsub = onSnapshot(collection(db, 'users'), (snap) => {
-      let all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
-      // A Client only manages Staff accounts - Super Admins and other Clients stay out of view.
-      if (myRole === 'client') all = all.filter((u) => u.role === 'staff');
+      const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
     });
     return unsub;
-  }, [user, isManager, myRole]);
+  }, [user, myRole]);
 
   const approveUser = async (uid) => {
     try {
@@ -403,6 +500,37 @@ export default function InventorySystem() {
       showToast('Could not update role — check your connection');
     }
   };
+
+  const saveLogo = async (dataUri) => {
+    if (myRole !== 'superadmin') return;
+    try {
+      await setDoc(doc(db, 'config', 'branding'), { logoDataUri: dataUri }, { merge: true });
+      showToast('Logo updated for everyone');
+    } catch (e) {
+      showToast('Could not save logo — check your connection');
+    }
+  };
+
+  const resetLogo = async () => {
+    if (myRole !== 'superadmin') return;
+    try {
+      await setDoc(doc(db, 'config', 'branding'), { logoDataUri: null }, { merge: true });
+      showToast('Reverted to the default logo');
+    } catch (e) {
+      showToast('Could not reset logo — check your connection');
+    }
+  };
+
+  const setThemeKey = async (key) => {
+    if (myRole !== 'superadmin') return;
+    try {
+      await setDoc(doc(db, 'config', 'branding'), { themeKey: key }, { merge: true });
+      showToast(`Theme changed to ${THEMES[key]?.label || key}`);
+    } catch (e) {
+      showToast('Could not change theme — check your connection');
+    }
+  };
+
 
   // Data: seed once if empty, then subscribe to live Firestore updates
   useEffect(() => {
@@ -467,10 +595,18 @@ export default function InventorySystem() {
         unsubs.push(onSnapshot(collection(db, 'sales'), (snap) => {
           setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
         }));
+        unsubs.push(onSnapshot(collection(db, 'loginLogs'), (snap) => {
+          setLoginLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
+        }));
       } else {
         setMovements([]);
         setDeliveryStatuses({});
-        setSales([]);
+        setLoginLogs([]);
+        // Staff only ever see their own sales - the query itself (not just the
+        // rule) scopes this, so there's no risk of over-fetching then hiding.
+        unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
+          setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
+        }));
       }
 
       setLoaded(true);
@@ -670,7 +806,10 @@ export default function InventorySystem() {
     const subtotal = saleLines.reduce((s, l) => s + l.lineTotal, 0);
     const tax = subtotal * TAX_RATE;
     const total = subtotal + tax;
-    const sale = { id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines, subtotal, tax, total, paymentMethod };
+    const sale = {
+      id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
+      subtotal, tax, total, paymentMethod, cashierId: user.uid, cashierEmail: user.email || '',
+    };
 
     try {
       await Promise.all(cartLines.map((line) => {
@@ -796,7 +935,7 @@ export default function InventorySystem() {
   }
 
   if (!user) {
-    return <LoginScreen />;
+    return <LoginScreen logo={effectiveLogo} theme={activeTheme} />;
   }
 
   if (!profileChecked) {
@@ -811,7 +950,7 @@ export default function InventorySystem() {
   }
 
   if (!myProfile || !myProfile.approved) {
-    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} />;
+    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} onSignOut={handleSignOut} />;
   }
 
   if (!loaded) {
@@ -831,17 +970,7 @@ export default function InventorySystem() {
         ${FONT_IMPORT}
         ${RESPONSIVE_CSS}
         :root {
-          --blueprint: #2F4A32;
-          --blueprint-deep: #16281C;
-          --line: #C9A96A;
-          --line-dim: rgba(201,169,106,0.28);
-          --paper: #F7EFDD;
-          --paper-dim: #EFE3C8;
-          --ink: #3B2A1F;
-          --amber: #D9A441;
-          --amber-deep: #A9701D;
-          --green: #5C8A5A;
-          --red: #C1503A;
+          ${themeCssVars(activeTheme)}
         }
         * { box-sizing: border-box; }
         .depot-btn { cursor: pointer; border: none; font-family: 'Nunito', sans-serif; transition: all 0.15s ease; }
@@ -862,7 +991,7 @@ export default function InventorySystem() {
 
       <BackgroundDecor variant="app" />
 
-      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} />
+      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} onSignOut={handleSignOut} />
 
       <main style={styles.main} className="depot-scroll depot-main">
         <TopBar
@@ -936,6 +1065,10 @@ export default function InventorySystem() {
           <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} />
         )}
 
+        {view === 'mysales' && (
+          <MySalesView sales={sales} />
+        )}
+
         {view === 'history' && (
           <TransactionHistoryView
             movements={filteredMovements}
@@ -956,7 +1089,15 @@ export default function InventorySystem() {
             onDeny={denyUser}
             onRevoke={revokeUser}
             onChangeRole={changeUserRole}
+            branding={branding}
+            onSaveLogo={saveLogo}
+            onResetLogo={resetLogo}
+            onSetTheme={setThemeKey}
           />
+        )}
+
+        {view === 'activity' && (
+          <ActivityLogView logs={loginLogs} myRole={myRole} approvedUsers={approvedUsers} pendingUsers={pendingUsers} />
         )}
         </>
         )}
@@ -1049,7 +1190,8 @@ export default function InventorySystem() {
   );
 }
 
-function LoginScreen() {
+function LoginScreen({ logo, theme }) {
+  const t = theme || THEMES[DEFAULT_THEME_KEY];
   const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -1101,24 +1243,24 @@ function LoginScreen() {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
-      background: 'var(--paper, #F7EFDD)', fontFamily: "'Nunito', sans-serif", borderRadius: 8,
+      background: t.paper, fontFamily: "'Nunito', sans-serif", borderRadius: 8,
       position: 'relative', overflow: 'hidden',
     }}>
       <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
       <BackgroundDecor variant="login" />
       <form onSubmit={submit} className="depot-login-form" style={{
         background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 360,
-        boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(217,164,65,0.15)',
-        border: '1px solid rgba(217,164,65,0.35)', position: 'relative', zIndex: 1,
+        boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
+        border: `1px solid ${t.lineDim}`, position: 'relative', zIndex: 1,
       }}>
         <div style={{
-          background: 'linear-gradient(135deg, #FFFCF5 0%, #F7EFDD 100%)',
+          background: `linear-gradient(135deg, #FFFCF5 0%, ${t.paper} 100%)`,
           borderRadius: 10, padding: '14px 14px 10px', marginBottom: 20,
-          border: '1px solid rgba(217,164,65,0.25)',
+          border: `1px solid ${t.lineDim}`,
         }}>
-          <img src={LOGO_DATA_URI} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+          <img src={logo} alt="RAS logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
         </div>
-        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: '#3B2A1F' }}>
+        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
           {mode === 'signup' ? 'Create Your Account' : 'Welcome Back!'}
         </div>
         <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 20 }}>
@@ -1143,9 +1285,9 @@ function LoginScreen() {
             />
           </>
         )}
-        {error && <div style={{ fontSize: 12.5, color: '#C1503A', marginBottom: 12 }}>{error}</div>}
+        {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
         <button type="submit" disabled={busy} style={{
-          width: '100%', background: '#2F4A32', color: '#fff', border: 'none', borderRadius: 6,
+          width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
           padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: busy ? 0.6 : 1,
         }}>
           {busy ? (mode === 'signup' ? 'Creating account…' : 'Signing in…') : (mode === 'signup' ? 'Sign Up' : 'Sign In')}
@@ -1153,7 +1295,7 @@ function LoginScreen() {
         <div style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>
           {mode === 'signup' ? 'Already have an account?' : "Don't have an account?"}{' '}
           <button type="button" onClick={switchMode} style={{
-            background: 'none', border: 'none', padding: 0, color: '#2F4A32', fontWeight: 600,
+            background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600,
             cursor: 'pointer', textDecoration: 'underline', fontSize: 12.5,
           }}>
             {mode === 'signup' ? 'Sign In' : 'Sign Up'}
@@ -1183,7 +1325,7 @@ function AccessDenied() {
   );
 }
 
-function PendingApprovalScreen({ email, missingProfile }) {
+function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1230,7 +1372,7 @@ function PendingApprovalScreen({ email, missingProfile }) {
           </button>
         )}
         <button
-          onClick={() => signOut(auth)}
+          onClick={onSignOut}
           style={{
             width: '100%', background: 'transparent', border: '1px solid rgba(59,42,31,0.2)', color: '#3B2A1F',
             borderRadius: 6, padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer',
@@ -1243,7 +1385,7 @@ function PendingApprovalScreen({ email, missingProfile }) {
   );
 }
 
-function Sidebar({ view, setView, lowCount, role, pendingCount }) {
+function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
   const allItems = [
     { key: 'overview', label: 'Overview', icon: LayoutGrid },
     { key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
@@ -1253,15 +1395,17 @@ function Sidebar({ view, setView, lowCount, role, pendingCount }) {
     { key: 'locations', label: 'Locations', icon: MapPin },
     { key: 'delivery', label: 'Delivery Times', icon: Timer },
     { key: 'sales', label: 'Sales History', icon: Receipt },
+    { key: 'mysales', label: 'My Sales', icon: Receipt },
     { key: 'history', label: 'Transaction History', icon: ScrollText },
     { key: 'approvals', label: 'Team Access', icon: User, badge: pendingCount },
+    { key: 'activity', label: 'Activity Log', icon: Clock },
   ];
   const items = allItems.filter((it) => canAccessView(role, it.key));
   return (
     <aside style={styles.sidebar} className="depot-sidebar">
       <div style={styles.brand} className="depot-brand">
         <div style={styles.logoCard}>
-          <img src={LOGO_DATA_URI} alt="Company logo" style={styles.logoImg} />
+          <img src={logo} alt="Company logo" style={styles.logoImg} />
         </div>
       </div>
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 28 }} className="depot-sidebar-nav">
@@ -1294,7 +1438,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount }) {
       </div>
       <button
         className="depot-btn depot-signout-btn"
-        onClick={() => signOut(auth)}
+        onClick={onSignOut}
         style={{
           marginTop: 8, background: 'transparent', border: '1px solid rgba(245,243,236,0.2)',
           color: 'rgba(245,243,236,0.7)', fontSize: 11.5, borderRadius: 5, padding: '7px 12px',
@@ -1318,6 +1462,8 @@ function TopBar({ view, role, onAdd }) {
     sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
     approvals: ['Team Access', 'Approve sign-ups and manage accounts'],
+    mysales: ['My Sales', 'Transactions you\'ve processed'],
+    activity: ['Activity Log', 'Sign-in and sign-out history'],
   };
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'));
@@ -1888,11 +2034,44 @@ function POSView({ items, onCompleteSale }) {
 
 function SalesHistoryView({ sales, role, onCancelSale }) {
   const canCancel = can(role, 'cancelSales');
+  const [cashierFilter, setCashierFilter] = useState('All');
+  const [expandedId, setExpandedId] = useState(null);
+
+  const cashiers = useMemo(() => {
+    const set = new Set(sales.map((s) => s.cashierEmail).filter(Boolean));
+    return Array.from(set).sort();
+  }, [sales]);
+
+  const filtered = useMemo(() => {
+    if (cashierFilter === 'All') return sales;
+    return sales.filter((s) => s.cashierEmail === cashierFilter);
+  }, [sales, cashierFilter]);
+
+  const overall = useMemo(() => {
+    const active = sales.filter((s) => !s.cancelled);
+    return { count: active.length, total: active.reduce((sum, s) => sum + s.total, 0) };
+  }, [sales]);
+
+  const byCashier = useMemo(() => {
+    const map = {};
+    sales.forEach((s) => {
+      if (s.cancelled) return;
+      const key = s.cashierEmail || 'Unknown';
+      if (!map[key]) map[key] = { count: 0, total: 0 };
+      map[key].count += 1;
+      map[key].total += s.total;
+    });
+    return Object.entries(map)
+      .map(([email, v]) => ({ email, ...v }))
+      .sort((a, b) => b.total - a.total);
+  }, [sales]);
+
   const handleDownload = () => {
-    const headers = ['Receipt', 'Date', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
-    const rows = sales.map((sale) => [
+    const headers = ['Receipt', 'Date', 'Cashier', 'Items', 'Payment Method', 'Subtotal', 'VAT', 'Total', 'Status'];
+    const rows = filtered.map((sale) => [
       sale.receiptNo,
       new Date(sale.timestamp).toLocaleString('en-PH'),
+      sale.cashierEmail || '—',
       sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
       sale.paymentMethod,
       sale.subtotal.toFixed(2),
@@ -1906,27 +2085,83 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} />
-      {sales.length === 0 ? (
+
+      <div style={styles.statGrid} className="depot-stat-grid">
+        <StatCard icon={Receipt} label="Sales (Overall)" value={overall.count} accent="var(--blueprint)" />
+        <StatCard icon={PesoIcon} label="Total Revenue (Overall)" value={currency(overall.total)} accent="var(--green)" />
+      </div>
+
+      {byCashier.length > 0 && (
+        <div style={{ ...styles.panel, marginBottom: 16 }}>
+          <div style={styles.panelHeader}>
+            <User size={15} />
+            <span>TOTAL SALES PER ACCOUNT</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+            {byCashier.map((c) => (
+              <div key={c.email} style={styles.watchRow}>
+                <div>
+                  <div style={styles.watchSku}>{c.email}</div>
+                  <div style={styles.watchName}>{c.count} sale{c.count === 1 ? '' : 's'}</div>
+                </div>
+                <div style={{ fontWeight: 700, fontFamily: "'Quicksand', sans-serif", color: 'var(--ink)' }}>
+                  {currency(c.total)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {cashiers.length > 0 && (
+        <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+          <select className="depot-select" value={cashierFilter} onChange={(e) => setCashierFilter(e.target.value)} style={styles.select}>
+            <option value="All">All Staff</option>
+            {cashiers.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          {cashierFilter !== 'All' && (
+            <div style={{ ...styles.watchName, alignSelf: 'center' }}>
+              {filtered.length} sale{filtered.length === 1 ? '' : 's'} · {currency(filtered.reduce((s, x) => s + (x.cancelled ? 0 : x.total), 0))} total
+            </div>
+          )}
+        </div>
+      )}
+      {filtered.length === 0 ? (
         <div style={styles.panel}><div style={styles.emptyState}>No sales recorded yet. Ring one up in Point of Sale.</div></div>
       ) : (
         <div style={styles.tableWrap} className="depot-scroll">
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Receipt', 'Date', 'Items', 'Payment', 'Total', 'Status', ...(canCancel ? [''] : [])].map((h) => (
+                {['Receipt', 'Date', 'Cashier', 'Items', 'Payment', 'Total', 'Status', ...(canCancel ? [''] : [])].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {sales.map((sale) => (
-                <tr key={sale.id} className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
+              {filtered.map((sale) => {
+                const isOpen = expandedId === sale.id;
+                const colCount = 7 + (canCancel ? 1 : 0);
+                return (
+                <React.Fragment key={sale.id}>
+                <tr className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{sale.receiptNo}</td>
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
+                  <td style={{ ...styles.td, fontSize: 12.5 }}>{sale.cashierEmail || '—'}</td>
                   <td style={styles.td}>
-                    {sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}
+                    <button
+                      className="depot-btn"
+                      onClick={() => setExpandedId(isOpen ? null : sale.id)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 5, background: 'transparent',
+                        border: 'none', padding: 0, color: 'var(--blueprint)', fontSize: 13, fontFamily: "'Nunito', sans-serif",
+                      }}
+                    >
+                      <ChevronDown size={14} className="depot-no-print" style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s ease' }} />
+                      {sale.items.length} item{sale.items.length === 1 ? '' : 's'}
+                    </button>
                   </td>
                   <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
@@ -1947,6 +2182,88 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
                     </td>
                   )}
                 </tr>
+                {isOpen && (
+                  <tr className="depot-row">
+                    <td colSpan={colCount} style={{ ...styles.td, background: 'rgba(20,33,61,0.02)', padding: '10px 14px' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                        <thead>
+                          <tr>
+                            {['SKU', 'Item', 'Qty', 'Unit Price', 'Line Total'].map((h) => (
+                              <th key={h} style={{ ...styles.th, padding: '4px 8px', fontSize: 10.5 }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sale.items.map((l, i) => (
+                            <tr key={i}>
+                              <td style={{ padding: '4px 8px', fontFamily: "'Quicksand', sans-serif", fontSize: 12 }}>{l.sku}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12 }}>{l.name}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12 }}>{l.qty}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12, fontFamily: "'IBM Plex Mono', monospace" }}>{currency(l.unitPrice)}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{currency(l.lineTotal)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
+                );
+              })}
+            </tbody>
+
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MySalesView({ sales }) {
+  const totalToday = useMemo(() => {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    return sales.filter((s) => !s.cancelled && s.timestamp >= start.getTime()).reduce((s, x) => s + x.total, 0);
+  }, [sales]);
+  const totalAll = useMemo(() => sales.filter((s) => !s.cancelled).reduce((s, x) => s + x.total, 0), [sales]);
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={styles.statGrid} className="depot-stat-grid">
+        <StatCard icon={Receipt} label="Sales Recorded" value={sales.length} accent="var(--blueprint)" />
+        <StatCard icon={PesoIcon} label="Total Today" value={currency(totalToday)} accent="var(--green)" />
+        <StatCard icon={PesoIcon} label="Total All-Time" value={currency(totalAll)} accent="var(--amber-deep)" />
+      </div>
+      {sales.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>You haven't processed any sales yet. Ring one up in Point of Sale.</div></div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table} className="depot-table">
+            <thead>
+              <tr>
+                {['Receipt', 'Date', 'Items', 'Payment', 'Total', 'Status'].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sales.map((sale) => (
+                <tr key={sale.id} className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{sale.receiptNo}</td>
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
+                    {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </td>
+                  <td style={styles.td}>{sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}</td>
+                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod}</span></td>
+                  <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
+                  <td style={styles.td}>
+                    {sale.cancelled ? (
+                      <span style={{ ...styles.statusPill, background: 'rgba(193,80,58,0.1)', color: 'var(--red)' }}>Cancelled</span>
+                    ) : (
+                      <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Completed</span>
+                    )}
+                  </td>
+                </tr>
               ))}
             </tbody>
           </table>
@@ -1956,8 +2273,88 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole }) {
+function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
+  const [userFilter, setUserFilter] = useState('All');
+  const roleByUid = useMemo(() => {
+    const map = {};
+    [...approvedUsers, ...pendingUsers].forEach((u) => { map[u.id] = u.role; });
+    return map;
+  }, [approvedUsers, pendingUsers]);
+
+  const users = useMemo(() => {
+    const set = new Set(logs.map((l) => l.email).filter(Boolean));
+    return Array.from(set).sort();
+  }, [logs]);
+
+  const filtered = userFilter === 'All' ? logs : logs.filter((l) => l.email === userFilter);
+
+  const handleDownload = () => {
+    const headers = ['Email', 'Role', 'Type', 'Timestamp'];
+    const rows = filtered.map((l) => [l.email, ROLES[roleByUid[l.uid]] || '—', l.type, new Date(l.timestamp).toLocaleString('en-PH')]);
+    downloadCSV('activity-log.csv', headers, rows);
+  };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <ExportBar onPrint={printPage} onDownload={handleDownload} />
+      {users.length > 0 && (
+        <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+          <select className="depot-select" value={userFilter} onChange={(e) => setUserFilter(e.target.value)} style={styles.select}>
+            <option value="All">All Users</option>
+            {users.map((u) => <option key={u} value={u}>{u}</option>)}
+          </select>
+        </div>
+      )}
+      {filtered.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>No activity recorded yet.</div></div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table} className="depot-table">
+            <thead>
+              <tr>
+                {['Email', 'Role', 'Event', 'Timestamp'].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((l) => (
+                <tr key={l.id} className="depot-row">
+                  <td style={styles.td}>{l.email}</td>
+                  <td style={styles.td}><span style={styles.pill}>{ROLES[roleByUid[l.uid]] || '—'}</span></td>
+                  <td style={styles.td}>
+                    {l.type === 'login' ? (
+                      <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Login</span>
+                    ) : (
+                      <span style={{ ...styles.statusPill, background: 'rgba(20,33,61,0.08)', color: 'var(--ink)' }}>Logout</span>
+                    )}
+                  </td>
+                  <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
+                    {new Date(l.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApprove, onDeny, onRevoke, onChangeRole, branding, onSaveLogo, onResetLogo, onSetTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
+  const [logoPreview, setLogoPreview] = useState(null);
+  const activeThemeKey = branding?.themeKey || DEFAULT_THEME_KEY;
+
+  const handleLogoFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setLogoPreview(reader.result);
+    reader.readAsDataURL(file);
+  };
+
   // A Client can only promote/demote within reach of their own permissions -
   // in practice that means they don't get a role selector at all; only
   // Super Admin can reassign roles (staff <-> client <-> superadmin).
@@ -1976,6 +2373,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
               <div key={u.id} style={styles.watchRow}>
                 <div>
                   <div style={styles.watchSku}>{u.email}</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
                   <div style={styles.watchName}>
                     {!isSuperAdmin && `${ROLES[u.role] || 'Staff'} · `}Requested {u.createdAt ? formatDate(u.createdAt) : 'recently'}
                   </div>
@@ -2013,6 +2411,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
               <div key={u.id} style={styles.watchRow}>
                 <div>
                   <div style={styles.watchSku}>{u.email}</div>
+                  <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.id}</div>
                   <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -2035,6 +2434,68 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, onApp
           </div>
         )}
       </div>
+
+      {isSuperAdmin && (
+        <div style={{ ...styles.panel, marginTop: 16 }}>
+          <div style={styles.panelHeader}>
+            <Package size={15} />
+            <span>APP BRANDING</span>
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Logo</div>
+            <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+              <div style={{ width: 180, background: '#fff', border: '1px solid rgba(20,33,61,0.1)', borderRadius: 8, padding: 10 }}>
+                <img src={logoPreview || branding?.logoDataUri || LOGO_DATA_URI} alt="Current logo" style={{ width: '100%', height: 'auto', display: 'block' }} />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <input type="file" accept="image/*" onChange={handleLogoFile} />
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button
+                    className="depot-btn"
+                    style={{ ...styles.smallAmberBtn, opacity: logoPreview ? 1 : 0.45 }}
+                    disabled={!logoPreview}
+                    onClick={() => { onSaveLogo(logoPreview); setLogoPreview(null); }}
+                  >
+                    Save Logo
+                  </button>
+                  <button
+                    className="depot-btn"
+                    style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--ink)', border: '1px solid rgba(20,33,61,0.2)' }}
+                    onClick={() => { onResetLogo(); setLogoPreview(null); }}
+                  >
+                    Reset to Default
+                  </button>
+                </div>
+                <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', maxWidth: 260 }}>
+                  Applies for everyone, including the sign-in screen.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Background / Color Scheme</div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              {Object.entries(THEMES).map(([key, theme]) => (
+                <button
+                  key={key}
+                  className="depot-btn"
+                  onClick={() => onSetTheme(key)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8,
+                    border: activeThemeKey === key ? '2px solid var(--ink)' : '1px solid rgba(20,33,61,0.15)',
+                    background: '#fff', fontSize: 12.5, fontWeight: 500,
+                  }}
+                >
+                  <span style={{ width: 16, height: 16, borderRadius: '50%', background: theme.swatch, display: 'inline-block' }} />
+                  {theme.label}
+                  {activeThemeKey === key && <CheckCircle2 size={13} color="var(--green)" />}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
