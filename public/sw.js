@@ -1,13 +1,17 @@
-// Minimal service worker for Stock IT.
+// Service worker for Stock IT.
 //
-// This exists mainly so Chrome/Android treats the app as a properly
-// installable PWA (a registered service worker is one of the install
-// criteria) - it does NOT try to cache your Firestore data, so the app
-// always loads current data when online. It only caches the static app
-// shell (HTML/JS/CSS) so the app can still open (though not sync data)
-// briefly offline or on a flaky connection.
+// This exists so Chrome/Android treats the app as a properly installable
+// PWA (a registered service worker is one of the install criteria) - it
+// does NOT try to cache your Firestore data, so the app always loads
+// current data when online.
+//
+// IMPORTANT: this is NETWORK-FIRST, not cache-first. Every request tries
+// the real network first, and only falls back to a cached copy if that
+// fails (genuinely offline). An earlier cache-first version of this file
+// served stale JavaScript indefinitely after every deploy, regardless of
+// hard refresh - this version fixes that.
 
-const CACHE_NAME = 'stockit-shell-v1';
+const CACHE_NAME = 'stockit-shell-v2';
 
 self.addEventListener('install', (event) => {
   self.skipWaiting();
@@ -32,17 +36,14 @@ self.addEventListener('fetch', (event) => {
   if (request.url.includes('identitytoolkit.googleapis.com')) return;
 
   event.respondWith(
-    caches.match(request).then((cached) => {
-      const fetchPromise = fetch(request)
-        .then((response) => {
-          if (response && response.status === 200) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
-          }
-          return response;
-        })
-        .catch(() => cached);
-      return cached || fetchPromise;
-    })
+    fetch(request)
+      .then((response) => {
+        if (response && response.status === 200) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+        }
+        return response;
+      })
+      .catch(() => caches.match(request))
   );
 });
