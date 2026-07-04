@@ -173,6 +173,44 @@ function printPage() {
   window.print();
 }
 
+const ACTIVITY_TYPE_LABELS = {
+  login: 'Login',
+  logout: 'Logout',
+  staff_created: 'Staff Created',
+  inventory_added: 'Inventory Added',
+  inventory_edited: 'Inventory Edited',
+  inventory_assigned: 'Inventory Assigned',
+  price_changed: 'Base Price Changed',
+  markup_changed: 'Markup Changed',
+  sale_completed: 'Sale Completed',
+  report_generated: 'Report Generated',
+};
+
+function describeActivity(l) {
+  const m = l.meta || {};
+  switch (l.type) {
+    case 'login': return 'Signed in';
+    case 'logout': return 'Signed out';
+    case 'staff_created': return `Created staff account for ${m.targetEmail || '—'}`;
+    case 'inventory_added': return `Added item ${m.itemSku || ''}${m.itemName ? ` — ${m.itemName}` : ''}`;
+    case 'inventory_edited': return `Edited item ${m.itemSku || ''}${m.itemName ? ` — ${m.itemName}` : ''}`;
+    case 'inventory_assigned': return `Assigned ${m.qty ?? ''} × ${m.itemSku || ''} to ${m.targetEmail || '—'}`;
+    case 'price_changed': return `Changed base cost of ${m.itemSku || ''} from ${currency(m.oldCost ?? 0)} to ${currency(m.newCost ?? 0)}`;
+    case 'markup_changed': return `Updated markup on ${m.itemSku || ''} to ${m.markupType === 'fixed' ? currency(m.markupValue ?? 0) + ' flat' : `${m.markupValue ?? 0}%`}`;
+    case 'sale_completed': return `Completed sale ${m.receiptNo || ''} (${currency(m.total ?? 0)})`;
+    case 'report_generated': return `Generated ${m.report || 'a report'}${m.format ? ` (${m.format})` : ''}`;
+    default: return ACTIVITY_TYPE_LABELS[l.type] || l.type;
+  }
+}
+
+function activityBadgeColors(type) {
+  if (type === 'login' || type === 'sale_completed') return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' };
+  if (type === 'logout') return { bg: 'rgba(20,33,61,0.08)', color: 'var(--ink)' };
+  if (type === 'price_changed' || type === 'markup_changed') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
+  if (type === 'staff_created' || type === 'inventory_assigned') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
+  return { bg: 'rgba(20,33,61,0.06)', color: 'var(--ink)' };
+}
+
 // Every onSnapshot below is wired with this, so if a listener ever gets
 // blocked (e.g. by a rules change), the console tells us exactly which
 // one - rather than every listener producing the same generic, impossible
@@ -803,6 +841,7 @@ export default function InventorySystem() {
       }, { merge: true });
       await signOut(secondaryAuth);
       playAddSound();
+      logActivity('staff_created', { targetEmail: email.trim(), targetUid: cred.user.uid });
       showToast(`Staff account created for ${email.trim()}`);
       return { ok: true };
     } catch (e) {
@@ -1068,17 +1107,44 @@ export default function InventorySystem() {
     setTimeout(() => setToast(null), 2400);
   };
 
+  // Extends the same tenant-scoped, already-permissioned loginLogs
+  // collection to cover the full activity vocabulary (not just login/
+  // logout) - staff creation, inventory changes, price/markup changes,
+  // sales, and report generation. One shared shape keeps Activity Log's
+  // filters simple: every entry has {type, meta, uid, email, timestamp,
+  // ownerId}.
+  const logActivity = async (type, meta = {}) => {
+    if (!ownerId || !user) return;
+    try {
+      const logId = 'l' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'loginLogs', logId), {
+        uid: user.uid, email: user.email || '', type, meta, timestamp: Date.now(), ownerId,
+      });
+    } catch (e) {
+      console.error('Activity log error:', e);
+    }
+  };
+
   const saveItem = async (draft) => {
     if (!can(myRole, 'editInventory')) { showToast("You don't have permission to edit inventory"); return; }
+    const isNew = !draft.id;
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
     const markupType = draft.markupType === 'fixed' ? 'fixed' : 'percent';
     const markupValue = Math.max(0, Number(draft.markupValue) || 0);
     const sellingPrice = computeSellingPrice(unitCost, markupType, markupValue);
+    const previous = isNew ? null : items.find((i) => i.id === id);
     try {
       await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, unitCost, markupType, markupValue, sellingPrice });
-      if (!draft.id) playAddSound();
+      if (isNew) {
+        playAddSound();
+        logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
+      } else if (previous && previous.unitCost !== unitCost) {
+        logActivity('price_changed', { itemSku: draft.sku, oldCost: previous.unitCost, newCost: unitCost });
+      } else {
+        logActivity('inventory_edited', { itemSku: draft.sku, itemName: draft.name });
+      }
       showToast(draft.id ? `Updated ${draft.sku}` : `Added ${draft.sku} to the manifest`);
     } catch (e) {
       showToast('Could not save item — check your connection');
@@ -1155,6 +1221,7 @@ export default function InventorySystem() {
       });
 
       playAddSound();
+      logActivity('inventory_assigned', { itemSku: source.sku, itemName: source.name, qty, targetEmail: staff.email });
       showToast(`Assigned ${qty} × ${source.sku} to ${staff.fullName || staff.email}`);
     } catch (e) {
       showToast('Could not assign inventory — check your connection');
@@ -1177,6 +1244,7 @@ export default function InventorySystem() {
     const sellingPrice = computeSellingPrice(item.unitCost, mt, mv);
     try {
       await setDoc(doc(db, 'items', item.id), { markupType: mt, markupValue: mv, sellingPrice }, { merge: true });
+      logActivity('markup_changed', { itemSku: item.sku, itemName: item.name, markupType: mt, markupValue: mv });
       showToast(`Markup updated for ${item.sku}`);
     } catch (e) {
       showToast('Could not update markup — check your connection');
@@ -1373,6 +1441,7 @@ export default function InventorySystem() {
       }));
       await setDoc(doc(db, 'sales', sale.id), sale);
       playSaleSound();
+      logActivity('sale_completed', { receiptNo, total, itemCount: saleLines.length });
       showToast(`Sale ${receiptNo} recorded — ${currency(total)}`);
       return sale;
     } catch (e) {
@@ -1762,7 +1831,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'sales' && (
-          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} />
+          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onLogActivity={logActivity} />
         )}
 
         {view === 'mysales' && (
@@ -3464,7 +3533,7 @@ function POSView({ items, onCompleteSale }) {
   );
 }
 
-function SalesHistoryView({ sales, role, onCancelSale }) {
+function SalesHistoryView({ sales, role, onCancelSale, onLogActivity }) {
   const canCancel = can(role, 'cancelSales');
   const [cashierFilter, setCashierFilter] = useState('All');
   const [expandedId, setExpandedId] = useState(null);
@@ -3533,8 +3602,8 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
     sale.total.toFixed(2),
     sale.cancelled ? 'Cancelled' : 'Completed',
   ]);
-  const handleDownload = () => downloadCSV('sales-history.csv', exportHeaders, exportRows());
-  const handleDownloadPDF = () => downloadPDF('sales-history.pdf', 'Sales History', exportHeaders, exportRows());
+  const handleDownload = () => { downloadCSV('sales-history.csv', exportHeaders, exportRows()); onLogActivity?.('report_generated', { report: 'Sales History', format: 'CSV' }); };
+  const handleDownloadPDF = () => { downloadPDF('sales-history.pdf', 'Sales History', exportHeaders, exportRows()); onLogActivity?.('report_generated', { report: 'Sales History', format: 'PDF' }); };
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
@@ -3743,6 +3812,9 @@ function MySalesView({ sales }) {
 
 function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   const [userFilter, setUserFilter] = useState('All');
+  const [roleFilter, setRoleFilter] = useState('All');
+  const [typeFilter, setTypeFilter] = useState('All');
+  const [itemFilter, setItemFilter] = useState('All');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   const roleByUid = useMemo(() => {
@@ -3758,56 +3830,93 @@ function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
     return Array.from(set).sort();
   }, [dateFiltered]);
 
-  const filtered = userFilter === 'All' ? dateFiltered : dateFiltered.filter((l) => l.email === userFilter);
+  const types = useMemo(() => {
+    const set = new Set(dateFiltered.map((l) => l.type).filter(Boolean));
+    return Array.from(set).sort();
+  }, [dateFiltered]);
 
-  const exportHeaders = ['Email', 'Role', 'Type', 'Timestamp'];
-  const exportRows = () => filtered.map((l) => [l.email, ROLES[roleByUid[l.uid]] || '—', l.type, new Date(l.timestamp).toLocaleString('en-PH')]);
+  const items = useMemo(() => {
+    const set = new Set(dateFiltered.map((l) => l.meta?.itemSku).filter(Boolean));
+    return Array.from(set).sort();
+  }, [dateFiltered]);
+
+  const filtered = useMemo(() => {
+    return dateFiltered.filter((l) => {
+      const matchesUser = userFilter === 'All' || l.email === userFilter;
+      const matchesRole = roleFilter === 'All' || roleByUid[l.uid] === roleFilter;
+      const matchesType = typeFilter === 'All' || l.type === typeFilter;
+      const matchesItem = itemFilter === 'All' || l.meta?.itemSku === itemFilter;
+      return matchesUser && matchesRole && matchesType && matchesItem;
+    });
+  }, [dateFiltered, userFilter, roleFilter, typeFilter, itemFilter, roleByUid]);
+
+  const exportHeaders = ['Email', 'Role', 'Type', 'Details', 'Timestamp'];
+  const exportRows = () => filtered.map((l) => [
+    l.email, ROLES[roleByUid[l.uid]] || '—', ACTIVITY_TYPE_LABELS[l.type] || l.type,
+    describeActivity(l), new Date(l.timestamp).toLocaleString('en-PH'),
+  ]);
   const handleDownload = () => downloadCSV('activity-log.csv', exportHeaders, exportRows());
   const handleDownloadPDF = () => downloadPDF('activity-log.pdf', 'Activity Log', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
-      <div style={{ ...styles.filterBar, marginBottom: users.length > 0 ? 8 : 16 }} className="depot-no-print depot-filterbar">
+      <div style={{ ...styles.filterBar, marginBottom: 8 }} className="depot-no-print depot-filterbar">
         <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
       </div>
-      {users.length > 0 && (
-        <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+      <div style={{ ...styles.filterBar, flexWrap: 'wrap' }} className="depot-no-print depot-filterbar">
+        {users.length > 0 && (
           <select className="depot-select" value={userFilter} onChange={(e) => setUserFilter(e.target.value)} style={styles.select}>
             <option value="All">All Users</option>
             {users.map((u) => <option key={u} value={u}>{u}</option>)}
           </select>
-        </div>
-      )}
+        )}
+        <select className="depot-select" value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)} style={styles.select}>
+          <option value="All">All Roles</option>
+          {Object.keys(ROLES).map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}
+        </select>
+        <select className="depot-select" value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} style={styles.select}>
+          <option value="All">All Activity Types</option>
+          {types.map((t) => <option key={t} value={t}>{ACTIVITY_TYPE_LABELS[t] || t}</option>)}
+        </select>
+        {items.length > 0 && (
+          <select className="depot-select" value={itemFilter} onChange={(e) => setItemFilter(e.target.value)} style={styles.select}>
+            <option value="All">All Items</option>
+            {items.map((sku) => <option key={sku} value={sku}>{sku}</option>)}
+          </select>
+        )}
+      </div>
       {filtered.length === 0 ? (
-        <div style={styles.panel}><div style={styles.emptyState}>No activity recorded yet.</div></div>
+        <div style={styles.panel}><div style={styles.emptyState}>No activity matches your filters.</div></div>
       ) : (
         <div style={styles.tableWrap} className="depot-scroll">
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Email', 'Role', 'Event', 'Timestamp'].map((h) => (
+                {['Email', 'Role', 'Event', 'Details', 'Timestamp'].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {filtered.map((l) => (
-                <tr key={l.id} className="depot-row">
-                  <td style={styles.td}>{l.email}</td>
-                  <td style={styles.td}><span style={styles.pill}>{ROLES[roleByUid[l.uid]] || '—'}</span></td>
-                  <td style={styles.td}>
-                    {l.type === 'login' ? (
-                      <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Login</span>
-                    ) : (
-                      <span style={{ ...styles.statusPill, background: 'rgba(20,33,61,0.08)', color: 'var(--ink)' }}>Logout</span>
-                    )}
-                  </td>
-                  <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
-                    {new Date(l.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                  </td>
-                </tr>
-              ))}
+              {filtered.map((l) => {
+                const badge = activityBadgeColors(l.type);
+                return (
+                  <tr key={l.id} className="depot-row">
+                    <td style={styles.td}>{l.email}</td>
+                    <td style={styles.td}><span style={styles.pill}>{ROLES[roleByUid[l.uid]] || '—'}</span></td>
+                    <td style={styles.td}>
+                      <span style={{ ...styles.statusPill, background: badge.bg, color: badge.color }}>
+                        {ACTIVITY_TYPE_LABELS[l.type] || l.type}
+                      </span>
+                    </td>
+                    <td style={{ ...styles.td, fontSize: 12.5, color: 'rgba(59,42,31,0.75)' }}>{describeActivity(l)}</td>
+                    <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
+                      {new Date(l.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
