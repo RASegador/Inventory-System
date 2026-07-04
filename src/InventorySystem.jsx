@@ -388,6 +388,28 @@ function daysUntilExpiration(subscription) {
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
+// Convert between a timestamp and the yyyy-mm-dd string an <input type="date">
+// needs, in LOCAL time (not UTC) so the date shown always matches the date
+// actually intended, regardless of timezone offset.
+function timestampToDateInputValue(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// endOfDay=true gives 23:59:59.999 that date (for an end date), otherwise
+// midnight (for a start date) - both in local time.
+function dateInputValueToTimestamp(value, endOfDay) {
+  if (!value) return null;
+  const [y, m, d] = value.split('-').map(Number);
+  return endOfDay
+    ? new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+    : new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
+}
+
 function ExportBar({ onPrint, onDownload, onDownloadPDF }) {
   return (
     <div className="depot-no-print depot-export-bar" style={styles.exportBar}>
@@ -1041,21 +1063,22 @@ export default function InventorySystem() {
     }
   };
 
-  // Super Admin only. Month/Year fully determine the period's start/end
-  // dates (auto-derived, never separately editable) - so the only thing
-  // that can actually change on an EXISTING period is payment status.
-  // Creating a period for a month/year that doesn't exist yet in this
-  // client's history appends a new entry; picking one that already exists
-  // updates it in place (e.g. flipping Paid/Unpaid).
-  const saveSubscriptionPeriod = async (clientUid, { month, year, paymentStatus }) => {
+  // Super Admin only. Month/Year still label and identify each period (used
+  // to file it under a specific month for the Monthly Report and history
+  // list), but the actual startDate/endDate are now whatever the admin
+  // sets them to - not forced to calendar-month boundaries, so a
+  // subscription can start/end on any specific date. Creating a period for
+  // a month/year that doesn't exist yet in this client's history appends a
+  // new entry; picking one that already exists updates it in place.
+  const saveSubscriptionPeriod = async (clientUid, { month, year, startDate, endDate, paymentStatus }) => {
     if (myRole !== 'superadmin') { showToast("You don't have permission to manage subscriptions"); return; }
     const client = approvedUsers.find((u) => u.id === clientUid);
     if (!client) { showToast('Client not found'); return; }
-    const { start, end } = computeSubscriptionPeriod(month, year);
+    if (!startDate || !endDate || endDate < startDate) { showToast('Pick a valid start and end date (end must be after start)'); return; }
     const history = client.subscription?.history || [];
     const idx = history.findIndex((p) => p.month === month && p.year === year);
     const isNew = idx < 0;
-    const entry = { month, year, startDate: start, endDate: end, paymentStatus, setAt: Date.now(), setBy: user.email || user.uid };
+    const entry = { month, year, startDate, endDate, paymentStatus, setAt: Date.now(), setBy: user.email || user.uid };
     const newHistory = isNew ? [...history, entry] : history.map((p, i) => (i === idx ? entry : p));
     const monthLabel = `${MONTH_NAMES[month - 1]} ${year}`;
 
@@ -2921,7 +2944,13 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
         return canAccessView(role, entry.key) ? entry : null;
       }
       const children = entry.children.filter((c) => canAccessView(role, c.key));
-      return children.length ? { ...entry, children } : null;
+      if (children.length === 0) return null;
+      if (children.length === 1) {
+        // Only one visible child - show it as a flat item instead of a
+        // dropdown group wrapping a single link.
+        return { type: 'item', key: children[0].key, label: children[0].label, icon: children[0].icon, badge: children[0].badge };
+      }
+      return { ...entry, children };
     })
     .filter(Boolean);
 
@@ -3718,18 +3747,46 @@ function SubscriptionModal({ client, onClose, onSave }) {
   const [paymentStatus, setPaymentStatus] = useState('unpaid');
   const [busy, setBusy] = useState(false);
 
+  const defaultPeriod = computeSubscriptionPeriod(today.getMonth() + 1, today.getFullYear());
+  const [startDateStr, setStartDateStr] = useState(timestampToDateInputValue(defaultPeriod.start));
+  const [endDateStr, setEndDateStr] = useState(timestampToDateInputValue(defaultPeriod.end));
+
   const history = (client.subscription?.history || []).slice().sort((a, b) => (b.year - a.year) || (b.month - a.month));
-  const { start, end } = computeSubscriptionPeriod(month, year);
   const existing = history.find((p) => p.month === month && p.year === year);
+
+  // Changing Month/Year re-fills the date pickers with that calendar
+  // month's defaults (or the existing period's real dates, if one's
+  // already saved for that month) - a convenient starting point that can
+  // still be adjusted freely afterward.
+  const handleMonthYearChange = (newMonth, newYear) => {
+    setMonth(newMonth); setYear(newYear);
+    const match = history.find((p) => p.month === newMonth && p.year === newYear);
+    if (match) {
+      setStartDateStr(timestampToDateInputValue(match.startDate));
+      setEndDateStr(timestampToDateInputValue(match.endDate));
+      setPaymentStatus(match.paymentStatus);
+    } else {
+      const period = computeSubscriptionPeriod(newMonth, newYear);
+      setStartDateStr(timestampToDateInputValue(period.start));
+      setEndDateStr(timestampToDateInputValue(period.end));
+    }
+  };
 
   const loadPeriod = (p) => {
     setMonth(p.month); setYear(p.year); setPaymentStatus(p.paymentStatus);
+    setStartDateStr(timestampToDateInputValue(p.startDate));
+    setEndDateStr(timestampToDateInputValue(p.endDate));
   };
+
+  const startTs = dateInputValueToTimestamp(startDateStr, false);
+  const endTs = dateInputValueToTimestamp(endDateStr, true);
+  const datesValid = startTs && endTs && endTs >= startTs;
 
   const submit = async (e) => {
     e.preventDefault();
+    if (!datesValid) return;
     setBusy(true);
-    await onSave(client.id, { month, year, paymentStatus });
+    await onSave(client.id, { month, year, startDate: startTs, endDate: endTs, paymentStatus });
     setBusy(false);
   };
 
@@ -3744,16 +3801,30 @@ function SubscriptionModal({ client, onClose, onSave }) {
           <div style={styles.modalBody}>
             <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
               <Field label="Month" grow>
-                <select className="depot-select" style={styles.modalInput} value={month} onChange={(e) => setMonth(Number(e.target.value))}>
+                <select className="depot-select" style={styles.modalInput} value={month} onChange={(e) => handleMonthYearChange(Number(e.target.value), year)}>
                   {MONTH_NAMES.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
                 </select>
               </Field>
               <Field label="Year" grow>
-                <input className="depot-input" type="number" style={styles.modalInput} value={year} onChange={(e) => setYear(Number(e.target.value))} />
+                <input className="depot-input" type="number" style={styles.modalInput} value={year} onChange={(e) => handleMonthYearChange(month, Number(e.target.value))} />
               </Field>
             </div>
+            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginBottom: 10 }}>
+              Month/Year files this period for reports and history &mdash; the actual dates below are fully adjustable and don't have to match the calendar month.
+            </div>
+            <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+              <Field label="Start Date" grow>
+                <input className="depot-input" type="date" style={styles.modalInput} value={startDateStr} onChange={(e) => setStartDateStr(e.target.value)} />
+              </Field>
+              <Field label="End Date" grow>
+                <input className="depot-input" type="date" style={styles.modalInput} value={endDateStr} onChange={(e) => setEndDateStr(e.target.value)} />
+              </Field>
+            </div>
+            {!datesValid && (
+              <div style={{ fontSize: 12, color: 'var(--red)', marginBottom: 6 }}>End date must be on or after the start date.</div>
+            )}
             <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginBottom: 10 }}>
-              Period: {formatDate(start)} &ndash; {formatDate(end)}{existing ? ' (already exists — saving will update it)' : ' (new period)'}
+              {existing ? 'A period already exists for this month — saving will update it.' : 'This will be saved as a new period.'}
             </div>
             <Field label="Payment Status">
               <div style={{ display: 'flex', gap: 8 }}>
@@ -3808,7 +3879,7 @@ function SubscriptionModal({ client, onClose, onSave }) {
           </div>
           <div style={styles.modalFooter}>
             <button type="button" className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-            <button type="submit" className="depot-btn" style={{ ...styles.primaryBtn, opacity: busy ? 0.6 : 1 }} disabled={busy}>
+            <button type="submit" className="depot-btn" style={{ ...styles.primaryBtn, opacity: (busy || !datesValid) ? 0.6 : 1 }} disabled={busy || !datesValid}>
               {busy ? 'Saving…' : 'Save Subscription'}
             </button>
           </div>
