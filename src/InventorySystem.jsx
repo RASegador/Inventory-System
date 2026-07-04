@@ -326,6 +326,18 @@ function computeSellingPrice(baseCost, markupType, markupValue) {
   return Math.round(price * 100) / 100;
 }
 
+// Reverse direction: Base Price and Selling Price are entered directly, and
+// the markup (both as a peso amount and as a percentage) is derived purely
+// for display - it's read-only, never the source of truth. Guards against
+// divide-by-zero when base cost is 0.
+function computeMarkupFromPrices(baseCost, sellingPrice) {
+  const cost = Math.max(0, Number(baseCost) || 0);
+  const price = Math.max(0, Number(sellingPrice) || 0);
+  const amount = Math.round((price - cost) * 100) / 100;
+  const percent = cost > 0 ? Math.round((amount / cost) * 10000) / 100 : 0;
+  return { amount, percent };
+}
+
 function ExportBar({ onPrint, onDownload, onDownloadPDF }) {
   return (
     <div className="depot-no-print depot-export-bar" style={styles.exportBar}>
@@ -1131,12 +1143,12 @@ export default function InventorySystem() {
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
-    const markupType = draft.markupType === 'fixed' ? 'fixed' : 'percent';
-    const markupValue = Math.max(0, Number(draft.markupValue) || 0);
-    const sellingPrice = computeSellingPrice(unitCost, markupType, markupValue);
+    const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
+    const { percent: markupValue } = computeMarkupFromPrices(unitCost, sellingPrice);
+    const markupType = 'percent';
     const previous = isNew ? null : items.find((i) => i.id === id);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, unitCost, markupType, markupValue, sellingPrice });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, unitCost, sellingPrice, markupType, markupValue });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -1247,25 +1259,25 @@ export default function InventorySystem() {
     setAssignModal(null);
   };
 
-  // Staff can only ever touch the markup on their OWN assigned items - base
-  // cost, quantity, SKU, and everything else stays admin-controlled. Also
-  // usable by a manager adjusting markup directly, since it's just a subset
-  // of what saveItem already allows them.
-  const updateMarkup = async (item, markupType, markupValue) => {
+  // Staff can only ever touch the selling price on their OWN assigned
+  // items - base cost, quantity, SKU, and everything else stays
+  // admin-controlled. Also usable by a manager adjusting price directly,
+  // since it's just a subset of what saveItem already allows them.
+  const updateMarkup = async (item, sellingPriceInput) => {
     const isOwnItem = item.holderId === user.uid;
     if (!isOwnItem && !can(myRole, 'editInventory')) {
       showToast("You don't have permission to edit this item");
       return;
     }
-    const mt = markupType === 'fixed' ? 'fixed' : 'percent';
-    const mv = Math.max(0, Number(markupValue) || 0);
-    const sellingPrice = computeSellingPrice(item.unitCost, mt, mv);
+    const sellingPrice = Math.max(0, Number(sellingPriceInput) || 0);
+    const { percent: markupValue } = computeMarkupFromPrices(item.unitCost, sellingPrice);
+    const markupType = 'percent';
     try {
-      await setDoc(doc(db, 'items', item.id), { markupType: mt, markupValue: mv, sellingPrice }, { merge: true });
-      logActivity('markup_changed', { itemSku: item.sku, itemName: item.name, markupType: mt, markupValue: mv });
-      showToast(`Markup updated for ${item.sku}`);
+      await setDoc(doc(db, 'items', item.id), { markupType, markupValue, sellingPrice }, { merge: true });
+      logActivity('markup_changed', { itemSku: item.sku, itemName: item.name, markupType, markupValue });
+      showToast(`Price updated for ${item.sku}`);
     } catch (e) {
-      showToast('Could not update markup — check your connection');
+      showToast('Could not update price — check your connection');
     }
     setMarkupModal(null);
   };
@@ -1572,6 +1584,30 @@ export default function InventorySystem() {
     return items.filter((it) => !it.holderId || it.holderId === ownerId);
   }, [items, myRole, ownerId]);
 
+  // Total value of stock currently OUT with staff (assigned, not sitting in
+  // the admin's own inventory), broken down per staff member - managers
+  // only, since it's derived from the whole-tenant `items` state they alone
+  // have access to.
+  const staffInventoryStats = useMemo(() => {
+    if (myRole === 'staff') return { total: 0, byStaff: [] };
+    const staffItems = items.filter((it) => it.holderId && it.holderId !== ownerId);
+    const total = staffItems.reduce((s, it) => s + it.quantity * it.unitCost, 0);
+    const byStaffMap = {};
+    staffItems.forEach((it) => {
+      if (!byStaffMap[it.holderId]) byStaffMap[it.holderId] = { staffUid: it.holderId, value: 0, skuCount: 0, units: 0 };
+      byStaffMap[it.holderId].value += it.quantity * it.unitCost;
+      byStaffMap[it.holderId].skuCount += 1;
+      byStaffMap[it.holderId].units += it.quantity;
+    });
+    const byStaff = Object.values(byStaffMap)
+      .map((s) => {
+        const staffUser = approvedUsers.find((u) => u.id === s.staffUid);
+        return { ...s, name: staffUser?.fullName || staffUser?.email || 'Unknown Staff' };
+      })
+      .sort((a, b) => b.value - a.value);
+    return { total, byStaff };
+  }, [items, ownerId, myRole, approvedUsers]);
+
   const filtered = useMemo(() => {
     let list = myOwnItems.filter((it) => {
       const matchesSearch =
@@ -1764,7 +1800,7 @@ export default function InventorySystem() {
         ) : (
         <>
         {view === 'overview' && (
-          <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} role={myRole} onQuickMove={(it) => setMoveModal(it)} />
+          <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} staffInventoryStats={staffInventoryStats} role={myRole} onQuickMove={(it) => setMoveModal(it)} />
         )}
 
         {view === 'inventory' && (
@@ -2688,8 +2724,10 @@ function StatCard({ icon: Icon, label, value, accent }) {
   );
 }
 
-function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
+function Overview({ totals, categoryData, profitStats, staffInventoryStats, role, onQuickMove }) {
   const canViewProfit = can(role, 'viewSalesReports');
+  const canViewMySales = can(role, 'viewOwnSales');
+  const canViewStaffInventory = can(role, 'editInventory');
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <div style={styles.statGrid} className="depot-stat-grid">
@@ -2814,6 +2852,77 @@ function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
                 </div>
               )}
             </div>
+          </div>
+        </>
+      )}
+
+      {/* Value of stock currently out with staff, broken down per staff
+          member - managers only, same tier as the Staff Inventory
+          management page itself. */}
+      {canViewStaffInventory && (
+        <>
+          <div style={{ ...styles.panelHeader, marginTop: 24, marginBottom: 10 }}>
+            <User size={15} />
+            <span>STAFF INVENTORY VALUE</span>
+          </div>
+          <div style={styles.statGrid} className="depot-stat-grid">
+            <StatCard icon={PesoIcon} label="Total Value With Staff" value={currency(staffInventoryStats.total)} accent="var(--green)" />
+            <StatCard icon={User} label="Staff Holding Stock" value={staffInventoryStats.byStaff.length} accent="var(--blueprint)" />
+          </div>
+          <div style={styles.panel}>
+            {staffInventoryStats.byStaff.length === 0 ? (
+              <div style={styles.emptyState}>No inventory has been assigned to staff yet.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }}>
+                {staffInventoryStats.byStaff.map((s) => (
+                  <div key={s.staffUid} style={styles.watchRow}>
+                    <div>
+                      <div style={styles.watchSku}>{s.name}</div>
+                      <div style={styles.watchName}>{s.skuCount} SKU{s.skuCount === 1 ? '' : 's'} · {s.units} unit{s.units === 1 ? '' : 's'}</div>
+                    </div>
+                    <span style={{ fontWeight: 700, fontFamily: "'Quicksand', sans-serif", color: 'var(--ink)' }}>{currency(s.value)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* A staff member's own sales performance - their own scoped data
+          only, since `profitStats` is already computed from whatever
+          `sales` this role can see (their own sales, for staff). */}
+      {canViewMySales && (
+        <>
+          <div style={{ ...styles.panelHeader, marginTop: 24, marginBottom: 10 }}>
+            <Receipt size={15} />
+            <span>MY SALES</span>
+          </div>
+          <div style={styles.statGrid} className="depot-stat-grid">
+            <StatCard icon={Receipt} label="My Total Revenue" value={currency(profitStats.totalRevenue)} accent="var(--blueprint)" />
+            <StatCard icon={PesoIcon} label="My Total Profit" value={currency(profitStats.totalProfit)} accent={profitStats.totalProfit >= 0 ? 'var(--green)' : 'var(--red)'} />
+            <StatCard icon={CheckCircle2} label="My Margin" value={`${profitStats.margin.toFixed(1)}%`} accent={profitStats.margin >= 0 ? 'var(--green)' : 'var(--red)'} />
+          </div>
+          <div style={styles.panel}>
+            <div style={styles.panelHeader}>
+              <ScrollText size={15} />
+              <span>MY RECENT SALES</span>
+            </div>
+            {profitStats.perSale.length === 0 ? (
+              <div style={styles.emptyState}>No sales recorded yet — ring one up in Point of Sale.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+                {profitStats.perSale.map((s) => (
+                  <div key={s.id} style={styles.watchRow}>
+                    <div>
+                      <div style={styles.watchSku}>{s.receiptNo}</div>
+                      <div style={styles.watchName}>{formatDate(s.timestamp)} · Revenue {currency(s.revenue)}</div>
+                    </div>
+                    <span style={{ fontWeight: 700, color: s.profit >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(s.profit)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </>
       )}
@@ -4573,18 +4682,17 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
     if (!draft) {
       return {
         sku: '', name: '', category: categories[0] || '', quantity: 0, reorderPoint: 10, unitCost: 0,
-        location: locations[0] || '', supplierIds: [], markupType: 'percent', markupValue: 0,
+        location: locations[0] || '', supplierIds: [], sellingPrice: 0,
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
     return {
       ...rest, supplierIds: getSupplierIds(draft),
-      markupType: draft.markupType === 'fixed' ? 'fixed' : 'percent',
-      markupValue: draft.markupValue ?? 0,
+      sellingPrice: draft.sellingPrice ?? draft.unitCost ?? 0,
     };
   });
   const valid = form.sku.trim() && form.name.trim();
-  const sellingPricePreview = computeSellingPrice(form.unitCost, form.markupType, form.markupValue);
+  const markup = computeMarkupFromPrices(form.unitCost, form.sellingPrice);
   const toggleSupplier = (sid) => {
     setForm({
       ...form,
@@ -4658,20 +4766,18 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Markup Type" grow>
-              <select className="depot-select" style={styles.modalInput} value={form.markupType}
-                onChange={(e) => setForm({ ...form, markupType: e.target.value })}>
-                <option value="percent">Percentage</option>
-                <option value="fixed">Fixed Amount (₱)</option>
-              </select>
+            <Field label="Selling Price (₱)" grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.sellingPrice}
+                onChange={(e) => setForm({ ...form, sellingPrice: Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label={form.markupType === 'fixed' ? 'Markup (₱)' : 'Markup (%)'} grow>
-              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.markupValue}
-                onChange={(e) => setForm({ ...form, markupValue: Math.max(0, Number(e.target.value)) })} />
-            </Field>
-            <Field label="Selling Price" grow>
-              <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(79,138,99,0.08)', fontWeight: 700, color: 'var(--green)' }}>
-                {currency(sellingPricePreview)}
+            <Field label="Markup" grow>
+              <div style={{
+                ...styles.modalInput, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                background: markup.amount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                fontWeight: 700, color: markup.amount >= 0 ? 'var(--green)' : 'var(--red)',
+              }}>
+                <span>{currency(markup.amount)}</span>
+                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markup.percent.toFixed(1)}%</span>
               </div>
             </Field>
           </div>
@@ -4881,20 +4987,19 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
 }
 
 function MarkupModal({ item, onClose, onSave }) {
-  const [markupType, setMarkupType] = useState(item.markupType === 'fixed' ? 'fixed' : 'percent');
-  const [markupValue, setMarkupValue] = useState(item.markupValue || 0);
-  const sellingPricePreview = computeSellingPrice(item.unitCost, markupType, markupValue);
+  const [sellingPrice, setSellingPrice] = useState(item.sellingPrice ?? item.unitCost ?? 0);
+  const markup = computeMarkupFromPrices(item.unitCost, sellingPrice);
 
   return (
     <div style={styles.overlay} onClick={onClose}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
-          <span>UPDATE MARKUP — {item.sku}</span>
+          <span>UPDATE PRICE — {item.sku}</span>
           <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
         </div>
         <div style={styles.modalBody}>
           <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
-            Base cost is set by your Client Admin and can't be changed here — only your markup.
+            Base cost is set by your Client Admin and can't be changed here — only your selling price.
           </div>
           <Field label="Base Cost (₱)">
             <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(59,42,31,0.05)', color: 'rgba(59,42,31,0.6)' }}>
@@ -4902,27 +5007,26 @@ function MarkupModal({ item, onClose, onSave }) {
             </div>
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Markup Type" grow>
-              <select className="depot-select" style={styles.modalInput} value={markupType} onChange={(e) => setMarkupType(e.target.value)}>
-                <option value="percent">Percentage</option>
-                <option value="fixed">Fixed Amount (₱)</option>
-              </select>
-            </Field>
-            <Field label={markupType === 'fixed' ? 'Markup (₱)' : 'Markup (%)'} grow>
+            <Field label="Selling Price (₱)" grow>
               <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
-                value={markupValue} onChange={(e) => setMarkupValue(Math.max(0, Number(e.target.value)))} />
+                value={sellingPrice} onChange={(e) => setSellingPrice(Math.max(0, Number(e.target.value)))} />
             </Field>
-            <Field label="Selling Price" grow>
-              <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(79,138,99,0.08)', fontWeight: 700, color: 'var(--green)' }}>
-                {currency(sellingPricePreview)}
+            <Field label="Markup" grow>
+              <div style={{
+                ...styles.modalInput, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                background: markup.amount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                fontWeight: 700, color: markup.amount >= 0 ? 'var(--green)' : 'var(--red)',
+              }}>
+                <span>{currency(markup.amount)}</span>
+                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markup.percent.toFixed(1)}%</span>
               </div>
             </Field>
           </div>
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item, markupType, markupValue)}>
-            Save Markup
+          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item, sellingPrice)}>
+            Save Price
           </button>
         </div>
       </div>
