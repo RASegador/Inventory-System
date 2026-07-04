@@ -1174,57 +1174,75 @@ export default function InventorySystem() {
   // creating a duplicate line. The staff member's copy gets its own
   // independent quantity and starts with no markup - they set their own
   // from there.
-  const assignInventoryToStaff = async ({ sourceItemId, staffUid, quantity, unitCost }) => {
+  // Assigns a whole batch of items to one staff member in a single action -
+  // each line gets its own quantity/base cost, transferred out of the
+  // admin's own stock and into (or topped up in) that staff member's own
+  // separate inventory, with movements logged on both sides for every line.
+  const assignInventoryToStaff = async (staffUid, lines) => {
     if (!can(myRole, 'editInventory')) { showToast("You don't have permission to assign inventory"); return; }
-    const source = items.find((i) => i.id === sourceItemId);
     const staff = approvedUsers.find((u) => u.id === staffUid);
-    if (!source || !staff) { showToast('Pick an item and a staff member'); return; }
-    const qty = Math.max(1, Number(quantity) || 0);
-    if (qty > source.quantity) { showToast(`Only ${source.quantity} available to assign`); return; }
-    const cost = Math.max(0, Number(unitCost) || 0) || source.unitCost;
+    if (!staff || !lines || lines.length === 0) { showToast('Pick a staff member and at least one item'); return; }
+
     const now = Date.now();
-    const existing = items.find((i) => i.holderId === staffUid && i.sourceItemId === sourceItemId);
+    let successCount = 0;
+    const failedSkus = [];
 
-    try {
-      await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty });
-
-      let staffItemId;
-      if (existing) {
-        staffItemId = existing.id;
-        const newQty = existing.quantity + qty;
-        await setDoc(doc(db, 'items', existing.id), {
-          ...existing, quantity: newQty, unitCost: cost,
-          sellingPrice: computeSellingPrice(cost, existing.markupType || 'percent', existing.markupValue || 0),
-        });
-      } else {
-        staffItemId = 'i' + Math.random().toString(36).slice(2, 9);
-        const markupType = 'percent';
-        const markupValue = 0;
-        await setDoc(doc(db, 'items', staffItemId), {
-          id: staffItemId, ownerId, holderId: staffUid, sourceItemId: source.id,
-          sku: source.sku, name: source.name, category: source.category,
-          quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
-          location: source.location, supplierIds: getSupplierIds(source),
-          markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
-        });
+    for (const line of lines) {
+      const source = items.find((i) => i.id === line.itemId);
+      const qty = Math.max(1, Number(line.quantity) || 0);
+      if (!source || qty > source.quantity) {
+        failedSkus.push(source?.sku || line.itemId);
+        continue;
       }
+      const cost = Math.max(0, Number(line.unitCost) || 0) || source.unitCost;
+      const existing = items.find((i) => i.holderId === staffUid && i.sourceItemId === source.id);
 
-      const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
-      await setDoc(doc(db, 'movements', mvOut), {
-        id: mvOut, itemId: source.id, type: 'out', qty,
-        reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId,
-      });
-      const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
-      await setDoc(doc(db, 'movements', mvIn), {
-        id: mvIn, itemId: staffItemId, type: 'in', qty,
-        reason: 'Received from Client Admin', timestamp: now, ownerId,
-      });
+      try {
+        await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty });
 
-      playAddSound();
-      logActivity('inventory_assigned', { itemSku: source.sku, itemName: source.name, qty, targetEmail: staff.email });
-      showToast(`Assigned ${qty} × ${source.sku} to ${staff.fullName || staff.email}`);
-    } catch (e) {
-      showToast('Could not assign inventory — check your connection');
+        let staffItemId;
+        if (existing) {
+          staffItemId = existing.id;
+          await setDoc(doc(db, 'items', existing.id), {
+            ...existing, quantity: existing.quantity + qty, unitCost: cost,
+            sellingPrice: computeSellingPrice(cost, existing.markupType || 'percent', existing.markupValue || 0),
+          });
+        } else {
+          staffItemId = 'i' + Math.random().toString(36).slice(2, 9);
+          const markupType = 'percent';
+          const markupValue = 0;
+          await setDoc(doc(db, 'items', staffItemId), {
+            id: staffItemId, ownerId, holderId: staffUid, sourceItemId: source.id,
+            sku: source.sku, name: source.name, category: source.category,
+            quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
+            location: source.location, supplierIds: getSupplierIds(source),
+            markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
+          });
+        }
+
+        const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'movements', mvOut), {
+          id: mvOut, itemId: source.id, type: 'out', qty,
+          reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId,
+        });
+        const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'movements', mvIn), {
+          id: mvIn, itemId: staffItemId, type: 'in', qty,
+          reason: 'Received from Client Admin', timestamp: now, ownerId,
+        });
+
+        logActivity('inventory_assigned', { itemSku: source.sku, itemName: source.name, qty, targetEmail: staff.email });
+        successCount++;
+      } catch (e) {
+        failedSkus.push(source.sku);
+      }
+    }
+
+    if (successCount > 0) playAddSound();
+    if (failedSkus.length === 0) {
+      showToast(`Assigned ${successCount} item${successCount === 1 ? '' : 's'} to ${staff.fullName || staff.email}`);
+    } else {
+      showToast(`Assigned ${successCount} item(s); couldn't assign: ${failedSkus.join(', ')}`);
     }
     setAssignModal(null);
   };
@@ -4725,37 +4743,53 @@ function SupplierModal({ draft, onClose, onSave }) {
 }
 
 function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
-  const [sourceItemId, setSourceItemId] = useState('');
   const [staffUid, setStaffUid] = useState('');
-  const [quantity, setQuantity] = useState(1);
-  const [unitCost, setUnitCost] = useState(0);
+  const [lines, setLines] = useState([]); // [{itemId, quantity, unitCost}]
+  const [draftItemId, setDraftItemId] = useState('');
+  const [draftQty, setDraftQty] = useState(1);
+  const [draftCost, setDraftCost] = useState(0);
 
-  const source = myOwnItems.find((it) => it.id === sourceItemId);
+  const draftSource = myOwnItems.find((it) => it.id === draftItemId);
+  const availableItems = myOwnItems.filter((it) => it.quantity > 0);
 
-  const handleItemChange = (id) => {
-    setSourceItemId(id);
+  const handleDraftItemChange = (id) => {
+    setDraftItemId(id);
     const it = myOwnItems.find((i) => i.id === id);
-    if (it) setUnitCost(it.unitCost);
+    if (it) setDraftCost(it.unitCost);
   };
 
-  const valid = sourceItemId && staffUid && Number(quantity) > 0 && source && Number(quantity) <= source.quantity;
+  const draftValid = draftItemId && Number(draftQty) > 0 && draftSource && Number(draftQty) <= draftSource.quantity;
+
+  const addLine = () => {
+    if (!draftValid) return;
+    setLines((prev) => {
+      // If this item's already queued, just update it rather than adding a
+      // confusing duplicate row.
+      const existingIdx = prev.findIndex((l) => l.itemId === draftItemId);
+      const newLine = { itemId: draftItemId, quantity: Number(draftQty), unitCost: Number(draftCost) };
+      if (existingIdx >= 0) {
+        const copy = [...prev];
+        copy[existingIdx] = newLine;
+        return copy;
+      }
+      return [...prev, newLine];
+    });
+    setDraftItemId(''); setDraftQty(1); setDraftCost(0);
+  };
+
+  const removeLine = (itemId) => setLines((prev) => prev.filter((l) => l.itemId !== itemId));
+
+  const total = lines.reduce((s, l) => s + l.quantity * l.unitCost, 0);
+  const canSubmit = staffUid && lines.length > 0;
 
   return (
     <div style={styles.overlay} onClick={onClose}>
-      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+      <div style={{ ...styles.modal, maxWidth: 560 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>ASSIGN INVENTORY TO STAFF</span>
           <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
         </div>
         <div style={styles.modalBody}>
-          <Field label="Item (from your own inventory)">
-            <select className="depot-select" style={styles.modalInput} value={sourceItemId}
-              onChange={(e) => handleItemChange(e.target.value)}>
-              <option value="">— Select an item —</option>
-              {myOwnItems.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name} ({it.quantity} on hand)</option>)}
-            </select>
-          </Field>
-
           <Field label="Staff Member">
             <select className="depot-select" style={styles.modalInput} value={staffUid} onChange={(e) => setStaffUid(e.target.value)}>
               <option value="">— Select a staff member —</option>
@@ -4763,28 +4797,82 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
             </select>
           </Field>
 
-          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Quantity to Assign" grow>
-              <input className="depot-input" type="number" min="1" max={source?.quantity || 1} style={styles.modalInput}
-                value={quantity} onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
-            </Field>
-            <Field label="Base Cost (₱)" grow>
-              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
-                value={unitCost} onChange={(e) => setUnitCost(Math.max(0, Number(e.target.value)))} />
-            </Field>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginTop: 14, marginBottom: 8 }}>
+            Add items to this assignment
           </div>
-          {source && Number(quantity) > source.quantity && (
-            <div style={{ fontSize: 12, color: 'var(--red)' }}>Only {source.quantity} available in your inventory.</div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+            <div style={{ flex: '2 1 200px' }}>
+              <Field label="Item (from your own inventory)">
+                <select className="depot-select" style={styles.modalInput} value={draftItemId} onChange={(e) => handleDraftItemChange(e.target.value)}>
+                  <option value="">— Select an item —</option>
+                  {availableItems.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name} ({it.quantity} on hand)</option>)}
+                </select>
+              </Field>
+            </div>
+            <div style={{ flex: '1 1 90px' }}>
+              <Field label="Qty">
+                <input className="depot-input" type="number" min="1" max={draftSource?.quantity || 1} style={styles.modalInput}
+                  value={draftQty} onChange={(e) => setDraftQty(Math.max(1, Number(e.target.value)))} />
+              </Field>
+            </div>
+            <div style={{ flex: '1 1 110px' }}>
+              <Field label="Base Cost (₱)">
+                <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
+                  value={draftCost} onChange={(e) => setDraftCost(Math.max(0, Number(e.target.value)))} />
+              </Field>
+            </div>
+            <div style={{ flex: '0 0 auto', paddingBottom: 2 }}>
+              <button type="button" className="depot-btn" style={{ ...styles.smallAmberBtn, opacity: draftValid ? 1 : 0.45 }} disabled={!draftValid} onClick={addLine}>
+                <Plus size={14} /> Add
+              </button>
+            </div>
+          </div>
+          {draftSource && Number(draftQty) > draftSource.quantity && (
+            <div style={{ fontSize: 12, color: 'var(--red)', marginTop: 4 }}>Only {draftSource.quantity} available in your inventory.</div>
           )}
-          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>
+
+          {lines.length > 0 && (
+            <div style={{ marginTop: 16, border: '1px solid rgba(59,42,31,0.15)', borderRadius: 6, overflow: 'hidden' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr>
+                    {['Item', 'Qty', 'Base Cost', 'Line Total', ''].map((h) => (
+                      <th key={h} style={{ ...styles.th, padding: '6px 10px', fontSize: 10.5 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {lines.map((l) => {
+                    const it = myOwnItems.find((i) => i.id === l.itemId);
+                    return (
+                      <tr key={l.itemId}>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5 }}>{it ? `${it.sku} — ${it.name}` : l.itemId}</td>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5 }}>{l.quantity}</td>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5 }}>{currency(l.unitCost)}</td>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5, fontWeight: 600 }}>{currency(l.quantity * l.unitCost)}</td>
+                        <td style={{ padding: '6px 10px', textAlign: 'right' }}>
+                          <IconBtn onClick={() => removeLine(l.itemId)} title="Remove" danger><X size={13} /></IconBtn>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <div style={{ padding: '8px 10px', fontSize: 12.5, textAlign: 'right', borderTop: '1px solid rgba(59,42,31,0.1)', background: 'rgba(20,33,61,0.02)' }}>
+                {lines.length} item{lines.length === 1 ? '' : 's'} · Total value: <strong>{currency(total)}</strong>
+              </div>
+            </div>
+          )}
+
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 14 }}>
             This moves stock out of your own inventory into this staff member's separate inventory. They'll set their own markup from there.
           </div>
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
-            disabled={!valid} onClick={() => onSave({ sourceItemId, staffUid, quantity, unitCost })}>
-            Assign
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: canSubmit ? 1 : 0.45 }}
+            disabled={!canSubmit} onClick={() => onSave(staffUid, lines)}>
+            Assign {lines.length > 0 ? `${lines.length} Item${lines.length === 1 ? '' : 's'}` : ''}
           </button>
         </div>
       </div>
