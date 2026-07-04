@@ -1637,6 +1637,23 @@ export default function InventorySystem() {
     setConfirmModal(null);
   };
 
+  // Client Admin only (not Super Admin, who has no sales access at all) -
+  // permanently removes an already-cancelled sale record from the table.
+  // Only ever allowed on sales that are already cancelled, since a live
+  // sale should go through Cancel first (which restores stock) rather
+  // than being deleted outright.
+  const deleteSale = async (sale) => {
+    if (myRole !== 'client') { showToast("You don't have permission to delete sales"); return; }
+    if (!sale.cancelled) { showToast('Only cancelled sales can be deleted'); return; }
+    try {
+      await deleteDoc(doc(db, 'sales', sale.id));
+      showToast(`Sale ${sale.receiptNo} deleted`);
+    } catch (e) {
+      showToast('Could not delete sale — check your connection');
+    }
+    setConfirmModal(null);
+  };
+
   const saveOrder = async (draft) => {
     if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
     const item = items.find((i) => i.id === draft.itemId);
@@ -2016,7 +2033,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'sales' && (
-          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onLogActivity={logActivity} />
+          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onDeleteSale={(sale) => setConfirmModal({ kind: 'sale-delete', target: sale })} onLogActivity={logActivity} />
         )}
 
         {view === 'mysales' && (
@@ -2189,6 +2206,16 @@ export default function InventorySystem() {
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelSale(confirmModal.target)}
           confirmLabel="Cancel Sale"
+        />
+      )}
+
+      {confirmModal && confirmModal.kind === 'sale-delete' && (
+        <ConfirmModal
+          title="DELETE SALE RECORD"
+          message={<>Permanently delete the cancelled sale <strong>{confirmModal.target.receiptNo}</strong>? This only removes the record from your table &mdash; it does not affect stock, since cancelling already restored it. This can't be undone.</>}
+          onCancel={() => setConfirmModal(null)}
+          onConfirm={() => deleteSale(confirmModal.target)}
+          confirmLabel="Delete Sale"
         />
       )}
 
@@ -3851,8 +3878,9 @@ function POSView({ items, onCompleteSale }) {
   );
 }
 
-function SalesHistoryView({ sales, role, onCancelSale, onLogActivity }) {
+function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivity }) {
   const canCancel = can(role, 'cancelSales');
+  const canDeleteSale = role === 'client';
   const [cashierFilter, setCashierFilter] = useState('All');
   const [expandedId, setExpandedId] = useState(null);
   const [dateFrom, setDateFrom] = useState('');
@@ -3987,7 +4015,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onLogActivity }) {
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Receipt', 'Date', 'Cashier', 'Items', ...(showMatchedQtyCol ? ['Qty Sold'] : []), 'Payment', 'Total', 'Status', ...(canCancel ? [''] : [])].map((h) => (
+                {['Receipt', 'Date', 'Cashier', 'Items', ...(showMatchedQtyCol ? ['Qty Sold'] : []), 'Payment', 'Total', 'Status', ...((canCancel || canDeleteSale) ? [''] : [])].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
@@ -3995,7 +4023,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onLogActivity }) {
             <tbody>
               {filtered.map((sale) => {
                 const isOpen = expandedId === sale.id;
-                const colCount = 7 + (showMatchedQtyCol ? 1 : 0) + (canCancel ? 1 : 0);
+                const colCount = 7 + (showMatchedQtyCol ? 1 : 0) + ((canCancel || canDeleteSale) ? 1 : 0);
                 return (
                 <React.Fragment key={sale.id}>
                 <tr className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
@@ -4027,11 +4055,16 @@ function SalesHistoryView({ sales, role, onCancelSale, onLogActivity }) {
                       <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Completed</span>
                     )}
                   </td>
-                  {canCancel && (
+                  {(canCancel || canDeleteSale) && (
                     <td className="depot-no-print" style={{ ...styles.td, textAlign: 'right' }}>
-                      {!sale.cancelled && (
+                      {!sale.cancelled && canCancel && (
                         <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onCancelSale(sale)}>
                           Cancel
+                        </button>
+                      )}
+                      {sale.cancelled && canDeleteSale && (
+                        <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'var(--red)', color: '#fff' }} onClick={() => onDeleteSale(sale)}>
+                          Delete
                         </button>
                       )}
                     </td>
