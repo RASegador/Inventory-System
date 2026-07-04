@@ -16,7 +16,7 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -180,6 +180,7 @@ const ACTIVITY_TYPE_LABELS = {
   inventory_added: 'Inventory Added',
   inventory_edited: 'Inventory Edited',
   inventory_assigned: 'Inventory Assigned',
+  inventory_returned: 'Inventory Returned',
   price_changed: 'Base Price Changed',
   markup_changed: 'Markup Changed',
   sale_completed: 'Sale Completed',
@@ -195,6 +196,7 @@ function describeActivity(l) {
     case 'inventory_added': return `Added item ${m.itemSku || ''}${m.itemName ? ` — ${m.itemName}` : ''}`;
     case 'inventory_edited': return `Edited item ${m.itemSku || ''}${m.itemName ? ` — ${m.itemName}` : ''}`;
     case 'inventory_assigned': return `Assigned ${m.qty ?? ''} × ${m.itemSku || ''} to ${m.targetEmail || '—'}`;
+    case 'inventory_returned': return `Returned ${m.qty ?? ''} × ${m.itemSku || ''}${m.byEmail ? ` (by ${m.byEmail})` : ''}`;
     case 'price_changed': return `Changed base cost of ${m.itemSku || ''} from ${currency(m.oldCost ?? 0)} to ${currency(m.newCost ?? 0)}`;
     case 'markup_changed': return `Updated markup on ${m.itemSku || ''} to ${m.markupType === 'fixed' ? currency(m.markupValue ?? 0) + ' flat' : `${m.markupValue ?? 0}%`}`;
     case 'sale_completed': return `Completed sale ${m.receiptNo || ''} (${currency(m.total ?? 0)})`;
@@ -206,7 +208,7 @@ function describeActivity(l) {
 function activityBadgeColors(type) {
   if (type === 'login' || type === 'sale_completed') return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' };
   if (type === 'logout') return { bg: 'rgba(20,33,61,0.08)', color: 'var(--ink)' };
-  if (type === 'price_changed' || type === 'markup_changed') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
+  if (type === 'price_changed' || type === 'markup_changed' || type === 'inventory_returned') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
   if (type === 'staff_created' || type === 'inventory_assigned') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
   return { bg: 'rgba(20,33,61,0.06)', color: 'var(--ink)' };
 }
@@ -691,6 +693,7 @@ export default function InventorySystem() {
   const [orderModal, setOrderModal] = useState(null);
   const [assignModal, setAssignModal] = useState(null);
   const [markupModal, setMarkupModal] = useState(null);
+  const [returnModal, setReturnModal] = useState(null);
   const [selectedStaffUid, setSelectedStaffUid] = useState('');
   const [confirmModal, setConfirmModal] = useState(null); // {kind: 'item'|'supplier'|'order', target}
   const [deliveryStatusModal, setDeliveryStatusModal] = useState(null);
@@ -1350,6 +1353,66 @@ export default function InventorySystem() {
     setMarkupModal(null);
   };
 
+  // The inverse of assignInventoryToStaff: moves stock OUT of a staff
+  // member's own inventory and back INTO the Client Admin's own inventory
+  // (matched via sourceItemId, the same link assignInventoryToStaff sets
+  // up). Usable by the staff member themselves (returning their own stock)
+  // or by a Client Admin pulling stock back from a staff member directly.
+  const returnInventoryToAdmin = async (staffItem, quantityInput) => {
+    const isOwnItem = staffItem.holderId === user.uid;
+    const isManagerCaller = can(myRole, 'editInventory');
+    if (!isOwnItem && !isManagerCaller) {
+      showToast("You don't have permission to return this item");
+      return;
+    }
+    const qty = Math.max(1, Number(quantityInput) || 0);
+    if (qty > staffItem.quantity) { showToast(`Only ${staffItem.quantity} available to return`); return; }
+
+    // Only a manager (who already has full write access across the whole
+    // tenant) can credit the admin's own item in the same action - a
+    // staff-initiated return only ever touches their OWN held item
+    // (already within their existing quantity permission), never writes to
+    // someone else's inventory doc. If a Client Admin wants to formally
+    // receive stock back, they use this same action themselves.
+    const adminItem = (isManagerCaller && staffItem.sourceItemId)
+      ? items.find((i) => i.id === staffItem.sourceItemId)
+      : null;
+    const now = Date.now();
+    const staffUser = approvedUsers.find((u) => u.id === staffItem.holderId);
+    const staffLabel = isOwnItem ? (user.email || 'you') : (staffUser?.fullName || staffUser?.email || 'staff');
+
+    try {
+      // Never delete the doc here (delete stays manager-only under current
+      // rules) - just reduce to 0. The admin can clean up a zero-quantity
+      // item manually if they want to.
+      const remaining = Math.max(0, staffItem.quantity - qty);
+      await setDoc(doc(db, 'items', staffItem.id), { ...staffItem, quantity: remaining });
+
+      if (adminItem) {
+        await setDoc(doc(db, 'items', adminItem.id), { ...adminItem, quantity: adminItem.quantity + qty });
+      }
+
+      const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'movements', mvOut), {
+        id: mvOut, itemId: staffItem.id, type: 'out', qty,
+        reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+      });
+      if (adminItem) {
+        const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'movements', mvIn), {
+          id: mvIn, itemId: adminItem.id, type: 'in', qty,
+          reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+        });
+      }
+
+      logActivity('inventory_returned', { itemSku: staffItem.sku, itemName: staffItem.name, qty, byEmail: isOwnItem ? user.email : staffUser?.email });
+      showToast(`Returned ${qty} × ${staffItem.sku}${adminItem ? ' to your inventory' : ''}`);
+    } catch (e) {
+      showToast('Could not process return — check your connection');
+    }
+    setReturnModal(null);
+  };
+
   const saveSupplier = async (draft) => {
     if (!can(myRole, 'manageSuppliers')) { showToast("You don't have permission to manage suppliers"); return; }
     const id = draft.id || ('s' + Math.random().toString(36).slice(2, 9));
@@ -1882,6 +1945,7 @@ export default function InventorySystem() {
             onDelete={(it) => setConfirmModal({ kind: 'item', target: it })}
             onMove={(it) => setMoveModal(it)}
             onEditMarkup={(it) => setMarkupModal(it)}
+            onReturn={(it) => setReturnModal(it)}
           />
         )}
 
@@ -1895,6 +1959,7 @@ export default function InventorySystem() {
             onEdit={(it) => setItemModal(it)}
             onDelete={(it) => setConfirmModal({ kind: 'item', target: it })}
             onMove={(it) => setMoveModal(it)}
+            onReturn={(it) => setReturnModal(it)}
           />
         )}
 
@@ -2059,6 +2124,15 @@ export default function InventorySystem() {
           item={markupModal}
           onClose={() => setMarkupModal(null)}
           onSave={updateMarkup}
+        />
+      )}
+
+      {returnModal && (
+        <ReturnInventoryModal
+          item={returnModal}
+          hasDestination={!!(can(myRole, 'editInventory') && returnModal.sourceItemId && items.some((i) => i.id === returnModal.sourceItemId))}
+          onClose={() => setReturnModal(null)}
+          onSave={returnInventoryToAdmin}
         />
       )}
 
@@ -3000,7 +3074,7 @@ function Overview({ totals, categoryData, profitStats, staffInventoryStats, role
   );
 }
 
-function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove, onEditMarkup }) {
+function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove, onEditMarkup, onReturn }) {
   const supplierNames = (it) => getSupplierIds(it).map((sid) => supplierMap[sid]?.name).filter(Boolean);
   const itemMarkup = (it) => computeMarkupFromPrices(it.unitCost, it.sellingPrice ?? it.unitCost);
   const itemEstProfit = (it) => it.quantity * itemMarkup(it).amount;
@@ -3102,6 +3176,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                       {canMove && <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>}
                       {canEdit && <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>}
                       {!canEdit && canEditMarkup && <IconBtn onClick={() => onEditMarkup(it)} title="Update markup"><PesoIcon size={14} /></IconBtn>}
+                      {!canEdit && canEditMarkup && <IconBtn onClick={() => onReturn(it)} title="Return to Client Admin"><Undo2 size={14} /></IconBtn>}
                       {canDelete && <IconBtn onClick={() => onDelete(it)} title="Delete" danger><Trash2 size={14} /></IconBtn>}
                     </td>
                   )}
@@ -3128,7 +3203,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
   );
 }
 
-function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedStaffUid, onAssign, onEdit, onDelete, onMove }) {
+function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedStaffUid, onAssign, onEdit, onDelete, onMove, onReturn }) {
   const staffItems = useMemo(
     () => items.filter((it) => it.holderId === selectedStaffUid),
     [items, selectedStaffUid]
@@ -3187,6 +3262,7 @@ function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedSta
                     <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>
                       <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>
+                      <IconBtn onClick={() => onReturn(it)} title="Return to my inventory"><Undo2 size={14} /></IconBtn>
                       <IconBtn onClick={() => onDelete(it)} title="Remove" danger><Trash2 size={14} /></IconBtn>
                     </td>
                   </tr>
@@ -5009,6 +5085,43 @@ function SupplierModal({ draft, onClose, onSave }) {
           <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
             disabled={!valid} onClick={() => onSave(form)}>
             {draft ? 'Save Changes' : 'Add Supplier'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReturnInventoryModal({ item, hasDestination, onClose, onSave }) {
+  const [quantity, setQuantity] = useState(item.quantity);
+  const valid = Number(quantity) > 0 && Number(quantity) <= item.quantity;
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>RETURN ITEM — {item.sku}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
+            {item.name} — currently {item.quantity} on hand.
+          </div>
+          <Field label="Quantity to Return">
+            <input className="depot-input" type="number" min="1" max={item.quantity} style={styles.modalInput}
+              value={quantity} onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
+          </Field>
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 4 }}>
+            {hasDestination
+              ? 'This moves the quantity back into the Client Admin\u2019s own inventory.'
+              : 'The original source item no longer exists, so this will remove the quantity without crediting it elsewhere.'}
+          </div>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
+            disabled={!valid} onClick={() => onSave(item, quantity)}>
+            Return {quantity > 0 ? quantity : ''} Item{quantity === 1 ? '' : 's'}
           </button>
         </div>
       </div>
