@@ -16,7 +16,7 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -181,6 +181,9 @@ const ACTIVITY_TYPE_LABELS = {
   inventory_edited: 'Inventory Edited',
   inventory_assigned: 'Inventory Assigned',
   inventory_returned: 'Inventory Returned',
+  subscription_created: 'Subscription Created',
+  subscription_marked_paid: 'Subscription Marked Paid',
+  subscription_marked_unpaid: 'Subscription Marked Unpaid',
   price_changed: 'Base Price Changed',
   markup_changed: 'Markup Changed',
   sale_completed: 'Sale Completed',
@@ -197,6 +200,9 @@ function describeActivity(l) {
     case 'inventory_edited': return `Edited item ${m.itemSku || ''}${m.itemName ? ` — ${m.itemName}` : ''}`;
     case 'inventory_assigned': return `Assigned ${m.qty ?? ''} × ${m.itemSku || ''} to ${m.targetEmail || '—'}`;
     case 'inventory_returned': return `Returned ${m.qty ?? ''} × ${m.itemSku || ''}${m.byEmail ? ` (by ${m.byEmail})` : ''}`;
+    case 'subscription_created': return `Created ${m.monthLabel || ''} subscription for ${m.targetName || m.targetEmail || '—'}`;
+    case 'subscription_marked_paid': return `Marked ${m.monthLabel || ''} as Paid for ${m.targetName || m.targetEmail || '—'}`;
+    case 'subscription_marked_unpaid': return `Marked ${m.monthLabel || ''} as Unpaid for ${m.targetName || m.targetEmail || '—'}`;
     case 'price_changed': return `Changed base cost of ${m.itemSku || ''} from ${currency(m.oldCost ?? 0)} to ${currency(m.newCost ?? 0)}`;
     case 'markup_changed': return `Updated markup on ${m.itemSku || ''} to ${m.markupType === 'fixed' ? currency(m.markupValue ?? 0) + ' flat' : `${m.markupValue ?? 0}%`}`;
     case 'sale_completed': return `Completed sale ${m.receiptNo || ''} (${currency(m.total ?? 0)})`;
@@ -206,10 +212,10 @@ function describeActivity(l) {
 }
 
 function activityBadgeColors(type) {
-  if (type === 'login' || type === 'sale_completed') return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' };
+  if (type === 'login' || type === 'sale_completed' || type === 'subscription_marked_paid') return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' };
   if (type === 'logout') return { bg: 'rgba(20,33,61,0.08)', color: 'var(--ink)' };
-  if (type === 'price_changed' || type === 'markup_changed' || type === 'inventory_returned') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
-  if (type === 'staff_created' || type === 'inventory_assigned') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
+  if (type === 'price_changed' || type === 'markup_changed' || type === 'inventory_returned' || type === 'subscription_marked_unpaid') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
+  if (type === 'staff_created' || type === 'inventory_assigned' || type === 'subscription_created') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
   return { bg: 'rgba(20,33,61,0.06)', color: 'var(--ink)' };
 }
 
@@ -339,6 +345,48 @@ function computeMarkupFromPrices(baseCost, sellingPrice) {
   const percent = cost > 0 ? Math.round((amount / cost) * 10000) / 100 : 0;
   return { amount, percent };
 }
+
+// --- Subscription helpers -------------------------------------------------
+// A Client Admin's subscription lives entirely on their own users/{uid}
+// doc as `subscription: { history: [...] }` - Super Admin writes it,
+// everyone (the Client Admin + their staff) can read it. Status is always
+// computed LIVE against the current date rather than trusting a stored
+// "active" flag, since there's no backend cron job here to flip a flag the
+// moment a period lapses - only a real date comparison is trustworthy.
+
+// Month is 1-indexed (1 = January) to match how a person actually thinks
+// about "July 2026", not JS Date's 0-indexed convention.
+function computeSubscriptionPeriod(month, year) {
+  const start = new Date(year, month - 1, 1, 0, 0, 0, 0).getTime();
+  const end = new Date(year, month, 0, 23, 59, 59, 999).getTime(); // day 0 of next month = last day of this one
+  return { start, end };
+}
+
+function getLatestSubscriptionPeriod(subscription) {
+  const history = subscription?.history || [];
+  if (history.length === 0) return null;
+  return history.reduce((latest, p) => (!latest || p.year > latest.year || (p.year === latest.year && p.month > latest.month) ? p : latest), null);
+}
+
+// No subscription history at all (brand new client Super Admin hasn't set
+// up yet) is treated as active/not-paused - a friendlier default than
+// instantly locking out a client the moment they're approved, before
+// Super Admin has had a chance to configure anything.
+function isSubscriptionActive(subscription) {
+  const latest = getLatestSubscriptionPeriod(subscription);
+  if (!latest) return true;
+  return latest.end >= Date.now();
+}
+
+// Days remaining until the current period lapses (negative if already
+// expired). Used for the "expiring within 5 days" warning.
+function daysUntilExpiration(subscription) {
+  const latest = getLatestSubscriptionPeriod(subscription);
+  if (!latest) return null;
+  return Math.ceil((latest.end - Date.now()) / DAY_MS);
+}
+
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
 function ExportBar({ onPrint, onDownload, onDownloadPDF }) {
   return (
@@ -506,6 +554,7 @@ const VIEW_PERMISSIONS = {
   pos: 'pos',
   inventory: 'viewInventory',
   staffInventory: 'editInventory',
+  clientAccounts: 'manageSystem',
   suppliers: 'manageSuppliers',
   categories: 'manageCategories',
   locations: 'manageLocations',
@@ -668,6 +717,7 @@ export default function InventorySystem() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [myProfile, setMyProfile] = useState(null);
+  const [employerProfile, setEmployerProfile] = useState(null);
   const [profileChecked, setProfileChecked] = useState(false);
   const [pendingUsers, setPendingUsers] = useState([]);
   const [approvedUsers, setApprovedUsers] = useState([]);
@@ -694,6 +744,7 @@ export default function InventorySystem() {
   const [assignModal, setAssignModal] = useState(null);
   const [markupModal, setMarkupModal] = useState(null);
   const [returnModal, setReturnModal] = useState(null);
+  const [subscriptionModal, setSubscriptionModal] = useState(null);
   const [selectedStaffUid, setSelectedStaffUid] = useState('');
   const [confirmModal, setConfirmModal] = useState(null); // {kind: 'item'|'supplier'|'order', target}
   const [deliveryStatusModal, setDeliveryStatusModal] = useState(null);
@@ -752,6 +803,25 @@ export default function InventorySystem() {
   const ownerId = !user ? null
     : myRole === 'staff' ? (myProfile?.parentId || null)
     : user.uid;
+
+  // Staff read their employer's (Client Admin's) profile doc to check
+  // subscription status - a plain get() on one known document, not a list
+  // query, so it's not subject to the Firestore list-query limitation
+  // we've hit elsewhere in this app.
+  useEffect(() => {
+    if (myRole !== 'staff' || !ownerId) { setEmployerProfile(null); return; }
+    const unsub = onSnapshot(doc(db, 'users', ownerId), (d) => {
+      setEmployerProfile(d.exists() ? d.data() : null);
+    }, logSnapErr('employerProfile'));
+    return unsub;
+  }, [myRole, ownerId]);
+
+  // Whichever profile actually carries subscription data for this
+  // session: a Client Admin's own subscription, or (for staff) their
+  // employer's. Computed live against today's date every render - see the
+  // subscription helpers for why this can't just trust a stored flag.
+  const mySubscription = myRole === 'staff' ? employerProfile?.subscription : myProfile?.subscription;
+  const accessPaused = (myRole === 'client' || myRole === 'staff') && !isSubscriptionActive(mySubscription);
 
   // Activity log: record a "login" entry each time a session starts. This is
   // a client-side approximation - it can't distinguish "just signed in" from
@@ -964,6 +1034,36 @@ export default function InventorySystem() {
       showToast(`Role updated to ${ROLES[newRole] || newRole}`);
     } catch (e) {
       showToast('Could not update role — check your connection');
+    }
+  };
+
+  // Super Admin only. Month/Year fully determine the period's start/end
+  // dates (auto-derived, never separately editable) - so the only thing
+  // that can actually change on an EXISTING period is payment status.
+  // Creating a period for a month/year that doesn't exist yet in this
+  // client's history appends a new entry; picking one that already exists
+  // updates it in place (e.g. flipping Paid/Unpaid).
+  const saveSubscriptionPeriod = async (clientUid, { month, year, paymentStatus }) => {
+    if (myRole !== 'superadmin') { showToast("You don't have permission to manage subscriptions"); return; }
+    const client = approvedUsers.find((u) => u.id === clientUid);
+    if (!client) { showToast('Client not found'); return; }
+    const { start, end } = computeSubscriptionPeriod(month, year);
+    const history = client.subscription?.history || [];
+    const idx = history.findIndex((p) => p.month === month && p.year === year);
+    const isNew = idx < 0;
+    const entry = { month, year, startDate: start, endDate: end, paymentStatus, setAt: Date.now(), setBy: user.email || user.uid };
+    const newHistory = isNew ? [...history, entry] : history.map((p, i) => (i === idx ? entry : p));
+    const monthLabel = `${MONTH_NAMES[month - 1]} ${year}`;
+
+    try {
+      await setDoc(doc(db, 'users', clientUid), { subscription: { history: newHistory } }, { merge: true });
+      const activityType = isNew ? 'subscription_created' : (paymentStatus === 'paid' ? 'subscription_marked_paid' : 'subscription_marked_unpaid');
+      logActivity(activityType, { targetEmail: client.email, targetName: client.fullName, monthLabel, paymentStatus });
+      showToast(`${monthLabel} subscription ${isNew ? 'created' : 'updated'} for ${client.fullName || client.email}`);
+      return { ok: true };
+    } catch (e) {
+      showToast('Could not update subscription — check your connection');
+      return { ok: false };
     }
   };
 
@@ -1892,6 +1992,10 @@ export default function InventorySystem() {
     return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} onSignOut={handleSignOut} />;
   }
 
+  if (accessPaused) {
+    return <SubscriptionPausedScreen role={myRole} onSignOut={handleSignOut} />;
+  }
+
   if (!loaded) {
     return (
       <div style={{ ...styles.wrap, alignItems: 'center', justifyContent: 'center', display: 'flex' }}>
@@ -1977,6 +2081,14 @@ export default function InventorySystem() {
             onDelete={(it) => setConfirmModal({ kind: 'item', target: it })}
             onMove={(it) => setMoveModal(it)}
             onReturn={(it) => setReturnModal(it)}
+          />
+        )}
+
+        {view === 'clientAccounts' && (
+          <ClientAccountsView
+            clients={approvedUsers.filter((u) => u.role === 'client')}
+            allUsers={approvedUsers}
+            onManageSubscription={(client) => setSubscriptionModal(client)}
           />
         )}
 
@@ -2150,6 +2262,14 @@ export default function InventorySystem() {
           hasDestination={!!(can(myRole, 'editInventory') && returnModal.sourceItemId && items.some((i) => i.id === returnModal.sourceItemId))}
           onClose={() => setReturnModal(null)}
           onSave={returnInventoryToAdmin}
+        />
+      )}
+
+      {subscriptionModal && (
+        <SubscriptionModal
+          client={subscriptionModal}
+          onClose={() => setSubscriptionModal(null)}
+          onSave={saveSubscriptionPeriod}
         />
       )}
 
@@ -2710,9 +2830,55 @@ function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
   );
 }
 
+function SubscriptionPausedScreen({ role, onSignOut }) {
+  return (
+    <div style={{
+      minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'var(--paper, #F7EFDD)', fontFamily: "'Nunito', sans-serif", borderRadius: 8,
+      position: 'relative', overflow: 'hidden',
+    }}>
+      <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
+      <BackgroundDecor variant="login" />
+      <div className="depot-login-form" style={{
+        background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
+        boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(193,80,58,0.2)',
+        border: '1px solid rgba(193,80,58,0.35)', position: 'relative', zIndex: 1,
+      }}>
+        <div style={{
+          width: 52, height: 52, borderRadius: '50%', background: 'var(--red, #C1503A)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px',
+        }}>
+          <AlertTriangle size={26} color="#fff" />
+        </div>
+        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 19, marginBottom: 8, color: '#3B2A1F' }}>
+          Subscription Paused
+        </div>
+        <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
+          {role === 'client'
+            ? 'Access to Stock IT is currently paused because your subscription has expired. Please contact your platform administrator to renew.'
+            : 'Access to Stock IT is currently paused because your Client Admin\u2019s subscription has expired. Please check with them, or contact the platform administrator.'}
+        </div>
+        <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginTop: 10, marginBottom: 22 }}>
+          This page will update automatically once the subscription is renewed &mdash; no need to refresh.
+        </div>
+        <button
+          onClick={onSignOut}
+          style={{
+            width: '100%', background: 'transparent', border: '1px solid rgba(59,42,31,0.2)', color: '#3B2A1F',
+            borderRadius: 6, padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer',
+          }}
+        >
+          Sign Out
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
   const structure = [
     { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
+    { type: 'item', key: 'clientAccounts', label: 'Client Accounts', icon: Building2 },
     { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
     { type: 'group', label: 'Stock Management', icon: Boxes, children: [
       { key: 'inventory', label: 'Inventory', icon: Boxes },
@@ -2851,6 +3017,7 @@ function TopBar({ view, role, onAdd }) {
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
     staffInventory: ['Staff Inventory', 'Stock assigned to each staff member'],
+    clientAccounts: ['Client Accounts', 'Manage subscriptions for every business on the platform'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     orders: ['Orders', 'Purchase orders placed with your suppliers'],
     categories: ['Categories', 'Organize items into your own groups'],
@@ -3310,6 +3477,233 @@ function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedSta
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+function ClientAccountsView({ clients, allUsers, onManageSubscription }) {
+  const [expandedUid, setExpandedUid] = useState(null);
+
+  const staffFor = (clientUid) => allUsers.filter((u) => u.role === 'staff' && u.parentId === clientUid);
+
+  const expiringWarnings = useMemo(() => {
+    return clients
+      .map((c) => ({ client: c, days: daysUntilExpiration(c.subscription) }))
+      .filter((x) => x.days !== null && x.days >= 0 && x.days <= 5);
+  }, [clients]);
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {expiringWarnings.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
+          {expiringWarnings.map(({ client, days }) => (
+            <div key={client.id} style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 8,
+              background: 'rgba(232,163,61,0.14)', border: '1px solid rgba(232,163,61,0.4)',
+            }}>
+              <AlertTriangle size={16} color="var(--amber-deep)" />
+              <div style={{ fontSize: 13 }}>
+                <strong>{client.fullName || client.email}</strong> &mdash; subscription expires in {days} day{days === 1 ? '' : 's'}.
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={styles.statGrid} className="depot-stat-grid">
+        <StatCard icon={Building2} label="Total Clients" value={clients.length} accent="var(--blueprint)" />
+        <StatCard icon={CheckCircle2} label="Active Subscriptions" value={clients.filter((c) => isSubscriptionActive(c.subscription)).length} accent="var(--green)" />
+        <StatCard icon={AlertTriangle} label="Expired Subscriptions" value={clients.filter((c) => !isSubscriptionActive(c.subscription)).length} accent="var(--red)" />
+        <StatCard icon={User} label="Total Staff" value={allUsers.filter((u) => u.role === 'staff').length} accent="#2E5C87" />
+      </div>
+
+      {clients.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>No Client Admin accounts yet.</div></div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table} className="depot-table">
+            <thead>
+              <tr>
+                {['Client', 'Subscription', 'Start', 'Expires', 'Payment', 'Staff', ''].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {clients.map((c) => {
+                const latest = getLatestSubscriptionPeriod(c.subscription);
+                const active = isSubscriptionActive(c.subscription);
+                const staff = staffFor(c.id);
+                const isOpen = expandedUid === c.id;
+                return (
+                  <React.Fragment key={c.id}>
+                    <tr className="depot-row">
+                      <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500 }}>
+                        {c.fullName || '—'}<br />
+                        <span style={{ fontFamily: "'Nunito', sans-serif", fontWeight: 400, fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>{c.email}</span>
+                      </td>
+                      <td style={styles.td}>
+                        <span style={{ ...styles.statusPill, background: active ? 'rgba(79,138,99,0.1)' : 'rgba(193,80,58,0.1)', color: active ? 'var(--green)' : 'var(--red)' }}>
+                          {active ? 'Active' : 'Expired'}
+                        </span>
+                      </td>
+                      <td style={styles.td}>{latest ? formatDate(latest.startDate) : '—'}</td>
+                      <td style={styles.td}>{latest ? formatDate(latest.endDate) : '—'}</td>
+                      <td style={styles.td}>
+                        {latest ? (
+                          <span style={{ ...styles.statusPill, background: latest.paymentStatus === 'paid' ? 'rgba(79,138,99,0.1)' : 'rgba(232,163,61,0.14)', color: latest.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)' }}>
+                            {latest.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                          </span>
+                        ) : '—'}
+                      </td>
+                      <td style={styles.td}>
+                        <button
+                          className="depot-btn"
+                          onClick={() => setExpandedUid(isOpen ? null : c.id)}
+                          style={{ display: 'flex', alignItems: 'center', gap: 5, background: 'transparent', border: 'none', padding: 0, color: 'var(--blueprint)', fontSize: 13 }}
+                        >
+                          <ChevronDown size={14} style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s ease' }} />
+                          {staff.length} staff
+                        </button>
+                      </td>
+                      <td className="depot-no-print" style={{ ...styles.td, textAlign: 'right' }}>
+                        <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onManageSubscription(c)}>
+                          Manage Subscription
+                        </button>
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr>
+                        <td colSpan={7} style={{ ...styles.td, background: 'rgba(20,33,61,0.02)', padding: '10px 14px' }}>
+                          {staff.length === 0 ? (
+                            <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)' }}>No staff accounts under this client yet.</div>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              {staff.map((s) => (
+                                <div key={s.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5 }}>
+                                  <span>{s.fullName || s.email}</span>
+                                  <span style={{ color: 'rgba(59,42,31,0.55)' }}>{s.approved ? 'Active' : 'Pending'}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SubscriptionModal({ client, onClose, onSave }) {
+  const today = new Date();
+  const [month, setMonth] = useState(today.getMonth() + 1);
+  const [year, setYear] = useState(today.getFullYear());
+  const [paymentStatus, setPaymentStatus] = useState('unpaid');
+  const [busy, setBusy] = useState(false);
+
+  const history = (client.subscription?.history || []).slice().sort((a, b) => (b.year - a.year) || (b.month - a.month));
+  const { start, end } = computeSubscriptionPeriod(month, year);
+  const existing = history.find((p) => p.month === month && p.year === year);
+
+  const loadPeriod = (p) => {
+    setMonth(p.month); setYear(p.year); setPaymentStatus(p.paymentStatus);
+  };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    await onSave(client.id, { month, year, paymentStatus });
+    setBusy(false);
+  };
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={{ ...styles.modal, maxWidth: 520 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>MANAGE SUBSCRIPTION — {client.fullName || client.email}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <form onSubmit={submit}>
+          <div style={styles.modalBody}>
+            <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+              <Field label="Month" grow>
+                <select className="depot-select" style={styles.modalInput} value={month} onChange={(e) => setMonth(Number(e.target.value))}>
+                  {MONTH_NAMES.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+                </select>
+              </Field>
+              <Field label="Year" grow>
+                <input className="depot-input" type="number" style={styles.modalInput} value={year} onChange={(e) => setYear(Number(e.target.value))} />
+              </Field>
+            </div>
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginBottom: 10 }}>
+              Period: {formatDate(start)} &ndash; {formatDate(end)}{existing ? ' (already exists — saving will update it)' : ' (new period)'}
+            </div>
+            <Field label="Payment Status">
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button type="button" onClick={() => setPaymentStatus('paid')}
+                  className="depot-btn"
+                  style={{
+                    flex: 1, padding: '10px 0', borderRadius: 6, fontSize: 13, fontWeight: 600,
+                    background: paymentStatus === 'paid' ? 'var(--green)' : 'transparent',
+                    color: paymentStatus === 'paid' ? '#fff' : 'var(--ink)',
+                    border: `1px solid ${paymentStatus === 'paid' ? 'var(--green)' : 'rgba(59,42,31,0.2)'}`,
+                  }}>
+                  Mark as Paid
+                </button>
+                <button type="button" onClick={() => setPaymentStatus('unpaid')}
+                  className="depot-btn"
+                  style={{
+                    flex: 1, padding: '10px 0', borderRadius: 6, fontSize: 13, fontWeight: 600,
+                    background: paymentStatus === 'unpaid' ? 'var(--red)' : 'transparent',
+                    color: paymentStatus === 'unpaid' ? '#fff' : 'var(--ink)',
+                    border: `1px solid ${paymentStatus === 'unpaid' ? 'var(--red)' : 'rgba(59,42,31,0.2)'}`,
+                  }}>
+                  Mark as Unpaid
+                </button>
+              </div>
+            </Field>
+
+            {history.length > 0 && (
+              <div style={{ marginTop: 16 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Subscription History</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 160, overflowY: 'auto' }} className="depot-scroll">
+                  {history.map((p) => (
+                    <button
+                      type="button"
+                      key={`${p.year}-${p.month}`}
+                      onClick={() => loadPeriod(p)}
+                      className="depot-btn"
+                      style={{
+                        display: 'flex', justifyContent: 'space-between', padding: '6px 10px', borderRadius: 6,
+                        background: (p.month === month && p.year === year) ? 'rgba(15,42,71,0.06)' : 'transparent',
+                        border: '1px solid rgba(59,42,31,0.1)', fontSize: 12,
+                      }}
+                    >
+                      <span>{MONTH_NAMES[p.month - 1]} {p.year}</span>
+                      <span style={{ color: p.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)', fontWeight: 600 }}>
+                        {p.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          <div style={styles.modalFooter}>
+            <button type="button" className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+            <button type="submit" className="depot-btn" style={{ ...styles.primaryBtn, opacity: busy ? 0.6 : 1 }} disabled={busy}>
+              {busy ? 'Saving…' : 'Save Subscription'}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
