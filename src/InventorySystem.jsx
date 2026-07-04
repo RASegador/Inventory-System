@@ -6,6 +6,7 @@ import { initializeApp, deleteApp } from 'firebase/app';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth,
   updatePassword, reauthenticateWithCredential, EmailAuthProvider, sendPasswordResetEmail,
+  inMemoryPersistence, setPersistence,
 } from 'firebase/auth';
 import {
   collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
@@ -740,6 +741,13 @@ export default function InventorySystem() {
     try {
       secondaryApp = initializeApp(auth.app.options, 'staff-creation-' + Date.now());
       const secondaryAuth = getAuth(secondaryApp);
+      // Critical: without this, the secondary app shares the SAME
+      // persisted auth storage as our own (primary) session by default -
+      // signing in/out a brand-new user on it can silently corrupt the
+      // admin's own active session, causing their live listeners to start
+      // throwing permission-denied shortly after. In-memory persistence
+      // keeps it fully isolated.
+      await setPersistence(secondaryAuth, inMemoryPersistence);
       const cred = await createUserWithEmailAndPassword(secondaryAuth, email.trim(), password);
       await setDoc(doc(db, 'users', cred.user.uid), {
         email: email.trim(), approved: true, isAdmin: false, role: 'staff',
