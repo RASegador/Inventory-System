@@ -22,7 +22,7 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
 } from 'recharts';
 
-const FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=Nunito:wght@400;500;600;700&display=swap');";
+const FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=Nunito:wght@400;500;600;700&family=Poppins:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');";
 
 const RESPONSIVE_CSS = `
   html, body { -webkit-text-size-adjust: 100%; }
@@ -595,22 +595,70 @@ const THEMES = {
     paper: '#F2F4F6', paperDim: '#E4E8EC', ink: '#232B35', amber: '#4A7FB5', amberDeep: '#2F5C8A',
     green: '#4F8A6E', red: '#C1543C',
   },
+  roseBlush: {
+    label: 'Rose Blush', swatch: '#B5586F',
+    blueprint: '#7A3B4A', blueprintDeep: '#54222D', line: '#E0A3AF', lineDim: 'rgba(224,163,175,0.28)',
+    paper: '#FBF0EE', paperDim: '#F3DEDC', ink: '#3D2228', amber: '#D98C55', amberDeep: '#A9601D',
+    green: '#6B8F6A', red: '#C1503A',
+  },
+  forestDeep: {
+    label: 'Forest Deep', swatch: '#1F4D3D',
+    blueprint: '#1F4D3D', blueprintDeep: '#123126', line: '#7FBFA0', lineDim: 'rgba(127,191,160,0.28)',
+    paper: '#EEF3EE', paperDim: '#DFE9DF', ink: '#16281E', amber: '#C9A441', amberDeep: '#8F7420',
+    green: '#3F8A5C', red: '#B84B3A',
+  },
+  midnightPurple: {
+    label: 'Midnight Purple', swatch: '#453166',
+    blueprint: '#453166', blueprintDeep: '#2B1F44', line: '#B39DDB', lineDim: 'rgba(179,157,219,0.28)',
+    paper: '#F3F0F8', paperDim: '#E6E0EF', ink: '#241A38', amber: '#C98A4A', amberDeep: '#9A621F',
+    green: '#4F8A63', red: '#C1503A',
+  },
+  sandstone: {
+    label: 'Sandstone', swatch: '#8C6A4E',
+    blueprint: '#6B5236', blueprintDeep: '#453420', line: '#C7A87B', lineDim: 'rgba(199,168,123,0.28)',
+    paper: '#F6F1E7', paperDim: '#EBE1CD', ink: '#332A1E', amber: '#B9803C', amberDeep: '#8A5C21',
+    green: '#6B8757', red: '#B8543C',
+  },
 };
 const DEFAULT_THEME_KEY = 'cozyGrocery';
 
-function themeCssVars(theme) {
+// Applied app-wide via a global !important rule (see themeCssVars), since
+// most text elements set their font-family inline rather than through a
+// shared class - a plain CSS var alone wouldn't be able to override that
+// without !important backing it.
+const FONT_PRESETS = {
+  quicksandNunito: { label: 'Quicksand + Nunito (Default)', family: "'Quicksand', 'Nunito', sans-serif" },
+  poppinsInter: { label: 'Poppins + Inter (Modern)', family: "'Poppins', 'Inter', sans-serif" },
+  playfairSource: { label: 'Playfair Display + Source Sans (Elegant)', family: "'Playfair Display', 'Source Sans 3', serif" },
+  georgiaVerdana: { label: 'Georgia + Verdana (Classic)', family: "Georgia, 'Verdana', serif" },
+  courierMono: { label: 'Courier Mono (Utilitarian)', family: "'IBM Plex Mono', 'Courier New', monospace" },
+};
+const DEFAULT_FONT_KEY = 'quicksandNunito';
+
+function themeCssVars(theme, fontFamily, customInk, customPanelBg) {
   return `
+    :root {
           --blueprint: ${theme.blueprint};
           --blueprint-deep: ${theme.blueprintDeep};
           --line: ${theme.line};
           --line-dim: ${theme.lineDim};
           --paper: ${theme.paper};
           --paper-dim: ${theme.paperDim};
-          --ink: ${theme.ink};
+          --ink: ${customInk || theme.ink};
           --amber: ${theme.amber};
           --amber-deep: ${theme.amberDeep};
           --green: ${theme.green};
           --red: ${theme.red};
+          --panel-bg: ${customPanelBg || '#ffffff'};
+          --font-body: ${fontFamily || FONT_PRESETS[DEFAULT_FONT_KEY].family};
+    }
+    /* Most text elements in this app set font-family inline rather than
+       through a shared class, so a plain CSS var alone can't override
+       them - !important is required to make the font picker actually
+       take effect app-wide. Text COLOR mostly already flows through
+       var(--ink) directly in shared styles, so it doesn't need the same
+       !important treatment. */
+    .depot-wrap, .depot-wrap * { font-family: var(--font-body) !important; }
   `;
 }
 
@@ -763,9 +811,13 @@ export default function InventorySystem() {
   const effectiveBranding = {
     logoDataUri: tenantBranding?.logoDataUri ?? branding?.logoDataUri,
     themeKey: tenantBranding?.themeKey ?? branding?.themeKey,
+    fontKey: tenantBranding?.fontKey ?? branding?.fontKey,
+    customInk: tenantBranding?.customInk ?? branding?.customInk,
+    customPanelBg: tenantBranding?.customPanelBg ?? branding?.customPanelBg,
   };
   const effectiveLogo = effectiveBranding.logoDataUri || LOGO_DATA_URI;
   const activeTheme = THEMES[effectiveBranding.themeKey] || THEMES[DEFAULT_THEME_KEY];
+  const activeFontFamily = (FONT_PRESETS[effectiveBranding.fontKey] || FONT_PRESETS[DEFAULT_FONT_KEY]).family;
 
   // Super Admin manages Team Access for the whole platform (every account) -
   // an unfiltered collection listener, which works fine for them since
@@ -969,40 +1021,50 @@ export default function InventorySystem() {
   // other Client Admin's portal.
   const brandingDocFor = (role) => (role === 'superadmin' ? 'branding' : 'branding_' + ownerId);
 
-  const saveLogo = async (dataUri) => {
+  // Shared plumbing for every branding field (logo, theme, font, custom
+  // colors) - routes to the platform default doc for Super Admin, or the
+  // caller's own tenant-scoped doc for a Client Admin.
+  const updateBranding = async (fields, successMsg) => {
     if (!isManager) return;
     try {
       await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
-        logoDataUri: dataUri, ...(myRole === 'superadmin' ? {} : { ownerId }),
+        ...fields, ...(myRole === 'superadmin' ? {} : { ownerId }),
       }, { merge: true });
-      showToast(myRole === 'superadmin' ? 'Logo updated for everyone' : 'Logo updated for your inventory portal');
+      if (successMsg) showToast(successMsg);
     } catch (e) {
-      showToast('Could not save logo — check your connection');
+      showToast('Could not update branding — check your connection');
     }
+  };
+
+  const saveLogo = async (dataUri) => {
+    await updateBranding(
+      { logoDataUri: dataUri },
+      myRole === 'superadmin' ? 'Logo updated for everyone' : 'Logo updated for your inventory portal'
+    );
   };
 
   const resetLogo = async () => {
-    if (!isManager) return;
-    try {
-      await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
-        logoDataUri: null, ...(myRole === 'superadmin' ? {} : { ownerId }),
-      }, { merge: true });
-      showToast('Reverted to the default logo');
-    } catch (e) {
-      showToast('Could not reset logo — check your connection');
-    }
+    await updateBranding({ logoDataUri: null }, 'Reverted to the default logo');
   };
 
   const setThemeKey = async (key) => {
-    if (!isManager) return;
-    try {
-      await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
-        themeKey: key, ...(myRole === 'superadmin' ? {} : { ownerId }),
-      }, { merge: true });
-      showToast(`Theme changed to ${THEMES[key]?.label || key}`);
-    } catch (e) {
-      showToast('Could not change theme — check your connection');
-    }
+    await updateBranding({ themeKey: key }, `Theme changed to ${THEMES[key]?.label || key}`);
+  };
+
+  const setFontKey = async (key) => {
+    await updateBranding({ fontKey: key }, `Text format changed to ${FONT_PRESETS[key]?.label || key}`);
+  };
+
+  const setCustomInk = async (hex) => {
+    await updateBranding({ customInk: hex }, 'Text color updated');
+  };
+
+  const setCustomPanelBg = async (hex) => {
+    await updateBranding({ customPanelBg: hex }, 'Panel color updated');
+  };
+
+  const resetCustomColors = async () => {
+    await updateBranding({ customInk: null, customPanelBg: null }, 'Reverted to theme default colors');
   };
 
 
@@ -1766,11 +1828,9 @@ export default function InventorySystem() {
       <style>{`
         ${FONT_IMPORT}
         ${RESPONSIVE_CSS}
-        :root {
-          ${themeCssVars(activeTheme)}
-        }
+        ${themeCssVars(activeTheme, activeFontFamily, effectiveBranding.customInk, effectiveBranding.customPanelBg)}
         * { box-sizing: border-box; }
-        .depot-btn { cursor: pointer; border: none; font-family: 'Nunito', sans-serif; transition: all 0.15s ease; }
+        .depot-btn { cursor: pointer; border: none; font-family: var(--font-body); transition: all 0.15s ease; }
         .depot-btn:active { transform: translateY(1px); }
         .depot-row:hover { background: rgba(15,42,71,0.04); }
         .depot-input:focus, .depot-select:focus { outline: 2px solid var(--blueprint); outline-offset: 1px; }
@@ -1925,6 +1985,10 @@ export default function InventorySystem() {
             onSaveLogo={saveLogo}
             onResetLogo={resetLogo}
             onSetTheme={setThemeKey}
+            onSetFont={setFontKey}
+            onSetInk={setCustomInk}
+            onSetPanelBg={setCustomPanelBg}
+            onResetColors={resetCustomColors}
           />
         )}
 
@@ -4384,11 +4448,12 @@ function AddStaffPanel({ onCreateStaff }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme }) {
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme, onSetFont, onSetInk, onSetPanelBg, onResetColors }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
   const [editingUser, setEditingUser] = useState(null);
   const activeThemeKey = branding?.themeKey || DEFAULT_THEME_KEY;
+  const activeFontKey = branding?.fontKey || DEFAULT_FONT_KEY;
 
   const handleLogoFile = (e) => {
     const file = e.target.files?.[0];
@@ -4563,23 +4628,68 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
 
           <div style={{ marginTop: 20 }}>
             <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Background / Color Scheme</div>
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <select
+              className="depot-select"
+              value={activeThemeKey}
+              onChange={(e) => onSetTheme(e.target.value)}
+              style={{ ...styles.modalInput, maxWidth: 320 }}
+            >
               {Object.entries(THEMES).map(([key, theme]) => (
-                <button
-                  key={key}
-                  className="depot-btn"
-                  onClick={() => onSetTheme(key)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8,
-                    border: activeThemeKey === key ? '2px solid var(--ink)' : '1px solid rgba(20,33,61,0.15)',
-                    background: '#fff', fontSize: 12.5, fontWeight: 500,
-                  }}
-                >
-                  <span style={{ width: 16, height: 16, borderRadius: '50%', background: theme.swatch, display: 'inline-block' }} />
-                  {theme.label}
-                  {activeThemeKey === key && <CheckCircle2 size={13} color="var(--green)" />}
-                </button>
+                <option key={key} value={key}>{theme.label}</option>
               ))}
+            </select>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+              <span style={{ width: 20, height: 20, borderRadius: '50%', background: THEMES[activeThemeKey].swatch, display: 'inline-block', border: '1px solid rgba(20,33,61,0.15)' }} />
+              <span style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>Currently: {THEMES[activeThemeKey].label}</span>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Text Format</div>
+            <select
+              className="depot-select"
+              value={activeFontKey}
+              onChange={(e) => onSetFont(e.target.value)}
+              style={{ ...styles.modalInput, maxWidth: 320, fontFamily: FONT_PRESETS[activeFontKey].family }}
+            >
+              {Object.entries(FONT_PRESETS).map(([key, f]) => (
+                <option key={key} value={key} style={{ fontFamily: f.family }}>{f.label}</option>
+              ))}
+            </select>
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 6, maxWidth: 320 }}>
+              Changes the font used throughout the app.
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Color Panels</div>
+            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', marginBottom: 5 }}>Text Color</div>
+                <input
+                  type="color"
+                  value={branding?.customInk || THEMES[activeThemeKey].ink}
+                  onChange={(e) => onSetInk(e.target.value)}
+                  style={{ width: 48, height: 32, border: '1px solid rgba(20,33,61,0.15)', borderRadius: 6, cursor: 'pointer', padding: 2, background: '#fff' }}
+                />
+              </div>
+              <div>
+                <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', marginBottom: 5 }}>Panel Background</div>
+                <input
+                  type="color"
+                  value={branding?.customPanelBg || '#ffffff'}
+                  onChange={(e) => onSetPanelBg(e.target.value)}
+                  style={{ width: 48, height: 32, border: '1px solid rgba(20,33,61,0.15)', borderRadius: 6, cursor: 'pointer', padding: 2, background: '#fff' }}
+                />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+                <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--ink)', border: '1px solid rgba(20,33,61,0.2)' }} onClick={onResetColors}>
+                  Reset to Theme Defaults
+                </button>
+              </div>
+            </div>
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 8, maxWidth: 460 }}>
+              These override the color scheme's defaults for the main text color and card/panel backgrounds throughout the app. Some muted/secondary text tones are calculated automatically and may not shift with a custom text color.
             </div>
           </div>
         </div>
@@ -5380,7 +5490,7 @@ const styles = {
   statValue: { fontFamily: "'Quicksand', sans-serif", fontSize: 19, fontWeight: 600, lineHeight: 1.1 },
   statLabel: { fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 3 },
   overviewGrid: { display: 'grid', gridTemplateColumns: '1.3fr 1fr', gap: 16 },
-  panel: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18 },
+  panel: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18 },
   panelHeader: {
     display: 'flex', alignItems: 'center', gap: 7, fontFamily: "'Quicksand', sans-serif",
     fontSize: 11.5, fontWeight: 600, letterSpacing: '0.08em', color: 'var(--blueprint)',
