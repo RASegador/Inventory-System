@@ -2503,6 +2503,7 @@ function TopBar({ view, role, onAdd }) {
     overview: ['Overview', 'Warehouse status at a glance'],
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
+    staffInventory: ['Staff Inventory', 'Stock assigned to each staff member'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     orders: ['Orders', 'Purchase orders placed with your suppliers'],
     categories: ['Categories', 'Organize items into your own groups'],
