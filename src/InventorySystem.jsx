@@ -2839,6 +2839,7 @@ function TopBar({ view, role, onAdd }) {
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'))
     || (view === 'orders' && can(role, 'manageOrders'));
+  const showManualLink = view === 'overview';
   return (
     <div style={styles.topbar} className="depot-topbar">
       <div>
@@ -2849,6 +2850,16 @@ function TopBar({ view, role, onAdd }) {
         <button className="depot-btn depot-no-print depot-topbar-btn" style={styles.primaryBtn} onClick={onAdd}>
           <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : 'New Item'}
         </button>
+      )}
+      {showManualLink && (
+        <a
+          href="/Stock-IT-User-Manual.pdf"
+          download
+          className="depot-btn depot-no-print depot-topbar-btn"
+          style={{ ...styles.primaryBtn, textDecoration: 'none' }}
+        >
+          <Download size={16} /> Download User Manual
+        </a>
       )}
     </div>
   );
@@ -5630,7 +5641,7 @@ const styles = {
   },
   statGrid: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 20 },
   statCard: {
-    background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16,
+    background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16,
     display: 'flex', alignItems: 'center', gap: 12, animation: 'slideUp 0.3s ease',
   },
   statIcon: { width: 38, height: 38, borderRadius: 7, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
@@ -5674,7 +5685,7 @@ const styles = {
     background: '#fff', border: '1px solid rgba(59,42,31,0.15)', borderRadius: 6, padding: '9px 10px',
     fontSize: 13, fontFamily: "'Nunito', sans-serif", color: 'var(--ink)',
   },
-  tableWrap: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, overflowX: 'auto' },
+  tableWrap: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, overflowX: 'auto' },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: 13 },
   th: {
     textAlign: 'left', padding: '11px 14px', fontFamily: "'Quicksand', sans-serif", fontSize: 10.5,
@@ -5693,11 +5704,11 @@ const styles = {
     display: 'block', fontSize: 9.5, color: 'rgba(59,42,31,0.4)', marginTop: 3, fontStyle: 'italic',
   },
   supplierGrid: { display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 },
-  supplierCard: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16, animation: 'slideUp 0.3s ease' },
+  supplierCard: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16, animation: 'slideUp 0.3s ease' },
   supplierCardHead: { display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12 },
   supplierIcon: { width: 32, height: 32, borderRadius: 7, background: 'var(--blueprint)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   categoryCard: {
-    display: 'flex', alignItems: 'center', gap: 10, background: '#fff', border: '1px solid rgba(59,42,31,0.08)',
+    display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)',
     borderRadius: 8, padding: '12px 14px', animation: 'slideUp 0.3s ease',
   },
   categoryIcon: { width: 32, height: 32, borderRadius: 7, background: 'var(--amber-deep)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
@@ -5707,12 +5718,12 @@ const styles = {
   },
   posItemCard: {
     display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start', textAlign: 'left',
-    background: '#fff', border: '1px solid rgba(59,42,31,0.1)', borderRadius: 8, padding: '10px 12px',
+    background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.1)', borderRadius: 8, padding: '10px 12px',
   },
   posItemSku: { fontFamily: "'Quicksand', sans-serif", fontSize: 11, color: 'var(--blueprint)', fontWeight: 600 },
   posItemName: { fontSize: 12.5, fontWeight: 500, lineHeight: 1.3 },
   posItemFooter: { display: 'flex', justifyContent: 'space-between', width: '100%', fontSize: 11, marginTop: 4, fontFamily: "'Quicksand', sans-serif" },
-  cartPanel: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18, position: 'sticky', top: 0 },
+  cartPanel: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18, position: 'sticky', top: 0 },
   cartLine: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid rgba(59,42,31,0.06)' },
   qtyStepper: { display: 'flex', alignItems: 'center', gap: 6 },
   qtyBtn: {
@@ -5738,7 +5749,7 @@ const styles = {
   supplierNotes: { fontSize: 12, color: 'rgba(59,42,31,0.55)', fontStyle: 'italic', marginTop: 4 },
   ledger: { display: 'flex', flexDirection: 'column', gap: 8 },
   ledgerRow: {
-    display: 'flex', alignItems: 'center', gap: 12, background: '#fff', border: '1px solid rgba(59,42,31,0.08)',
+    display: 'flex', alignItems: 'center', gap: 12, background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)',
     borderRadius: 8, padding: '12px 16px',
   },
   ledgerIcon: { width: 32, height: 32, borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
