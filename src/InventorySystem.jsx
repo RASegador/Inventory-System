@@ -3002,12 +3002,28 @@ function Overview({ totals, categoryData, profitStats, staffInventoryStats, role
 
 function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove, onEditMarkup }) {
   const supplierNames = (it) => getSupplierIds(it).map((sid) => supplierMap[sid]?.name).filter(Boolean);
+  const itemMarkup = (it) => computeMarkupFromPrices(it.unitCost, it.sellingPrice ?? it.unitCost);
+  const itemEstProfit = (it) => it.quantity * itemMarkup(it).amount;
 
-  const exportHeaders = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Value'];
-  const exportRows = () => filtered.map((it) => [
-    it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
-    it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2), (it.quantity * it.unitCost).toFixed(2),
-  ]);
+  const totalQty = filtered.reduce((s, it) => s + it.quantity, 0);
+  const totalBaseCostValue = filtered.reduce((s, it) => s + it.quantity * it.unitCost, 0);
+  const totalSellingValue = filtered.reduce((s, it) => s + it.quantity * (it.sellingPrice ?? it.unitCost), 0);
+  const totalEstProfit = totalSellingValue - totalBaseCostValue;
+
+  const exportHeaders = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Markup', 'Base Cost Total Value', 'Selling Price Total Value', 'Est. Profit'];
+  const exportRows = () => [
+    ...filtered.map((it) => {
+      const markup = itemMarkup(it);
+      return [
+        it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
+        it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2),
+        `${currency(markup.amount)} (${markup.percent.toFixed(1)}%)`,
+        (it.quantity * it.unitCost).toFixed(2), (it.quantity * (it.sellingPrice ?? it.unitCost)).toFixed(2),
+        itemEstProfit(it).toFixed(2),
+      ];
+    }),
+    ['TOTAL', '', '', '', '', totalQty, '', '', '', totalBaseCostValue.toFixed(2), totalSellingValue.toFixed(2), totalEstProfit.toFixed(2)],
+  ];
   const handleDownload = () => downloadCSV('inventory.csv', exportHeaders, exportRows());
   const handleDownloadPDF = () => downloadPDF('inventory.pdf', 'Inventory', exportHeaders, exportRows());
   const canEdit = can(role, 'editInventory');
@@ -3046,14 +3062,14 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
         <table style={styles.table} className="depot-table">
           <thead>
             <tr>
-              {['SKU', 'Item', 'Category', 'Suppliers', 'Location', 'Qty', 'Base Cost', 'Selling Price', 'Value', ...(showActionsCol ? [''] : [])].map((h) => (
+              {['SKU', 'Item', 'Category', 'Suppliers', 'Location', 'Qty', 'Base Cost', 'Selling Price', 'Markup', 'Base Cost Total Value', 'Selling Price Total Value', 'Est. Profit', ...(showActionsCol ? [''] : [])].map((h) => (
                 <th key={h} style={styles.th}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {filtered.length === 0 && (
-              <tr><td colSpan={10} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your search.</td></tr>
+              <tr><td colSpan={13} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your search.</td></tr>
             )}
             {filtered.map((it) => {
               const low = it.quantity <= it.reorderPoint;
@@ -3075,7 +3091,12 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                   </td>
                   <td style={styles.td}>{currency(it.unitCost)}</td>
                   <td style={styles.td}>{currency(it.sellingPrice ?? it.unitCost)}</td>
+                  <td style={{ ...styles.td, fontSize: 12.5 }}>
+                    {(() => { const m = itemMarkup(it); return `${currency(m.amount)} (${m.percent.toFixed(1)}%)`; })()}
+                  </td>
                   <td style={styles.td}>{currency(it.quantity * it.unitCost)}</td>
+                  <td style={{ ...styles.td, fontWeight: 600, color: 'var(--green)' }}>{currency(it.quantity * (it.sellingPrice ?? it.unitCost))}</td>
+                  <td style={{ ...styles.td, fontWeight: 600, color: itemEstProfit(it) >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(itemEstProfit(it))}</td>
                   {showActionsCol && (
                     <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       {canMove && <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>}
@@ -3087,6 +3108,19 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                 </tr>
               );
             })}
+            {filtered.length > 0 && (
+              <tr style={{ borderTop: '2px solid rgba(59,42,31,0.25)', fontWeight: 700 }}>
+                <td style={styles.td} colSpan={5}>TOTAL</td>
+                <td style={styles.td}>{totalQty}</td>
+                <td style={styles.td}></td>
+                <td style={styles.td}></td>
+                <td style={styles.td}></td>
+                <td style={styles.td}>{currency(totalBaseCostValue)}</td>
+                <td style={{ ...styles.td, color: 'var(--green)' }}>{currency(totalSellingValue)}</td>
+                <td style={{ ...styles.td, color: totalEstProfit >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(totalEstProfit)}</td>
+                {showActionsCol && <td className="depot-no-print" style={styles.td}></td>}
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
