@@ -519,12 +519,16 @@ const ROLES = {
 
 const PERMISSIONS = {
   superadmin: {
-    viewInventory: true, editInventory: true, deleteInventory: true,
-    manageCategories: true, manageSuppliers: true, manageLocations: true, manageOrders: true,
-    stockReceive: true, stockIssue: true, editMarkup: true,
-    pos: true, viewReports: true, viewSalesReports: false, print: true, cancelSales: true,
+    // Super Admin no longer runs their own inventory/POS/reports - their
+    // role is purely platform management: approving Client Admin accounts
+    // (Team Access), managing subscriptions (Client Accounts), and
+    // reviewing the platform-wide Activity Log.
+    viewInventory: false, editInventory: false, deleteInventory: false,
+    manageCategories: false, manageSuppliers: false, manageLocations: false, manageOrders: false,
+    stockReceive: false, stockIssue: false, editMarkup: false,
+    pos: false, viewReports: false, viewSalesReports: false, print: false, cancelSales: false,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
-    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: false,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
@@ -2050,7 +2054,15 @@ export default function InventorySystem() {
         ) : (
         <>
         {view === 'overview' && (
-          <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} staffInventoryStats={staffInventoryStats} role={myRole} onQuickMove={(it) => setMoveModal(it)} />
+          myRole === 'superadmin' ? (
+            <ClientAccountsView
+              clients={approvedUsers.filter((u) => u.role === 'client')}
+              allUsers={approvedUsers}
+              onManageSubscription={(client) => setSubscriptionModal(client)}
+            />
+          ) : (
+            <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} staffInventoryStats={staffInventoryStats} role={myRole} onQuickMove={(it) => setMoveModal(it)} />
+          )
         )}
 
         {view === 'inventory' && (
@@ -2878,7 +2890,6 @@ function SubscriptionPausedScreen({ role, onSignOut }) {
 function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
   const structure = [
     { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
-    { type: 'item', key: 'clientAccounts', label: 'Client Accounts', icon: Building2 },
     { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
     { type: 'group', label: 'Stock Management', icon: Boxes, children: [
       { key: 'inventory', label: 'Inventory', icon: Boxes },
@@ -3013,7 +3024,9 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
 
 function TopBar({ view, role, onAdd }) {
   const titles = {
-    overview: ['Overview', 'Warehouse status at a glance'],
+    overview: role === 'superadmin'
+      ? ['Client Accounts', 'Manage subscriptions for every business on the platform']
+      : ['Overview', 'Warehouse status at a glance'],
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
     staffInventory: ['Staff Inventory', 'Stock assigned to each staff member'],
