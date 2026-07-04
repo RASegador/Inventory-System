@@ -412,24 +412,24 @@ const PERMISSIONS = {
   superadmin: {
     viewInventory: true, editInventory: true, deleteInventory: true,
     manageCategories: true, manageSuppliers: true, manageLocations: true, manageOrders: true,
-    stockReceive: true, stockIssue: true,
-    pos: true, viewReports: true, print: true, cancelSales: true,
+    stockReceive: true, stockIssue: true, editMarkup: true,
+    pos: true, viewReports: true, viewSalesReports: false, print: true, cancelSales: true,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
     viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: true,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
     manageCategories: true, manageSuppliers: true, manageLocations: true, manageOrders: true,
-    stockReceive: true, stockIssue: true,
-    pos: true, viewReports: true, print: true, cancelSales: true,
+    stockReceive: true, stockIssue: true, editMarkup: true,
+    pos: true, viewReports: true, viewSalesReports: true, print: true, cancelSales: true,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
     viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: true,
   },
   staff: {
     viewInventory: true, editInventory: false, deleteInventory: false,
     manageCategories: false, manageSuppliers: false, manageLocations: false, manageOrders: false,
-    stockReceive: true, stockIssue: false,
-    pos: true, viewReports: false, print: false, cancelSales: false,
+    stockReceive: true, stockIssue: false, editMarkup: true,
+    pos: true, viewReports: false, viewSalesReports: false, print: false, cancelSales: false,
     manageUsers: false, manageAllRoles: false, manageSystem: false,
     viewOwnSales: true, viewActivityLogs: false, manageUserProfiles: false, createStaff: false,
   },
@@ -444,12 +444,13 @@ const VIEW_PERMISSIONS = {
   overview: null,
   pos: 'pos',
   inventory: 'viewInventory',
+  staffInventory: 'editInventory',
   suppliers: 'manageSuppliers',
   categories: 'manageCategories',
   locations: 'manageLocations',
   orders: 'manageOrders',
   delivery: 'viewReports',
-  sales: 'viewReports',
+  sales: 'viewSalesReports',
   mysales: 'viewOwnSales',
   history: 'viewReports',
   approvals: 'manageUserProfiles',
@@ -581,6 +582,9 @@ export default function InventorySystem() {
   const [moveModal, setMoveModal] = useState(null);
   const [supplierModal, setSupplierModal] = useState(null);
   const [orderModal, setOrderModal] = useState(null);
+  const [assignModal, setAssignModal] = useState(null);
+  const [markupModal, setMarkupModal] = useState(null);
+  const [selectedStaffUid, setSelectedStaffUid] = useState('');
   const [confirmModal, setConfirmModal] = useState(null); // {kind: 'item'|'supplier'|'order', target}
   const [deliveryStatusModal, setDeliveryStatusModal] = useState(null);
   const [toast, setToast] = useState(null);
@@ -913,7 +917,7 @@ export default function InventorySystem() {
           const itemsSnap = await getDocs(query(collection(db, 'items'), where('ownerId', '==', ownerId)));
           if (itemsSnap.empty) {
             const seed = seedItems().map((it) => ({ ...it, id: 'i' + Math.random().toString(36).slice(2, 9) }));
-            await Promise.all(seed.map((it) => setDoc(doc(db, 'items', it.id), { ...it, ownerId })));
+            await Promise.all(seed.map((it) => setDoc(doc(db, 'items', it.id), { ...it, ownerId, holderId: ownerId })));
             const moves = seedMovements(seed).map((m) => ({ ...m, id: 'm' + Math.random().toString(36).slice(2, 9) }));
             await Promise.all(moves.map((m) => setDoc(doc(db, 'movements', m.id), { ...m, ownerId })));
           }
@@ -937,7 +941,14 @@ export default function InventorySystem() {
 
       if (cancelled) return;
 
-      unsubs.push(onSnapshot(query(collection(db, 'items'), where('ownerId', '==', ownerId)), (snap) => {
+      // Staff only ever see stock assigned to THEM (holderId) - never the
+      // Client Admin's master inventory or another staff member's stock.
+      // Managers see the whole tenant's items regardless of holder, since
+      // they need full oversight to assign/edit/reclaim stock.
+      const itemsQuery = isManager
+        ? query(collection(db, 'items'), where('ownerId', '==', ownerId))
+        : query(collection(db, 'items'), where('ownerId', '==', ownerId), where('holderId', '==', user.uid));
+      unsubs.push(onSnapshot(itemsQuery, (snap) => {
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       }));
       unsubs.push(onSnapshot(query(collection(db, 'suppliers'), where('ownerId', '==', ownerId)), (snap) => {
@@ -961,9 +972,15 @@ export default function InventorySystem() {
           snap.docs.forEach((d) => { map[d.id] = d.data(); });
           setDeliveryStatuses(map);
         }));
-        unsubs.push(onSnapshot(query(collection(db, 'sales'), where('ownerId', '==', ownerId)), (snap) => {
-          setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-        }));
+        // Super Admin has no sales report access at all per policy - skip
+        // the subscription entirely rather than just hiding it in the UI.
+        if (myRole !== 'superadmin') {
+          unsubs.push(onSnapshot(query(collection(db, 'sales'), where('ownerId', '==', ownerId)), (snap) => {
+            setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
+          }));
+        } else {
+          setSales([]);
+        }
         unsubs.push(onSnapshot(query(collection(db, 'orders'), where('ownerId', '==', ownerId)), (snap) => {
           setOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.orderDate - a.orderDate));
         }));
@@ -1001,12 +1018,13 @@ export default function InventorySystem() {
   const saveItem = async (draft) => {
     if (!can(myRole, 'editInventory')) { showToast("You don't have permission to edit inventory"); return; }
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
+    const holderId = draft.holderId || ownerId;
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
     const markupType = draft.markupType === 'fixed' ? 'fixed' : 'percent';
     const markupValue = Math.max(0, Number(draft.markupValue) || 0);
     const sellingPrice = computeSellingPrice(unitCost, markupType, markupValue);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, unitCost, markupType, markupValue, sellingPrice });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, unitCost, markupType, markupValue, sellingPrice });
       if (!draft.id) playAddSound();
       showToast(draft.id ? `Updated ${draft.sku}` : `Added ${draft.sku} to the manifest`);
     } catch (e) {
@@ -1028,6 +1046,89 @@ export default function InventorySystem() {
       showToast('Could not remove item — check your connection');
     }
     setConfirmModal(null);
+  };
+
+  // Transfers stock out of the Client Admin's own master inventory into a
+  // specific staff member's own separate inventory (a real stock movement,
+  // logged on both sides) - or, if that staff member already has their own
+  // copy of this item (tracked via sourceItemId), tops it up instead of
+  // creating a duplicate line. The staff member's copy gets its own
+  // independent quantity and starts with no markup - they set their own
+  // from there.
+  const assignInventoryToStaff = async ({ sourceItemId, staffUid, quantity, unitCost }) => {
+    if (!can(myRole, 'editInventory')) { showToast("You don't have permission to assign inventory"); return; }
+    const source = items.find((i) => i.id === sourceItemId);
+    const staff = approvedUsers.find((u) => u.id === staffUid);
+    if (!source || !staff) { showToast('Pick an item and a staff member'); return; }
+    const qty = Math.max(1, Number(quantity) || 0);
+    if (qty > source.quantity) { showToast(`Only ${source.quantity} available to assign`); return; }
+    const cost = Math.max(0, Number(unitCost) || 0) || source.unitCost;
+    const now = Date.now();
+    const existing = items.find((i) => i.holderId === staffUid && i.sourceItemId === sourceItemId);
+
+    try {
+      await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty });
+
+      let staffItemId;
+      if (existing) {
+        staffItemId = existing.id;
+        const newQty = existing.quantity + qty;
+        await setDoc(doc(db, 'items', existing.id), {
+          ...existing, quantity: newQty, unitCost: cost,
+          sellingPrice: computeSellingPrice(cost, existing.markupType || 'percent', existing.markupValue || 0),
+        });
+      } else {
+        staffItemId = 'i' + Math.random().toString(36).slice(2, 9);
+        const markupType = 'percent';
+        const markupValue = 0;
+        await setDoc(doc(db, 'items', staffItemId), {
+          id: staffItemId, ownerId, holderId: staffUid, sourceItemId: source.id,
+          sku: source.sku, name: source.name, category: source.category,
+          quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
+          location: source.location, supplierIds: getSupplierIds(source),
+          markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
+        });
+      }
+
+      const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'movements', mvOut), {
+        id: mvOut, itemId: source.id, type: 'out', qty,
+        reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId,
+      });
+      const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'movements', mvIn), {
+        id: mvIn, itemId: staffItemId, type: 'in', qty,
+        reason: 'Received from Client Admin', timestamp: now, ownerId,
+      });
+
+      playAddSound();
+      showToast(`Assigned ${qty} × ${source.sku} to ${staff.fullName || staff.email}`);
+    } catch (e) {
+      showToast('Could not assign inventory — check your connection');
+    }
+    setAssignModal(null);
+  };
+
+  // Staff can only ever touch the markup on their OWN assigned items - base
+  // cost, quantity, SKU, and everything else stays admin-controlled. Also
+  // usable by a manager adjusting markup directly, since it's just a subset
+  // of what saveItem already allows them.
+  const updateMarkup = async (item, markupType, markupValue) => {
+    const isOwnItem = item.holderId === user.uid;
+    if (!isOwnItem && !can(myRole, 'editInventory')) {
+      showToast("You don't have permission to edit this item");
+      return;
+    }
+    const mt = markupType === 'fixed' ? 'fixed' : 'percent';
+    const mv = Math.max(0, Number(markupValue) || 0);
+    const sellingPrice = computeSellingPrice(item.unitCost, mt, mv);
+    try {
+      await setDoc(doc(db, 'items', item.id), { markupType: mt, markupValue: mv, sellingPrice }, { merge: true });
+      showToast(`Markup updated for ${item.sku}`);
+    } catch (e) {
+      showToast('Could not update markup — check your connection');
+    }
+    setMarkupModal(null);
   };
 
   const saveSupplier = async (draft) => {
@@ -1319,8 +1420,20 @@ export default function InventorySystem() {
     setConfirmModal(null);
   };
 
+  // Staff's `items` state is already query-scoped to just their own holderId
+  // (see the data-loading effect), so it needs no further filtering here.
+  // A manager's `items` state includes the WHOLE tenant (their own master
+  // inventory + everything assigned to every staff member) - "my own
+  // inventory" for a manager means just the items they still personally
+  // hold, i.e. haven't assigned out. Legacy items from before this feature
+  // (no holderId yet) default to counting as the admin's own.
+  const myOwnItems = useMemo(() => {
+    if (myRole === 'staff') return items;
+    return items.filter((it) => !it.holderId || it.holderId === ownerId);
+  }, [items, myRole, ownerId]);
+
   const filtered = useMemo(() => {
-    let list = items.filter((it) => {
+    let list = myOwnItems.filter((it) => {
       const matchesSearch =
         it.name.toLowerCase().includes(search.toLowerCase()) ||
         it.sku.toLowerCase().includes(search.toLowerCase());
@@ -1335,21 +1448,21 @@ export default function InventorySystem() {
       return 0;
     });
     return list;
-  }, [items, search, categoryFilter, sortKey]);
+  }, [myOwnItems, search, categoryFilter, sortKey]);
 
   const totals = useMemo(() => {
-    const totalUnits = items.reduce((s, i) => s + i.quantity, 0);
-    const totalValue = items.reduce((s, i) => s + i.quantity * i.unitCost, 0);
-    const lowStock = items.filter((i) => i.quantity <= i.reorderPoint);
-    return { totalSkus: items.length, totalUnits, totalValue, lowStock };
+    const totalUnits = myOwnItems.reduce((s, i) => s + i.quantity, 0);
+    const totalValue = myOwnItems.reduce((s, i) => s + i.quantity * i.unitCost, 0);
+    const lowStock = myOwnItems.filter((i) => i.quantity <= i.reorderPoint);
+    return { totalSkus: myOwnItems.length, totalUnits, totalValue, lowStock };
   }, [items]);
 
   const categoryData = useMemo(() => {
     return categories.map((cat) => ({
       category: cat.split(' ')[0],
-      units: items.filter((i) => i.category === cat).reduce((s, i) => s + i.quantity, 0),
+      units: myOwnItems.filter((i) => i.category === cat).reduce((s, i) => s + i.quantity, 0),
     })).filter((c) => c.units > 0);
-  }, [items, categories]);
+  }, [myOwnItems, categories]);
 
   // Profit is derived entirely from completed (non-cancelled) sales, which
   // already carry a cost/profit snapshot per line from the moment they were
@@ -1397,7 +1510,7 @@ export default function InventorySystem() {
 
   const deliveryRows = useMemo(() => {
     const rows = [];
-    items.forEach((it) => {
+    myOwnItems.forEach((it) => {
       getSupplierIds(it).forEach((sid) => {
         const supplier = suppliers.find((s) => s.id === sid);
         if (!supplier) return;
@@ -1421,7 +1534,7 @@ export default function InventorySystem() {
       });
     });
     return rows;
-  }, [items, suppliers, movements, deliveryStatuses]);
+  }, [myOwnItems, suppliers, movements, deliveryStatuses]);
 
   const supplierMap = useMemo(() => Object.fromEntries(suppliers.map((s) => [s.id, s])), [suppliers]);
 
@@ -1523,6 +1636,20 @@ export default function InventorySystem() {
             search={search} setSearch={setSearch}
             categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter}
             sortKey={sortKey} setSortKey={setSortKey}
+            onEdit={(it) => setItemModal(it)}
+            onDelete={(it) => setConfirmModal({ kind: 'item', target: it })}
+            onMove={(it) => setMoveModal(it)}
+            onEditMarkup={(it) => setMarkupModal(it)}
+          />
+        )}
+
+        {view === 'staffInventory' && (
+          <StaffInventoryView
+            items={items}
+            staffList={approvedUsers.filter((u) => u.role === 'staff')}
+            selectedStaffUid={selectedStaffUid}
+            setSelectedStaffUid={setSelectedStaffUid}
+            onAssign={() => setAssignModal(true)}
             onEdit={(it) => setItemModal(it)}
             onDelete={(it) => setConfirmModal({ kind: 'item', target: it })}
             onMove={(it) => setMoveModal(it)}
@@ -1669,6 +1796,23 @@ export default function InventorySystem() {
           suppliers={suppliers}
           onClose={() => setOrderModal(null)}
           onSave={saveOrder}
+        />
+      )}
+
+      {assignModal && (
+        <AssignInventoryModal
+          myOwnItems={myOwnItems}
+          staffList={approvedUsers.filter((u) => u.role === 'staff')}
+          onClose={() => setAssignModal(null)}
+          onSave={assignInventoryToStaff}
+        />
+      )}
+
+      {markupModal && (
+        <MarkupModal
+          item={markupModal}
+          onClose={() => setMarkupModal(null)}
+          onSave={updateMarkup}
         />
       )}
 
@@ -2225,6 +2369,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
     { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
     { type: 'group', label: 'Stock Management', icon: Boxes, children: [
       { key: 'inventory', label: 'Inventory', icon: Boxes },
+      { key: 'staffInventory', label: 'Staff Inventory', icon: User },
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
       { key: 'orders', label: 'Orders', icon: ClipboardList },
       { key: 'categories', label: 'Categories', icon: Tag },
@@ -2403,7 +2548,7 @@ function StatCard({ icon: Icon, label, value, accent }) {
 }
 
 function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
-  const canViewProfit = can(role, 'viewReports');
+  const canViewProfit = can(role, 'viewSalesReports');
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <div style={styles.statGrid} className="depot-stat-grid">
@@ -2535,7 +2680,7 @@ function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
   );
 }
 
-function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove }) {
+function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove, onEditMarkup }) {
   const supplierNames = (it) => getSupplierIds(it).map((sid) => supplierMap[sid]?.name).filter(Boolean);
 
   const exportHeaders = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Value'];
@@ -2546,9 +2691,10 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
   const handleDownload = () => downloadCSV('inventory.csv', exportHeaders, exportRows());
   const handleDownloadPDF = () => downloadPDF('inventory.pdf', 'Inventory', exportHeaders, exportRows());
   const canEdit = can(role, 'editInventory');
+  const canEditMarkup = can(role, 'editMarkup');
   const canDelete = can(role, 'deleteInventory');
   const canMove = can(role, 'stockReceive') || can(role, 'stockIssue');
-  const showActionsCol = canEdit || canDelete || canMove;
+  const showActionsCol = canEdit || canDelete || canMove || canEditMarkup;
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
@@ -2614,6 +2760,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                     <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       {canMove && <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>}
                       {canEdit && <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>}
+                      {!canEdit && canEditMarkup && <IconBtn onClick={() => onEditMarkup(it)} title="Update markup"><PesoIcon size={14} /></IconBtn>}
                       {canDelete && <IconBtn onClick={() => onDelete(it)} title="Delete" danger><Trash2 size={14} /></IconBtn>}
                     </td>
                   )}
@@ -2623,6 +2770,78 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedStaffUid, onAssign, onEdit, onDelete, onMove }) {
+  const staffItems = useMemo(
+    () => items.filter((it) => it.holderId === selectedStaffUid),
+    [items, selectedStaffUid]
+  );
+  const selectedStaff = staffList.find((s) => s.id === selectedStaffUid);
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+        <select className="depot-select" value={selectedStaffUid} onChange={(e) => setSelectedStaffUid(e.target.value)} style={styles.select}>
+          <option value="">— Select a staff member —</option>
+          {staffList.map((s) => <option key={s.id} value={s.id}>{s.fullName || s.email}</option>)}
+        </select>
+        {selectedStaffUid && (
+          <button className="depot-btn" style={styles.primaryBtn} onClick={onAssign}>
+            <Plus size={16} /> Assign Inventory
+          </button>
+        )}
+      </div>
+
+      {staffList.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>No staff accounts yet — create one from Team Access.</div></div>
+      ) : !selectedStaffUid ? (
+        <div style={styles.panel}><div style={styles.emptyState}>Pick a staff member above to view and manage their inventory.</div></div>
+      ) : staffItems.length === 0 ? (
+        <div style={styles.panel}>
+          <div style={styles.emptyState}>{selectedStaff?.fullName || selectedStaff?.email} has no assigned inventory yet.</div>
+        </div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table} className="depot-table">
+            <thead>
+              <tr>
+                {['SKU', 'Item', 'Category', 'Qty', 'Base Cost', 'Markup', 'Selling Price', 'Value', ''].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {staffItems.map((it) => {
+                const low = it.quantity <= it.reorderPoint;
+                const markupLabel = it.markupType === 'fixed' ? `${currency(it.markupValue || 0)} flat` : `${it.markupValue || 0}%`;
+                return (
+                  <tr key={it.id} className="depot-row">
+                    <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500 }}>{it.sku}</td>
+                    <td style={styles.td}>{it.name}</td>
+                    <td style={styles.td}><span style={styles.pill}>{it.category}</span></td>
+                    <td style={styles.td}>
+                      <span style={{ color: low ? 'var(--red)' : 'var(--ink)', fontWeight: low ? 700 : 500 }}>{it.quantity}</span>
+                      {low && <AlertTriangle size={12} color="var(--red)" style={{ marginLeft: 5, verticalAlign: -1 }} />}
+                    </td>
+                    <td style={styles.td}>{currency(it.unitCost)}</td>
+                    <td style={styles.td}>{markupLabel}</td>
+                    <td style={styles.td}>{currency(it.sellingPrice ?? it.unitCost)}</td>
+                    <td style={styles.td}>{currency(it.quantity * it.unitCost)}</td>
+                    <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                      <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>
+                      <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>
+                      <IconBtn onClick={() => onDelete(it)} title="Remove" danger><Trash2 size={14} /></IconBtn>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -4335,6 +4554,124 @@ function SupplierModal({ draft, onClose, onSave }) {
           <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
             disabled={!valid} onClick={() => onSave(form)}>
             {draft ? 'Save Changes' : 'Add Supplier'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
+  const [sourceItemId, setSourceItemId] = useState('');
+  const [staffUid, setStaffUid] = useState('');
+  const [quantity, setQuantity] = useState(1);
+  const [unitCost, setUnitCost] = useState(0);
+
+  const source = myOwnItems.find((it) => it.id === sourceItemId);
+
+  const handleItemChange = (id) => {
+    setSourceItemId(id);
+    const it = myOwnItems.find((i) => i.id === id);
+    if (it) setUnitCost(it.unitCost);
+  };
+
+  const valid = sourceItemId && staffUid && Number(quantity) > 0 && source && Number(quantity) <= source.quantity;
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>ASSIGN INVENTORY TO STAFF</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <Field label="Item (from your own inventory)">
+            <select className="depot-select" style={styles.modalInput} value={sourceItemId}
+              onChange={(e) => handleItemChange(e.target.value)}>
+              <option value="">— Select an item —</option>
+              {myOwnItems.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name} ({it.quantity} on hand)</option>)}
+            </select>
+          </Field>
+
+          <Field label="Staff Member">
+            <select className="depot-select" style={styles.modalInput} value={staffUid} onChange={(e) => setStaffUid(e.target.value)}>
+              <option value="">— Select a staff member —</option>
+              {staffList.map((s) => <option key={s.id} value={s.id}>{s.fullName || s.email}</option>)}
+            </select>
+          </Field>
+
+          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+            <Field label="Quantity to Assign" grow>
+              <input className="depot-input" type="number" min="1" max={source?.quantity || 1} style={styles.modalInput}
+                value={quantity} onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
+            </Field>
+            <Field label="Base Cost (₱)" grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
+                value={unitCost} onChange={(e) => setUnitCost(Math.max(0, Number(e.target.value)))} />
+            </Field>
+          </div>
+          {source && Number(quantity) > source.quantity && (
+            <div style={{ fontSize: 12, color: 'var(--red)' }}>Only {source.quantity} available in your inventory.</div>
+          )}
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>
+            This moves stock out of your own inventory into this staff member's separate inventory. They'll set their own markup from there.
+          </div>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
+            disabled={!valid} onClick={() => onSave({ sourceItemId, staffUid, quantity, unitCost })}>
+            Assign
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MarkupModal({ item, onClose, onSave }) {
+  const [markupType, setMarkupType] = useState(item.markupType === 'fixed' ? 'fixed' : 'percent');
+  const [markupValue, setMarkupValue] = useState(item.markupValue || 0);
+  const sellingPricePreview = computeSellingPrice(item.unitCost, markupType, markupValue);
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>UPDATE MARKUP — {item.sku}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
+            Base cost is set by your Client Admin and can't be changed here — only your markup.
+          </div>
+          <Field label="Base Cost (₱)">
+            <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(59,42,31,0.05)', color: 'rgba(59,42,31,0.6)' }}>
+              {currency(item.unitCost)}
+            </div>
+          </Field>
+          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+            <Field label="Markup Type" grow>
+              <select className="depot-select" style={styles.modalInput} value={markupType} onChange={(e) => setMarkupType(e.target.value)}>
+                <option value="percent">Percentage</option>
+                <option value="fixed">Fixed Amount (₱)</option>
+              </select>
+            </Field>
+            <Field label={markupType === 'fixed' ? 'Markup (₱)' : 'Markup (%)'} grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
+                value={markupValue} onChange={(e) => setMarkupValue(Math.max(0, Number(e.target.value)))} />
+            </Field>
+            <Field label="Selling Price" grow>
+              <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(79,138,99,0.08)', fontWeight: 700, color: 'var(--green)' }}>
+                {currency(sellingPricePreview)}
+              </div>
+            </Field>
+          </div>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item, markupType, markupValue)}>
+            Save Markup
           </button>
         </div>
       </div>
