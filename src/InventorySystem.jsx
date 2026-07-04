@@ -375,7 +375,7 @@ function getLatestSubscriptionPeriod(subscription) {
 function isSubscriptionActive(subscription) {
   const latest = getLatestSubscriptionPeriod(subscription);
   if (!latest) return true;
-  return latest.end >= Date.now();
+  return latest.endDate >= Date.now();
 }
 
 // Days remaining until the current period lapses (negative if already
@@ -383,7 +383,7 @@ function isSubscriptionActive(subscription) {
 function daysUntilExpiration(subscription) {
   const latest = getLatestSubscriptionPeriod(subscription);
   if (!latest) return null;
-  return Math.ceil((latest.end - Date.now()) / DAY_MS);
+  return Math.ceil((latest.endDate - Date.now()) / DAY_MS);
 }
 
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
