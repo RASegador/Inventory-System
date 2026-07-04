@@ -3483,14 +3483,83 @@ function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedSta
 
 function ClientAccountsView({ clients, allUsers, onManageSubscription }) {
   const [expandedUid, setExpandedUid] = useState(null);
+  const today = new Date();
+  const [reportMonth, setReportMonth] = useState(today.getMonth() + 1);
+  const [reportYear, setReportYear] = useState(today.getFullYear());
 
   const staffFor = (clientUid) => allUsers.filter((u) => u.role === 'staff' && u.parentId === clientUid);
+  const staffCountFor = (clientUid) => staffFor(clientUid).length;
 
   const expiringWarnings = useMemo(() => {
     return clients
       .map((c) => ({ client: c, days: daysUntilExpiration(c.subscription) }))
       .filter((x) => x.days !== null && x.days >= 0 && x.days <= 5);
   }, [clients]);
+
+  // --- Reports --------------------------------------------------------
+  // All six reuse the same downloadCSV helper used everywhere else in the
+  // app - CSV opens fine in Excel, so no separate library/format needed.
+  const clientRow = (c) => {
+    const latest = getLatestSubscriptionPeriod(c.subscription);
+    return {
+      name: c.fullName || '—', email: c.email, staff: staffCountFor(c.id),
+      period: latest ? `${MONTH_NAMES[latest.month - 1]} ${latest.year}` : '—',
+      start: latest ? formatDate(latest.startDate) : '—',
+      end: latest ? formatDate(latest.endDate) : '—',
+      payment: latest ? (latest.paymentStatus === 'paid' ? 'Paid' : 'Unpaid') : '—',
+      active: isSubscriptionActive(c.subscription),
+      days: daysUntilExpiration(c.subscription),
+    };
+  };
+
+  const downloadMonthlyReport = () => {
+    const monthLabel = `${MONTH_NAMES[reportMonth - 1]} ${reportYear}`;
+    const headers = ['Client', 'Email', 'Staff', 'Payment Status (this month)', 'Start', 'End'];
+    const rows = clients.map((c) => {
+      const p = (c.subscription?.history || []).find((x) => x.month === reportMonth && x.year === reportYear);
+      return [
+        c.fullName || '—', c.email, staffCountFor(c.id),
+        p ? (p.paymentStatus === 'paid' ? 'Paid' : 'Unpaid') : 'No record',
+        p ? formatDate(p.startDate) : '—', p ? formatDate(p.endDate) : '—',
+      ];
+    });
+    downloadCSV(`subscription-report-${monthLabel.replace(' ', '-')}.csv`, headers, rows);
+  };
+
+  const downloadFiltered = (filename, headers, filterFn, mapFn) => {
+    const rows = clients.filter(filterFn).map(mapFn);
+    downloadCSV(filename, headers, rows);
+  };
+
+  const downloadPaidClients = () => downloadFiltered(
+    'paid-clients.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Staff'],
+    (c) => { const r = clientRow(c); return r.payment === 'Paid'; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.staff]; }
+  );
+
+  const downloadUnpaidClients = () => downloadFiltered(
+    'unpaid-clients.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Staff'],
+    (c) => { const r = clientRow(c); return r.payment === 'Unpaid'; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.staff]; }
+  );
+
+  const downloadExpiredSubscriptions = () => downloadFiltered(
+    'expired-subscriptions.csv', ['Client', 'Email', 'Last Period', 'Expired On', 'Days Since Expired', 'Staff'],
+    (c) => { const r = clientRow(c); return !r.active && r.period !== '—'; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.days !== null ? Math.abs(r.days) : '—', r.staff]; }
+  );
+
+  const downloadUpcomingExpiration = () => downloadFiltered(
+    'upcoming-expiration.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Days Remaining', 'Payment Status', 'Staff'],
+    (c) => { const r = clientRow(c); return r.active && r.days !== null && r.days <= 30; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.days, r.payment, r.staff]; }
+  );
+
+  const downloadActiveSubscribers = () => downloadFiltered(
+    'active-subscribers.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Payment Status', 'Staff'],
+    (c) => { const r = clientRow(c); return r.active; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.payment, r.staff]; }
+  );
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
@@ -3515,6 +3584,34 @@ function ClientAccountsView({ clients, allUsers, onManageSubscription }) {
         <StatCard icon={CheckCircle2} label="Active Subscriptions" value={clients.filter((c) => isSubscriptionActive(c.subscription)).length} accent="var(--green)" />
         <StatCard icon={AlertTriangle} label="Expired Subscriptions" value={clients.filter((c) => !isSubscriptionActive(c.subscription)).length} accent="var(--red)" />
         <StatCard icon={User} label="Total Staff" value={allUsers.filter((u) => u.role === 'staff').length} accent="#2E5C87" />
+      </div>
+
+      <div style={{ ...styles.panel, marginBottom: 16 }}>
+        <div style={styles.panelHeader}>
+          <Download size={15} />
+          <span>SUBSCRIPTION REPORTS</span>
+        </div>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap', marginTop: 12, marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 4 }}>Monthly Subscription Report</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <select className="depot-select" value={reportMonth} onChange={(e) => setReportMonth(Number(e.target.value))} style={{ ...styles.select, padding: '7px 8px' }}>
+                {MONTH_NAMES.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+              </select>
+              <input className="depot-input" type="number" value={reportYear} onChange={(e) => setReportYear(Number(e.target.value))} style={{ ...styles.select, width: 80, padding: '7px 8px' }} />
+              <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadMonthlyReport}>
+                <Download size={13} /> Export
+              </button>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadPaidClients}><Download size={13} /> Paid Clients</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadUnpaidClients}><Download size={13} /> Unpaid Clients</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadExpiredSubscriptions}><Download size={13} /> Expired Subscriptions</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadUpcomingExpiration}><Download size={13} /> Upcoming Expiration (30 days)</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadActiveSubscribers}><Download size={13} /> Active Subscribers</button>
+        </div>
       </div>
 
       {clients.length === 0 ? (
