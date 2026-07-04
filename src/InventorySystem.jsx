@@ -9,7 +9,7 @@ import {
   inMemoryPersistence, setPersistence,
 } from 'firebase/auth';
 import {
-  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
+  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where, arrayUnion,
 } from 'firebase/firestore';
 import {
   Package, AlertTriangle, Search, Plus, Pencil, Trash2, X,
@@ -717,22 +717,50 @@ export default function InventorySystem() {
   const effectiveLogo = effectiveBranding.logoDataUri || LOGO_DATA_URI;
   const activeTheme = THEMES[effectiveBranding.themeKey] || THEMES[DEFAULT_THEME_KEY];
 
-  // Super Admin manages Team Access for the whole platform (every account).
-  // A Client only ever subscribes to the staff THEY created - scoped via
-  // `parentId`, matching Firestore rules - so they can never see another
-  // Client's roster or other Client/Super Admin accounts.
+  // Super Admin manages Team Access for the whole platform (every account) -
+  // an unfiltered collection listener, which works fine for them since
+  // isSuperAdmin() alone (not combined with per-document field matching)
+  // is trivially provable across the whole collection.
+  //
+  // A Client reads each of THEIR staff individually, driven by the
+  // `staffUids` array recorded on their own profile (see
+  // createStaffAccount). This sidesteps a Firestore list-query edge case:
+  // a collection query filtered by `where('parentId', '==', myUid)` -
+  // logically sound and confirmed correct against the security rules -
+  // was nonetheless silently denied by Firestore with no reliable fix
+  // found. Reading each staff document individually (a plain get(), not a
+  // list) avoids that edge case entirely.
+  const staffUidsKey = JSON.stringify(myProfile?.staffUids || []);
   useEffect(() => {
     if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
-    const usersQuery = myRole === 'superadmin'
-      ? collection(db, 'users')
-      : query(collection(db, 'users'), where('parentId', '==', user.uid));
-    const unsub = onSnapshot(usersQuery, (snap) => {
-      const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
+
+    if (myRole === 'superadmin') {
+      const unsub = onSnapshot(collection(db, 'users'), (snap) => {
+        const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
+        setPendingUsers(all.filter((u) => !u.approved));
+        setApprovedUsers(all.filter((u) => u.approved));
+      }, logSnapErr('teamRoster'));
+      return unsub;
+    }
+
+    const staffUids = JSON.parse(staffUidsKey);
+    if (staffUids.length === 0) { setPendingUsers([]); setApprovedUsers([]); return; }
+
+    const docsMap = {};
+    const refresh = () => {
+      const all = Object.values(docsMap);
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
-    }, logSnapErr('teamRoster'));
-    return unsub;
-  }, [user, isManager, myRole]);
+    };
+    const unsubs = staffUids.map((uid) =>
+      onSnapshot(doc(db, 'users', uid), (d) => {
+        if (d.exists()) docsMap[uid] = { id: d.id, ...d.data(), role: resolveRole(d.data()) };
+        else delete docsMap[uid];
+        refresh();
+      }, logSnapErr('teamRoster'))
+    );
+    return () => unsubs.forEach((u) => u());
+  }, [user, isManager, myRole, staffUidsKey]);
 
   // Lets a Client Admin (or Super Admin, for support) provision a Staff
   // account directly - no self-signup/approval step. Uses a throwaway
@@ -764,6 +792,15 @@ export default function InventorySystem() {
         contactNumber: (contactNumber || '').trim(), address: (address || '').trim(),
         userIdNumber: generateUserIdNumber(),
       });
+      // Record this staff member on OUR OWN profile too. This is what lets
+      // Team Access find "my staff" via a simple read of our own document
+      // instead of a collection-wide query for "anyone whose parentId is
+      // me" - the former is a plain, reliable single-document read; the
+      // latter turned out to be an unreliable Firestore list-query edge
+      // case that silently denied results with no clear fix.
+      await setDoc(doc(db, 'users', user.uid), {
+        staffUids: arrayUnion(cred.user.uid),
+      }, { merge: true });
       await signOut(secondaryAuth);
       playAddSound();
       showToast(`Staff account created for ${email.trim()}`);
