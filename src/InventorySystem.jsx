@@ -173,6 +173,14 @@ function printPage() {
   window.print();
 }
 
+// Every onSnapshot below is wired with this, so if a listener ever gets
+// blocked (e.g. by a rules change), the console tells us exactly which
+// one - rather than every listener producing the same generic, impossible
+// to distinguish "permission-denied" message.
+function logSnapErr(label) {
+  return (err) => console.error(`[snapshot:${label}]`, err?.code || err);
+}
+
 // Lightweight, dependency-free sound effects using the Web Audio API - no
 // external audio files to host, license, or fetch. Every entry point below
 // is wrapped in try/catch so a sound failure (e.g. an older browser, or a
@@ -624,7 +632,7 @@ export default function InventorySystem() {
       unsub = onSnapshot(doc(db, 'users', user.uid), (d) => {
         setMyProfile(d.exists() ? d.data() : null);
         setProfileChecked(true);
-      });
+      }, logSnapErr('myProfile'));
     })();
     return () => { if (unsub) unsub(); };
   }, [user]);
@@ -684,7 +692,7 @@ export default function InventorySystem() {
   useEffect(() => {
     const unsub = onSnapshot(doc(db, 'config', 'branding'), (d) => {
       setBranding(d.exists() ? d.data() : {});
-    }, () => setBranding({}));
+    }, (err) => { logSnapErr('platformBranding')(err); setBranding({}); });
     return unsub;
   }, []);
 
@@ -696,7 +704,7 @@ export default function InventorySystem() {
     if (!ownerId) { setTenantBranding(null); return; }
     const unsub = onSnapshot(doc(db, 'config', 'branding_' + ownerId), (d) => {
       setTenantBranding(d.exists() ? d.data() : {});
-    }, () => setTenantBranding({}));
+    }, (err) => { logSnapErr('tenantBranding')(err); setTenantBranding({}); });
     return unsub;
   }, [ownerId]);
 
@@ -722,7 +730,7 @@ export default function InventorySystem() {
       const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
-    });
+    }, logSnapErr('teamRoster'));
     return unsub;
   }, [user, isManager, myRole]);
 
@@ -958,40 +966,40 @@ export default function InventorySystem() {
         : query(collection(db, 'items'), where('ownerId', '==', ownerId), where('holderId', '==', user.uid));
       unsubs.push(onSnapshot(itemsQuery, (snap) => {
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      }));
+      }, logSnapErr('items')));
       unsubs.push(onSnapshot(query(collection(db, 'suppliers'), where('ownerId', '==', ownerId)), (snap) => {
         setSuppliers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      }));
+      }, logSnapErr('suppliers')));
       unsubs.push(onSnapshot(doc(db, 'config', categoriesDocId), (d) => {
         setCategories(d.exists() ? (d.data().list || []) : DEFAULT_CATEGORIES.slice());
-      }));
+      }, logSnapErr('categories')));
       unsubs.push(onSnapshot(doc(db, 'config', locationsDocId), (d) => {
         setLocations(d.exists() ? (d.data().list || []) : DEFAULT_LOCATIONS.slice());
-      }));
+      }, logSnapErr('locations')));
 
       // Report-like data: only managers (Client + Super Admin) can read these under
       // the Firestore rules, so staff skip subscribing to avoid permission errors.
       if (isManager) {
         unsubs.push(onSnapshot(query(collection(db, 'movements'), where('ownerId', '==', ownerId)), (snap) => {
           setMovements(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-        }));
+        }, logSnapErr('movements')));
         unsubs.push(onSnapshot(query(collection(db, 'deliveryStatus'), where('ownerId', '==', ownerId)), (snap) => {
           const map = {};
           snap.docs.forEach((d) => { map[d.id] = d.data(); });
           setDeliveryStatuses(map);
-        }));
+        }, logSnapErr('deliveryStatus')));
         // Super Admin has no sales report access at all per policy - skip
         // the subscription entirely rather than just hiding it in the UI.
         if (myRole !== 'superadmin') {
           unsubs.push(onSnapshot(query(collection(db, 'sales'), where('ownerId', '==', ownerId)), (snap) => {
             setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-          }));
+          }, logSnapErr('sales-manager')));
         } else {
           setSales([]);
         }
         unsubs.push(onSnapshot(query(collection(db, 'orders'), where('ownerId', '==', ownerId)), (snap) => {
           setOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.orderDate - a.orderDate));
-        }));
+        }, logSnapErr('orders')));
         // Super Admin monitors login activity platform-wide; a Client only
         // sees activity for their own tenant (themselves + their staff).
         const logsQuery = myRole === 'superadmin'
@@ -999,7 +1007,7 @@ export default function InventorySystem() {
           : query(collection(db, 'loginLogs'), where('ownerId', '==', ownerId));
         unsubs.push(onSnapshot(logsQuery, (snap) => {
           setLoginLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-        }));
+        }, logSnapErr('loginLogs')));
       } else {
         setMovements([]);
         setDeliveryStatuses({});
@@ -1009,7 +1017,7 @@ export default function InventorySystem() {
         // rule) scopes this, so there's no risk of over-fetching then hiding.
         unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
           setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-        }));
+        }, logSnapErr('sales-staff')));
       }
 
       setLoaded(true);
