@@ -9,7 +9,7 @@ import {
   inMemoryPersistence, setPersistence,
 } from 'firebase/auth';
 import {
-  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where, arrayUnion,
+  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where, arrayUnion, arrayRemove,
 } from 'firebase/firestore';
 import {
   Package, AlertTriangle, Search, Plus, Pencil, Trash2, X,
@@ -890,6 +890,12 @@ export default function InventorySystem() {
   const revokeUser = async (uid) => {
     try {
       await deleteDoc(doc(db, 'users', uid));
+      // Only relevant when a Client revokes their own staff (their roster
+      // is driven by this array) - harmless no-op for Super Admin removing
+      // any other account, since Super Admin's list isn't array-driven.
+      if (myRole === 'client') {
+        try { await setDoc(doc(db, 'users', user.uid), { staffUids: arrayRemove(uid) }, { merge: true }); } catch {}
+      }
       showToast('Access revoked');
     } catch (e) {
       showToast('Could not revoke access — check your connection');
@@ -4392,6 +4398,16 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
     reader.readAsDataURL(file);
   };
 
+  // Super Admin's approvedUsers list is unscoped (every account on the
+  // platform), so it doubles as a lookup for "which Client does this staff
+  // member belong to" - built once here rather than searching the array
+  // per row.
+  const usersByUid = useMemo(() => {
+    const map = {};
+    approvedUsers.forEach((u) => { map[u.id] = u; });
+    return map;
+  }, [approvedUsers]);
+
   // A Client can only promote/demote within reach of their own permissions -
   // in practice that means they don't get a role selector at all; only
   // Super Admin can reassign roles (staff <-> client <-> superadmin). Both
@@ -4462,7 +4478,15 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
                   <div>
                     <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
                     <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
-                    <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
+                    <div style={styles.watchName}>
+                      {ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}
+                      {isSuperAdmin && u.role === 'staff' && (
+                        <>
+                          {' · Client: '}
+                          {usersByUid[u.parentId] ? (usersByUid[u.parentId].fullName || usersByUid[u.parentId].email) : (u.parentId ? 'Unknown (orphaned)' : '—')}
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -4477,7 +4501,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
                     </select>
                   )}
                   <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setEditingUser(u)}>Edit</button>
-                  {isSuperAdmin && u.id !== currentUid && (
+                  {(isSuperAdmin || myRole === 'client') && u.id !== currentUid && (
                     <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onRevoke(u.id)}>Revoke</button>
                   )}
                 </div>
