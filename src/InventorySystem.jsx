@@ -371,13 +371,14 @@ function getLatestSubscriptionPeriod(subscription) {
   return history.reduce((latest, p) => (!latest || p.year > latest.year || (p.year === latest.year && p.month > latest.month) ? p : latest), null);
 }
 
-// No subscription history at all (brand new client Super Admin hasn't set
-// up yet) is treated as active/not-paused - a friendlier default than
-// instantly locking out a client the moment they're approved, before
-// Super Admin has had a chance to configure anything.
+// No subscription history at all means NOT active - this covers both a
+// brand new client Super Admin hasn't set up yet, and a client whose only
+// record was just deleted. Access stays paused until Super Admin actually
+// sets a subscription period, which is the intended two-step flow: approve
+// the account, then set up billing - not an accident.
 function isSubscriptionActive(subscription) {
   const latest = getLatestSubscriptionPeriod(subscription);
-  if (!latest) return true;
+  if (!latest) return false;
   return latest.endDate >= Date.now();
 }
 
@@ -2926,8 +2927,8 @@ function SubscriptionPausedScreen({ role, onSignOut }) {
         </div>
         <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
           {role === 'client'
-            ? 'Access to Stock IT is currently paused because your subscription has expired. Please contact your platform administrator to renew.'
-            : 'Access to Stock IT is currently paused because your Client Admin\u2019s subscription has expired. Please check with them, or contact the platform administrator.'}
+            ? 'Access to Stock IT is currently paused because there\u2019s no active subscription on file. Please contact your platform administrator to set one up or renew.'
+            : 'Access to Stock IT is currently paused because your Client Admin doesn\u2019t have an active subscription on file. Please check with them, or contact the platform administrator.'}
         </div>
         <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginTop: 10, marginBottom: 22 }}>
           This page will update automatically once the subscription is renewed &mdash; no need to refresh.
