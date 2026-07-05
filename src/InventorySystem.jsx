@@ -1393,13 +1393,15 @@ export default function InventorySystem() {
     const isNew = !draft.id;
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
+    const quantity = Math.max(0, Number(draft.quantity) || 0);
+    const reorderPoint = Math.max(0, Number(draft.reorderPoint) || 0);
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
     const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
     const { percent: markupValue } = computeMarkupFromPrices(unitCost, sellingPrice);
     const markupType = 'percent';
     const previous = isNew ? null : items.find((i) => i.id === id);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, unitCost, sellingPrice, markupType, markupValue });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -1596,8 +1598,9 @@ export default function InventorySystem() {
   const saveSupplier = async (draft) => {
     if (!can(myRole, 'manageSuppliers')) { showToast("You don't have permission to manage suppliers"); return; }
     const id = draft.id || ('s' + Math.random().toString(36).slice(2, 9));
+    const leadTimeDays = Math.max(0, Number(draft.leadTimeDays) || 0);
     try {
-      await setDoc(doc(db, 'suppliers', id), { ...draft, id, ownerId });
+      await setDoc(doc(db, 'suppliers', id), { ...draft, id, ownerId, leadTimeDays });
       if (!draft.id) playAddSound();
       showToast(draft.id ? `Updated ${draft.name}` : `Added ${draft.name} to suppliers`);
     } catch (e) {
@@ -1765,7 +1768,7 @@ export default function InventorySystem() {
     const total = subtotal;
     const sale = {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
-      subtotal, total, totalCost, totalProfit, cashierId: user.uid, cashierEmail: user.email || '', ownerId,
+      subtotal, total, totalCost, totalProfit, cashierId: user.uid, cashierEmail: user.email || '', cashierUsername: myProfile?.username || '', ownerId,
     };
 
     try {
@@ -2229,7 +2232,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'pos' && (
-          <POSView items={items} onCompleteSale={completeSale} />
+          <POSView items={myOwnItems} onCompleteSale={completeSale} />
         )}
 
         {view === 'sales' && (
@@ -2514,7 +2517,6 @@ function LegalModal({ kind, onClose, theme }) {
         position: 'fixed', inset: 0, background: 'rgba(10,20,35,0.55)', display: 'flex',
         alignItems: 'center', justifyContent: 'center', zIndex: 50,
       }}
-      onClick={onClose}
     >
       <div
         style={{
@@ -2578,7 +2580,7 @@ function LoginScreen({ logo, theme }) {
   const [legalModal, setLegalModal] = useState(null); // 'terms' | 'privacy' | null
 
   const switchTab = (tab) => {
-    setRoleTab(tab); setMode('signin'); setError(''); setPassword(''); setInventoryId(''); setResetSent(false);
+    setRoleTab(tab); setMode('signin'); setError(''); setEmail(''); setPassword(''); setInventoryId(''); setResetSent(false);
   };
 
   const friendlyAuthError = (err) => {
@@ -2598,6 +2600,7 @@ function LoginScreen({ logo, theme }) {
       await signInWithEmailAndPassword(auth, email.trim(), password);
     } catch (err) {
       setError(friendlyAuthError(err));
+      setPassword('');
     } finally {
       setBusy(false);
     }
@@ -2611,6 +2614,7 @@ function LoginScreen({ logo, theme }) {
       await signInWithEmailAndPassword(auth, inventoryIdToStaffEmail(inventoryId), password);
     } catch (err) {
       setError('Sign-in failed. Check your Inventory ID and password.');
+      setPassword('');
     } finally {
       setBusy(false);
     }
@@ -3935,7 +3939,7 @@ function SubscriptionModal({ client, onClose, onSave, onDelete }) {
   };
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={{ ...styles.modal, maxWidth: 520 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>MANAGE SUBSCRIPTION — {client.fullName || client.email}</span>
@@ -4616,6 +4620,11 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
   const [dateTo, setDateTo] = useState('');
   const [search, setSearch] = useState('');
 
+  // Filtering/grouping keys off the stable cashierEmail (always present),
+  // but everything actually DISPLAYED uses the username when available.
+  const cashierLabel = (sale) => sale.cashierUsername || sale.cashierEmail || 'Unknown';
+  const totalQtyFor = (sale) => sale.items.reduce((sum, l) => sum + l.qty, 0);
+
   const dateFiltered = useMemo(() => sales.filter((s) => inDateRange(s.timestamp, dateFrom, dateTo)), [sales, dateFrom, dateTo]);
 
   // Matches if ANY line item in the sale has a matching SKU or name.
@@ -4625,20 +4634,10 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
     return dateFiltered.filter((s) => s.items.some((l) => l.sku.toLowerCase().includes(q) || l.name.toLowerCase().includes(q)));
   }, [dateFiltered, search]);
 
-  // Total quantity sold of the matching item(s) within a sale - only
-  // meaningful (and only shown) while a search is active.
-  const matchedQtyFor = (sale) => {
-    const q = search.trim().toLowerCase();
-    if (!q) return null;
-    return sale.items
-      .filter((l) => l.sku.toLowerCase().includes(q) || l.name.toLowerCase().includes(q))
-      .reduce((sum, l) => sum + l.qty, 0);
-  };
-  const showMatchedQtyCol = search.trim().length > 0;
-
   const cashiers = useMemo(() => {
-    const set = new Set(searchFiltered.map((s) => s.cashierEmail).filter(Boolean));
-    return Array.from(set).sort();
+    const map = new Map();
+    searchFiltered.forEach((s) => { if (s.cashierEmail) map.set(s.cashierEmail, cashierLabel(s)); });
+    return Array.from(map.entries()).sort((a, b) => a[1].localeCompare(b[1])); // [email, label]
   }, [searchFiltered]);
 
   const filtered = useMemo(() => {
@@ -4656,23 +4655,22 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
     dateFiltered.forEach((s) => {
       if (s.cancelled) return;
       const key = s.cashierEmail || 'Unknown';
-      if (!map[key]) map[key] = { count: 0, total: 0 };
+      if (!map[key]) map[key] = { label: cashierLabel(s), count: 0, total: 0 };
       map[key].count += 1;
       map[key].total += s.total;
     });
     return Object.entries(map)
-      .map(([email, v]) => ({ email, ...v }))
+      .map(([key, v]) => ({ key, ...v }))
       .sort((a, b) => b.total - a.total);
   }, [dateFiltered]);
 
-  const exportHeaders = ['Receipt', 'Date', 'Cashier', 'Items', 'Qty Sold (matched)', 'Payment Method', 'Subtotal', 'Total', 'Status'];
+  const exportHeaders = ['Receipt', 'Date', 'Cashier', 'Items Sold', 'Quantity Sold', 'Subtotal', 'Total', 'Status'];
   const exportRows = () => filtered.map((sale) => [
     sale.receiptNo,
     new Date(sale.timestamp).toLocaleString('en-PH'),
-    sale.cashierEmail || '—',
+    cashierLabel(sale),
     sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
-    matchedQtyFor(sale) ?? '',
-    sale.paymentMethod || '—',
+    totalQtyFor(sale),
     sale.subtotal.toFixed(2),
     sale.total.toFixed(2),
     sale.cancelled ? 'Cancelled' : 'Completed',
@@ -4710,9 +4708,9 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
             {byCashier.map((c) => (
-              <div key={c.email} style={styles.watchRow}>
+              <div key={c.key} style={styles.watchRow}>
                 <div>
-                  <div style={styles.watchSku}>{c.email}</div>
+                  <div style={styles.watchSku}>{c.label}</div>
                   <div style={styles.watchName}>{c.count} sale{c.count === 1 ? '' : 's'}</div>
                 </div>
                 <div style={{ fontWeight: 700, fontFamily: "'Quicksand', sans-serif", color: 'var(--ink)' }}>
@@ -4728,7 +4726,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
         <div style={styles.filterBar} className="depot-no-print depot-filterbar">
           <select className="depot-select" value={cashierFilter} onChange={(e) => setCashierFilter(e.target.value)} style={styles.select}>
             <option value="All">All Staff</option>
-            {cashiers.map((c) => <option key={c} value={c}>{c}</option>)}
+            {cashiers.map(([emailVal, label]) => <option key={emailVal} value={emailVal}>{label}</option>)}
           </select>
           {cashierFilter !== 'All' && (
             <div style={{ ...styles.watchName, alignSelf: 'center' }}>
@@ -4744,7 +4742,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Receipt', 'Date', 'Cashier', 'Items', ...(showMatchedQtyCol ? ['Qty Sold'] : []), 'Payment', 'Total', 'Status', ...((canCancel || canDeleteSale) ? [''] : [])].map((h) => (
+                {['Receipt', 'Date', 'Cashier', 'Items Sold', 'Quantity Sold', 'Total', 'Status', ...((canCancel || canDeleteSale) ? [''] : [])].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
@@ -4752,7 +4750,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
             <tbody>
               {filtered.map((sale) => {
                 const isOpen = expandedId === sale.id;
-                const colCount = 7 + (showMatchedQtyCol ? 1 : 0) + ((canCancel || canDeleteSale) ? 1 : 0);
+                const colCount = 7 + (canCancel || canDeleteSale ? 1 : 0);
                 return (
                 <React.Fragment key={sale.id}>
                 <tr className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
@@ -4760,7 +4758,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
-                  <td style={{ ...styles.td, fontSize: 12.5 }}>{sale.cashierEmail || '—'}</td>
+                  <td style={{ ...styles.td, fontSize: 12.5 }}>{cashierLabel(sale)}</td>
                   <td style={styles.td}>
                     <button
                       className="depot-btn"
@@ -4774,8 +4772,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
                       {sale.items.length} item{sale.items.length === 1 ? '' : 's'}
                     </button>
                   </td>
-                  {showMatchedQtyCol && <td style={{ ...styles.td, fontWeight: 600 }}>{matchedQtyFor(sale)}</td>}
-                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod || '—'}</span></td>
+                  <td style={{ ...styles.td, fontWeight: 600 }}>{totalQtyFor(sale)}</td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
                   <td style={styles.td}>
                     {sale.cancelled ? (
@@ -4858,7 +4855,7 @@ function MySalesView({ sales }) {
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Receipt', 'Date', 'Items', 'Payment', 'Total', 'Status'].map((h) => (
+                {['Receipt', 'Date', 'Items Sold', 'Quantity Sold', 'Total', 'Status'].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
@@ -4871,7 +4868,7 @@ function MySalesView({ sales }) {
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
                   <td style={styles.td}>{sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}</td>
-                  <td style={styles.td}><span style={styles.pill}>{sale.paymentMethod || '—'}</span></td>
+                  <td style={{ ...styles.td, fontWeight: 600 }}>{sale.items.reduce((sum, l) => sum + l.qty, 0)}</td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
                   <td style={styles.td}>
                     {sale.cancelled ? (
@@ -5037,7 +5034,7 @@ function ProfileEditModal({ user, onClose, onSave }) {
   const currentPhoto = photoDataUri !== undefined ? photoDataUri : user.photoDataUri;
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={{ ...styles.modal, maxWidth: 400 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>EDIT PROFILE — {user.email}</span>
@@ -5758,8 +5755,8 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
   const [form, setForm] = useState(() => {
     if (!draft) {
       return {
-        sku: '', name: '', category: categories[0] || '', quantity: 0, reorderPoint: 10, unitCost: 0,
-        location: locations[0] || '', supplierIds: [], sellingPrice: 0,
+        sku: '', name: '', category: categories[0] || '', quantity: '', reorderPoint: '', unitCost: '',
+        location: locations[0] || '', supplierIds: [], sellingPrice: '',
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
@@ -5779,7 +5776,7 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
     });
   };
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>{draft ? 'EDIT ITEM' : 'NEW ITEM'}</span>
@@ -5831,21 +5828,21 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Quantity" grow>
               <input className="depot-input" type="number" style={styles.modalInput} value={form.quantity}
-                onChange={(e) => setForm({ ...form, quantity: Math.max(0, Number(e.target.value)) })} />
+                onChange={(e) => setForm({ ...form, quantity: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
             <Field label="Reorder Point" grow>
               <input className="depot-input" type="number" style={styles.modalInput} value={form.reorderPoint}
-                onChange={(e) => setForm({ ...form, reorderPoint: Math.max(0, Number(e.target.value)) })} />
+                onChange={(e) => setForm({ ...form, reorderPoint: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
             <Field label="Base Cost (₱)" grow>
               <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={form.unitCost}
-                onChange={(e) => setForm({ ...form, unitCost: Math.max(0, Number(e.target.value)) })} />
+                onChange={(e) => setForm({ ...form, unitCost: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Selling Price (₱)" grow>
               <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.sellingPrice}
-                onChange={(e) => setForm({ ...form, sellingPrice: Math.max(0, Number(e.target.value)) })} />
+                onChange={(e) => setForm({ ...form, sellingPrice: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
             <Field label="Markup" grow>
               <div style={{
@@ -5873,11 +5870,11 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
 
 function SupplierModal({ draft, onClose, onSave }) {
   const [form, setForm] = useState(draft || {
-    name: '', contact: '', phone: '', email: '', leadTimeDays: 7, notes: '',
+    name: '', contact: '', phone: '', email: '', leadTimeDays: '', notes: '',
   });
   const valid = form.name.trim();
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>{draft ? 'EDIT SUPPLIER' : 'NEW SUPPLIER'}</span>
@@ -5895,7 +5892,7 @@ function SupplierModal({ draft, onClose, onSave }) {
             </Field>
             <Field label="Lead Time (days)" grow>
               <input className="depot-input" type="number" min="0" style={styles.modalInput} value={form.leadTimeDays}
-                onChange={(e) => setForm({ ...form, leadTimeDays: Math.max(0, Number(e.target.value)) })} />
+                onChange={(e) => setForm({ ...form, leadTimeDays: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
@@ -5930,7 +5927,7 @@ function ReturnInventoryModal({ item, hasDestination, onClose, onSave }) {
   const valid = Number(quantity) > 0 && Number(quantity) <= item.quantity;
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>RETURN ITEM — {item.sku}</span>
@@ -5942,7 +5939,7 @@ function ReturnInventoryModal({ item, hasDestination, onClose, onSave }) {
           </div>
           <Field label="Quantity to Return">
             <input className="depot-input" type="number" min="1" max={item.quantity} style={styles.modalInput}
-              value={quantity} onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
+              value={quantity} onChange={(e) => setQuantity(e.target.value === '' ? '' : Math.max(1, Number(e.target.value)))} />
           </Field>
           <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 4 }}>
             {hasDestination
@@ -5966,8 +5963,8 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
   const [staffUid, setStaffUid] = useState('');
   const [lines, setLines] = useState([]); // [{itemId, quantity, unitCost}]
   const [draftItemId, setDraftItemId] = useState('');
-  const [draftQty, setDraftQty] = useState(1);
-  const [draftCost, setDraftCost] = useState(0);
+  const [draftQty, setDraftQty] = useState('');
+  const [draftCost, setDraftCost] = useState('');
 
   const draftSource = myOwnItems.find((it) => it.id === draftItemId);
   const availableItems = myOwnItems.filter((it) => it.quantity > 0);
@@ -5994,7 +5991,7 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
       }
       return [...prev, newLine];
     });
-    setDraftItemId(''); setDraftQty(1); setDraftCost(0);
+    setDraftItemId(''); setDraftQty(''); setDraftCost('');
   };
 
   const removeLine = (itemId) => setLines((prev) => prev.filter((l) => l.itemId !== itemId));
@@ -6003,7 +6000,7 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
   const canSubmit = staffUid && lines.length > 0;
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={{ ...styles.modal, maxWidth: 560 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>ASSIGN INVENTORY TO STAFF</span>
@@ -6032,13 +6029,13 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
             <div style={{ flex: '1 1 90px' }}>
               <Field label="Qty">
                 <input className="depot-input" type="number" min="1" max={draftSource?.quantity || 1} style={styles.modalInput}
-                  value={draftQty} onChange={(e) => setDraftQty(Math.max(1, Number(e.target.value)))} />
+                  value={draftQty} onChange={(e) => setDraftQty(e.target.value === '' ? '' : Math.max(1, Number(e.target.value)))} />
               </Field>
             </div>
             <div style={{ flex: '1 1 110px' }}>
               <Field label="Base Cost (₱)">
                 <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
-                  value={draftCost} onChange={(e) => setDraftCost(Math.max(0, Number(e.target.value)))} />
+                  value={draftCost} onChange={(e) => setDraftCost(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
               </Field>
             </div>
             <div style={{ flex: '0 0 auto', paddingBottom: 2 }}>
@@ -6105,7 +6102,7 @@ function MarkupModal({ item, onClose, onSave }) {
   const markup = computeMarkupFromPrices(item.unitCost, sellingPrice);
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>UPDATE PRICE — {item.sku}</span>
@@ -6123,7 +6120,7 @@ function MarkupModal({ item, onClose, onSave }) {
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Selling Price (₱)" grow>
               <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
-                value={sellingPrice} onChange={(e) => setSellingPrice(Math.max(0, Number(e.target.value)))} />
+                value={sellingPrice} onChange={(e) => setSellingPrice(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
             </Field>
             <Field label="Markup" grow>
               <div style={{
@@ -6139,7 +6136,7 @@ function MarkupModal({ item, onClose, onSave }) {
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item, sellingPrice)}>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: sellingPrice === '' ? 0.45 : 1 }} disabled={sellingPrice === ''} onClick={() => onSave(item, sellingPrice)}>
             Save Price
           </button>
         </div>
@@ -6151,8 +6148,8 @@ function MarkupModal({ item, onClose, onSave }) {
 function OrderModal({ draft, items, suppliers, onClose, onSave }) {
   const [itemId, setItemId] = useState(draft?.itemId || '');
   const [supplierId, setSupplierId] = useState(draft?.supplierId || '');
-  const [quantity, setQuantity] = useState(draft?.quantity ?? 1);
-  const [unitCost, setUnitCost] = useState(draft?.unitCost ?? 0);
+  const [quantity, setQuantity] = useState(draft?.quantity ?? '');
+  const [unitCost, setUnitCost] = useState(draft?.unitCost ?? '');
   const [notes, setNotes] = useState(draft?.notes || '');
 
   const selectedItem = items.find((it) => it.id === itemId);
@@ -6173,7 +6170,7 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
   const valid = itemId && supplierId && Number(quantity) > 0;
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>NEW ORDER</span>
@@ -6205,11 +6202,11 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Quantity" grow>
               <input className="depot-input" type="number" min="1" style={styles.modalInput} value={quantity}
-                onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
+                onChange={(e) => setQuantity(e.target.value === '' ? '' : Math.max(1, Number(e.target.value)))} />
             </Field>
             <Field label="Unit Cost (₱)" grow>
               <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={unitCost}
-                onChange={(e) => setUnitCost(Math.max(0, Number(e.target.value)))} />
+                onChange={(e) => setUnitCost(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
             </Field>
           </div>
 
@@ -6245,7 +6242,7 @@ function Field({ label, children, grow }) {
 
 function SaleReceiptModal({ sale, onClose }) {
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={{ ...styles.modal, maxWidth: 380 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>SALE COMPLETE</span>
@@ -6294,10 +6291,11 @@ function SaleReceiptModal({ sale, onClose }) {
 
 function MoveModal({ item, allowIssue, onClose, onSubmit }) {
   const [type, setType] = useState('in');
-  const [qty, setQty] = useState(1);
+  const [qty, setQty] = useState('');
   const [reason, setReason] = useState('');
+  const valid = Number(qty) > 0;
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={{ ...styles.modal, maxWidth: 380 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>MOVEMENT — {item.sku}</span>
@@ -6318,7 +6316,7 @@ function MoveModal({ item, allowIssue, onClose, onSubmit }) {
           </div>
           <Field label={`Quantity (currently ${item.quantity} on hand)`}>
             <input className="depot-input" type="number" min="1" style={styles.modalInput} value={qty}
-              onChange={(e) => setQty(Math.max(1, Number(e.target.value)))} />
+              onChange={(e) => setQty(e.target.value === '' ? '' : Math.max(1, Number(e.target.value)))} />
           </Field>
           <Field label="Reason / Reference">
             <input className="depot-input" style={styles.modalInput} value={reason}
@@ -6327,7 +6325,7 @@ function MoveModal({ item, allowIssue, onClose, onSubmit }) {
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSubmit(item.id, type, qty, reason)}>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }} disabled={!valid} onClick={() => onSubmit(item.id, type, Number(qty), reason)}>
             Confirm
           </button>
         </div>
@@ -6345,7 +6343,7 @@ function DeliveryStatusModal({ row, onClose, onSave, onClearOverride }) {
   const [orderDate, setOrderDate] = useState(existingOrderDate || '');
 
   return (
-    <div style={styles.overlay} onClick={onClose}>
+    <div style={styles.overlay}>
       <div style={{ ...styles.modal, maxWidth: 400 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
           <span>DELIVERY STATUS — {item.sku}</span>
@@ -6392,7 +6390,7 @@ function DeliveryStatusModal({ row, onClose, onSave, onClearOverride }) {
 
 function ConfirmModal({ title, message, onCancel, onConfirm, confirmLabel = 'Remove', danger = true }) {
   return (
-    <div style={styles.overlay} onClick={onCancel}>
+    <div style={styles.overlay}>
       <div style={{ ...styles.modal, maxWidth: 360 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}><span>{title}</span></div>
         <div style={{ ...styles.modalBody, fontFamily: 'Inter', fontSize: 14, color: 'var(--ink)' }}>
