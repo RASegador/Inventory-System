@@ -2323,7 +2323,7 @@ export default function InventorySystem() {
       {orderModal && (
         <OrderModal
           draft={orderModal === 'new' ? null : orderModal}
-          items={items}
+          items={myOwnItems}
           suppliers={suppliers}
           onClose={() => setOrderModal(null)}
           onSave={saveOrder}
