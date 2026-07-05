@@ -184,6 +184,7 @@ const ACTIVITY_TYPE_LABELS = {
   subscription_created: 'Subscription Created',
   subscription_marked_paid: 'Subscription Marked Paid',
   subscription_marked_unpaid: 'Subscription Marked Unpaid',
+  subscription_deleted: 'Subscription Record Deleted',
   price_changed: 'Base Price Changed',
   markup_changed: 'Markup Changed',
   sale_completed: 'Sale Completed',
@@ -203,6 +204,7 @@ function describeActivity(l) {
     case 'subscription_created': return `Created ${m.monthLabel || ''} subscription for ${m.targetName || m.targetEmail || '—'}`;
     case 'subscription_marked_paid': return `Marked ${m.monthLabel || ''} as Paid for ${m.targetName || m.targetEmail || '—'}`;
     case 'subscription_marked_unpaid': return `Marked ${m.monthLabel || ''} as Unpaid for ${m.targetName || m.targetEmail || '—'}`;
+    case 'subscription_deleted': return `Deleted ${m.monthLabel || ''} subscription record for ${m.targetName || m.targetEmail || '—'}`;
     case 'price_changed': return `Changed base cost of ${m.itemSku || ''} from ${currency(m.oldCost ?? 0)} to ${currency(m.newCost ?? 0)}`;
     case 'markup_changed': return `Updated markup on ${m.itemSku || ''} to ${m.markupType === 'fixed' ? currency(m.markupValue ?? 0) + ' flat' : `${m.markupValue ?? 0}%`}`;
     case 'sale_completed': return `Completed sale ${m.receiptNo || ''} (${currency(m.total ?? 0)})`;
@@ -216,6 +218,7 @@ function activityBadgeColors(type) {
   if (type === 'logout') return { bg: 'rgba(20,33,61,0.08)', color: 'var(--ink)' };
   if (type === 'price_changed' || type === 'markup_changed' || type === 'inventory_returned' || type === 'subscription_marked_unpaid') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
   if (type === 'staff_created' || type === 'inventory_assigned' || type === 'subscription_created') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
+  if (type === 'subscription_deleted') return { bg: 'rgba(193,80,58,0.1)', color: 'var(--red)' };
   return { bg: 'rgba(20,33,61,0.06)', color: 'var(--ink)' };
 }
 
@@ -1094,8 +1097,27 @@ export default function InventorySystem() {
     }
   };
 
-  // Edits profile info (name/username/contact/address) - never role or
-  // approval status, which stay behind the separate Team Access controls.
+  // Removes one subscription period entirely - for a mistakenly logged
+  // entry (wrong month, fat-fingered dates, etc.), not a normal part of
+  // the renewal flow. Super Admin only.
+  const deleteSubscriptionPeriod = async (clientUid, { month, year }) => {
+    if (myRole !== 'superadmin') { showToast("You don't have permission to manage subscriptions"); return; }
+    const client = approvedUsers.find((u) => u.id === clientUid);
+    if (!client) { showToast('Client not found'); return; }
+    const history = client.subscription?.history || [];
+    const newHistory = history.filter((p) => !(p.month === month && p.year === year));
+    const monthLabel = `${MONTH_NAMES[month - 1]} ${year}`;
+    try {
+      await setDoc(doc(db, 'users', clientUid), { subscription: { history: newHistory } }, { merge: true });
+      logActivity('subscription_deleted', { targetEmail: client.email, targetName: client.fullName, monthLabel });
+      showToast(`${monthLabel} subscription record deleted for ${client.fullName || client.email}`);
+      return { ok: true };
+    } catch (e) {
+      showToast('Could not delete subscription record — check your connection');
+      return { ok: false };
+    }
+  };
+
   // Anyone can edit their own; a manager can edit others' (Client limited to
   // Staff by the UI list they're given and by the Firestore rules).
   const updateUserProfile = async (uid, fields) => {
@@ -2305,6 +2327,20 @@ export default function InventorySystem() {
           client={subscriptionModal}
           onClose={() => setSubscriptionModal(null)}
           onSave={saveSubscriptionPeriod}
+          onDelete={(period) => setConfirmModal({ kind: 'subscription-delete', target: { client: subscriptionModal, period } })}
+        />
+      )}
+
+      {confirmModal && confirmModal.kind === 'subscription-delete' && (
+        <ConfirmModal
+          title="DELETE SUBSCRIPTION RECORD"
+          message={<>Permanently delete the <strong>{MONTH_NAMES[confirmModal.target.period.month - 1]} {confirmModal.target.period.year}</strong> subscription record for <strong>{confirmModal.target.client.fullName || confirmModal.target.client.email}</strong>? This can't be undone.</>}
+          onCancel={() => setConfirmModal(null)}
+          onConfirm={async () => {
+            await deleteSubscriptionPeriod(confirmModal.target.client.id, confirmModal.target.period);
+            setConfirmModal(null);
+          }}
+          confirmLabel="Delete Record"
         />
       )}
 
@@ -3644,28 +3680,70 @@ function ClientAccountsView({ clients, allUsers, onManageSubscription }) {
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      {expiringWarnings.length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
-          {expiringWarnings.map(({ client, days }) => (
-            <div key={client.id} style={{
-              display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 8,
-              background: 'rgba(232,163,61,0.14)', border: '1px solid rgba(232,163,61,0.4)',
-            }}>
-              <AlertTriangle size={16} color="var(--amber-deep)" />
-              <div style={{ fontSize: 13 }}>
-                <strong>{client.fullName || client.email}</strong> &mdash; subscription expires in {days} day{days === 1 ? '' : 's'}.
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
       <div style={styles.statGrid} className="depot-stat-grid">
         <StatCard icon={Building2} label="Total Clients" value={clients.length} accent="var(--blueprint)" />
         <StatCard icon={CheckCircle2} label="Active Subscriptions" value={clients.filter((c) => isSubscriptionActive(c.subscription)).length} accent="var(--green)" />
         <StatCard icon={AlertTriangle} label="Expired Subscriptions" value={clients.filter((c) => !isSubscriptionActive(c.subscription)).length} accent="var(--red)" />
         <StatCard icon={User} label="Total Staff" value={allUsers.filter((u) => u.role === 'staff').length} accent="#2E5C87" />
       </div>
+
+      {expiringWarnings.length > 0 && (
+        <div style={{ ...styles.panel, marginBottom: 16, border: '1px solid rgba(232,163,61,0.4)' }}>
+          <div style={styles.panelHeader}>
+            <AlertTriangle size={15} color="var(--amber-deep)" />
+            <span>ABOUT TO EXPIRE SUBSCRIPTIONS</span>
+          </div>
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 4, marginBottom: 10 }}>
+            Active subscriptions expiring within the next 5 days.
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={styles.table} className="depot-table">
+              <thead>
+                <tr>
+                  {['Client', 'Expires In', 'Expiration Date', 'Payment Status', 'Staff', ''].map((h) => (
+                    <th key={h} style={styles.th}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {expiringWarnings
+                  .slice()
+                  .sort((a, b) => a.days - b.days)
+                  .map(({ client, days }) => {
+                    const latest = getLatestSubscriptionPeriod(client.subscription);
+                    return (
+                      <tr key={client.id} className="depot-row">
+                        <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500 }}>
+                          {client.fullName || '—'}<br />
+                          <span style={{ fontFamily: "'Nunito', sans-serif", fontWeight: 400, fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>{client.email}</span>
+                        </td>
+                        <td style={styles.td}>
+                          <span style={{ ...styles.statusPill, background: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' }}>
+                            {days} day{days === 1 ? '' : 's'}
+                          </span>
+                        </td>
+                        <td style={styles.td}>{latest ? formatDate(latest.endDate) : '—'}</td>
+                        <td style={styles.td}>
+                          {latest && (
+                            <span style={{ ...styles.statusPill, background: latest.paymentStatus === 'paid' ? 'rgba(79,138,99,0.1)' : 'rgba(193,80,58,0.1)', color: latest.paymentStatus === 'paid' ? 'var(--green)' : 'var(--red)' }}>
+                              {latest.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                            </span>
+                          )}
+                        </td>
+                        <td style={styles.td}>{staffCountFor(client.id)}</td>
+                        <td style={{ ...styles.td, textAlign: 'right' }}>
+                          <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onManageSubscription(client)}>
+                            Manage
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div style={{ ...styles.panel, marginBottom: 16 }}>
         <div style={styles.panelHeader}>
@@ -3779,7 +3857,7 @@ function ClientAccountsView({ clients, allUsers, onManageSubscription }) {
   );
 }
 
-function SubscriptionModal({ client, onClose, onSave }) {
+function SubscriptionModal({ client, onClose, onSave, onDelete }) {
   const today = new Date();
   const [month, setMonth] = useState(today.getMonth() + 1);
   const [year, setYear] = useState(today.getFullYear());
@@ -3895,22 +3973,32 @@ function SubscriptionModal({ client, onClose, onSave }) {
                 <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Subscription History</div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 160, overflowY: 'auto' }} className="depot-scroll">
                   {history.map((p) => (
-                    <button
-                      type="button"
+                    <div
                       key={`${p.year}-${p.month}`}
-                      onClick={() => loadPeriod(p)}
-                      className="depot-btn"
                       style={{
-                        display: 'flex', justifyContent: 'space-between', padding: '6px 10px', borderRadius: 6,
+                        display: 'flex', alignItems: 'center', gap: 6, borderRadius: 6,
                         background: (p.month === month && p.year === year) ? 'rgba(15,42,71,0.06)' : 'transparent',
-                        border: '1px solid rgba(59,42,31,0.1)', fontSize: 12,
+                        border: '1px solid rgba(59,42,31,0.1)',
                       }}
                     >
-                      <span>{MONTH_NAMES[p.month - 1]} {p.year}</span>
-                      <span style={{ color: p.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)', fontWeight: 600 }}>
-                        {p.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
-                      </span>
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => loadPeriod(p)}
+                        className="depot-btn"
+                        style={{
+                          flex: 1, display: 'flex', justifyContent: 'space-between', padding: '6px 10px',
+                          background: 'transparent', border: 'none', fontSize: 12, textAlign: 'left',
+                        }}
+                      >
+                        <span>{MONTH_NAMES[p.month - 1]} {p.year}</span>
+                        <span style={{ color: p.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)', fontWeight: 600 }}>
+                          {p.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                        </span>
+                      </button>
+                      <IconBtn onClick={() => onDelete(p)} title="Delete this record" danger>
+                        <Trash2 size={13} />
+                      </IconBtn>
+                    </div>
                   ))}
                 </div>
               </div>
