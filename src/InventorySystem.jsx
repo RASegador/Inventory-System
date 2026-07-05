@@ -6,7 +6,7 @@ import { initializeApp, deleteApp } from 'firebase/app';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth,
   updatePassword, reauthenticateWithCredential, EmailAuthProvider, sendPasswordResetEmail,
-  inMemoryPersistence, setPersistence,
+  inMemoryPersistence, setPersistence, GoogleAuthProvider, signInWithPopup,
 } from 'firebase/auth';
 import {
   collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where, arrayUnion, arrayRemove,
@@ -620,6 +620,16 @@ function generateUserIdNumber() {
   return 'U-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 5).toUpperCase();
 }
 
+// Staff log in with their Inventory ID + password only - no real email.
+// Firebase's password auth still fundamentally requires *some* email
+// under the hood, so this deterministically derives an internal,
+// never-shown one straight from the Inventory ID (already guaranteed
+// unique) rather than needing a separate lookup collection.
+function inventoryIdToStaffEmail(inventoryId) {
+  const sanitized = (inventoryId || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+  return `${sanitized}@staff.stockit.internal`;
+}
+
 // Profile photos live inside the Firestore user doc (this app has no
 // separate file storage), so they need to be small. Downscale to a square
 // thumbnail and re-encode as compressed JPEG before it ever touches the
@@ -804,7 +814,21 @@ export default function InventorySystem() {
         const ref = doc(db, 'users', user.uid);
         const snap = await getDoc(ref);
         if (!snap.exists()) {
-          await setDoc(ref, {
+          const isGoogleSignIn = user.providerData?.some((p) => p.providerId === 'google.com');
+          await setDoc(ref, isGoogleSignIn ? {
+            // First-time Google sign-in always creates a new Client Admin
+            // account (a new tenant/business), pending Super Admin
+            // approval - this is the ONLY self-serve signup path now;
+            // Google sign-in is Client-Admin-only by design.
+            email: user.email || '', approved: false, isAdmin: false, role: 'client', createdAt: Date.now(),
+            fullName: user.displayName || '', username: '', contactNumber: '', address: '',
+            userIdNumber: generateUserIdNumber(), agreedToTermsAt: Date.now(),
+          } : {
+            // Safety-net bootstrap path: an authenticated user with no
+            // profile doc at all (shouldn't normally happen - staff are
+            // always created with a profile already in place by their
+            // Client Admin). Inert: unapproved, tenant-less, can't
+            // read/write anything.
             email: user.email || '', approved: false, isAdmin: false, role: 'staff', createdAt: Date.now(),
           }, { merge: true });
         }
@@ -973,13 +997,21 @@ export default function InventorySystem() {
   // sign the admin themselves out of their own session (the Firebase client
   // SDK otherwise switches the active session to whichever user was most
   // recently created).
-  const createStaffAccount = async ({ email, password, fullName, username, contactNumber, address }) => {
+  const createStaffAccount = async ({ password, fullName, username, contactNumber, address }) => {
     if (!can(myRole, 'createStaff') || !ownerId) {
       showToast("You don't have permission to add staff");
       return { ok: false };
     }
     let secondaryApp;
     try {
+      // The Inventory ID doubles as the staff member's login username AND
+      // (deterministically, via inventoryIdToStaffEmail) the seed for a
+      // fake internal email - Firebase's password auth fundamentally
+      // requires *some* email, real or not, but nothing about it is ever
+      // shown to the staff member or usable by them directly.
+      const inventoryId = generateUserIdNumber();
+      const staffEmail = inventoryIdToStaffEmail(inventoryId);
+
       secondaryApp = initializeApp(auth.app.options, 'staff-creation-' + Date.now());
       const secondaryAuth = getAuth(secondaryApp);
       // Critical: without this, the secondary app shares the SAME
@@ -989,13 +1021,13 @@ export default function InventorySystem() {
       // throwing permission-denied shortly after. In-memory persistence
       // keeps it fully isolated.
       await setPersistence(secondaryAuth, inMemoryPersistence);
-      const cred = await createUserWithEmailAndPassword(secondaryAuth, email.trim(), password);
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, staffEmail, password);
       await setDoc(doc(db, 'users', cred.user.uid), {
-        email: email.trim(), approved: true, isAdmin: false, role: 'staff',
+        email: staffEmail, approved: true, isAdmin: false, role: 'staff',
         parentId: ownerId, createdAt: Date.now(), createdBy: user.uid,
         fullName: (fullName || '').trim(), username: (username || '').trim(),
         contactNumber: (contactNumber || '').trim(), address: (address || '').trim(),
-        userIdNumber: generateUserIdNumber(),
+        userIdNumber: inventoryId,
       });
       // Record this staff member on OUR OWN profile too. This is what lets
       // Team Access find "my staff" via a simple read of our own document
@@ -1008,13 +1040,11 @@ export default function InventorySystem() {
       }, { merge: true });
       await signOut(secondaryAuth);
       playAddSound();
-      logActivity('staff_created', { targetEmail: email.trim(), targetUid: cred.user.uid });
-      showToast(`Staff account created for ${email.trim()}`);
-      return { ok: true };
+      logActivity('staff_created', { targetEmail: fullName || inventoryId, targetUid: cred.user.uid });
+      showToast(`Staff account created — Inventory ID: ${inventoryId}`);
+      return { ok: true, inventoryId };
     } catch (e) {
-      const msg = e?.code === 'auth/email-already-in-use'
-        ? 'That email already has an account'
-        : e?.code === 'auth/weak-password'
+      const msg = e?.code === 'auth/weak-password'
         ? 'Password should be at least 6 characters'
         : 'Could not create staff account — check your connection';
       showToast(msg);
@@ -2536,70 +2566,71 @@ function LegalModal({ kind, onClose, theme }) {
 
 function LoginScreen({ logo, theme }) {
   const t = theme || THEMES[DEFAULT_THEME_KEY];
-  const [mode, setMode] = useState('signin'); // 'signin' | 'signup' | 'reset'
+  const [roleTab, setRoleTab] = useState('client'); // 'superadmin' | 'client' | 'staff'
+  const [mode, setMode] = useState('signin'); // 'signin' | 'reset' - reset only ever applies to Super Admin
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [fullName, setFullName] = useState('');
-  const [username, setUsername] = useState('');
-  const [contactNumber, setContactNumber] = useState('');
-  const [address, setAddress] = useState('');
+  const [inventoryId, setInventoryId] = useState('');
   const [agreeTerms, setAgreeTerms] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [resetSent, setResetSent] = useState(false);
   const [legalModal, setLegalModal] = useState(null); // 'terms' | 'privacy' | null
 
-  const friendlyError = (err) => {
+  const switchTab = (tab) => {
+    setRoleTab(tab); setMode('signin'); setError(''); setPassword(''); setInventoryId(''); setResetSent(false);
+  };
+
+  const friendlyAuthError = (err) => {
     const code = err?.code || '';
-    if (code === 'auth/email-already-in-use') return 'That email already has an account. Try signing in instead.';
     if (code === 'auth/invalid-email') return 'That email address doesn\'t look right.';
-    if (code === 'auth/weak-password') return 'Password should be at least 6 characters.';
     if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
       return 'Sign-in failed. Check your email and password.';
     }
-    return mode === 'signup' ? 'Could not create your account. Please try again.' : 'Sign-in failed. Check your email and password.';
+    return 'Sign-in failed. Check your email and password.';
   };
 
-  const submit = async (e) => {
+  const submitSuperAdmin = async (e) => {
     e.preventDefault();
     setError('');
-
-    if (mode === 'signup' && password !== confirmPassword) {
-      setError('Passwords don\'t match.');
-      return;
-    }
-    if (mode === 'signup' && !agreeTerms) {
-      setError('Please agree to the Terms of Service and Privacy Policy to continue.');
-      return;
-    }
-
     setBusy(true);
     try {
-      if (mode === 'signup') {
-        const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
-        // Written separately from (and merged with) the app's own profile
-        // bootstrap effect, so whichever runs first or second, neither wipes
-        // the other's fields.
-        try {
-          // Self-signup always creates a new Client Admin account - i.e. a
-          // new tenant/business, still pending a Super Admin's approval.
-          // Staff accounts are created *by* a Client Admin from inside the
-          // app (Team Access), never through this public form.
-          await setDoc(doc(db, 'users', cred.user.uid), {
-            email: email.trim(), approved: false, isAdmin: false, role: 'client', createdAt: Date.now(),
-            fullName: fullName.trim(), username: username.trim(), contactNumber: contactNumber.trim(),
-            address: address.trim(), userIdNumber: generateUserIdNumber(),
-            agreedToTermsAt: Date.now(),
-          }, { merge: true });
-        } catch (profileErr) {
-          console.error('Could not save signup profile details:', profileErr);
-        }
-      } else {
-        await signInWithEmailAndPassword(auth, email.trim(), password);
-      }
+      await signInWithEmailAndPassword(auth, email.trim(), password);
     } catch (err) {
-      setError(friendlyError(err));
+      setError(friendlyAuthError(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitStaff = async (e) => {
+    e.preventDefault();
+    setError('');
+    setBusy(true);
+    try {
+      await signInWithEmailAndPassword(auth, inventoryIdToStaffEmail(inventoryId), password);
+    } catch (err) {
+      setError('Sign-in failed. Check your Inventory ID and password.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitGoogle = async () => {
+    setError('');
+    if (!agreeTerms) { setError('Please agree to the Terms of Service and Privacy Policy to continue.'); return; }
+    setBusy(true);
+    try {
+      const provider = new GoogleAuthProvider();
+      // Profile creation (or lookup, for a returning Client Admin) happens
+      // automatically once auth state updates - see the app's provider-
+      // aware profile bootstrap effect, which checks whether this sign-in
+      // came from Google to decide whether it's a brand new Client Admin.
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      if (err?.code !== 'auth/popup-closed-by-user' && err?.code !== 'auth/cancelled-popup-request') {
+        setError('Could not sign in with Google. Please try again.');
+      }
     } finally {
       setBusy(false);
     }
@@ -2624,26 +2655,20 @@ function LoginScreen({ logo, theme }) {
     }
   };
 
-  const switchMode = () => {
-    setMode(mode === 'signin' ? 'signup' : 'signin');
-    setError('');
-    setPassword('');
-    setConfirmPassword('');
-    setAgreeTerms(false);
-  };
+  const goToReset = () => { setMode('reset'); setError(''); setResetSent(false); };
+  const backToSignIn = () => { setMode('signin'); setError(''); setResetSent(false); setPassword(''); };
 
-  const goToReset = () => {
-    setMode('reset');
-    setError('');
-    setResetSent(false);
+  const cardStyle = {
+    background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 400,
+    boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
+    border: `1px solid ${t.lineDim}`, position: 'relative', zIndex: 1,
   };
-
-  const backToSignIn = () => {
-    setMode('signin');
-    setError('');
-    setResetSent(false);
-    setPassword('');
-  };
+  const labelStyle = { display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 };
+  const inputStyle = { width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' };
+  const primaryBtnStyle = (disabled) => ({
+    width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
+    padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: disabled ? 0.6 : 1,
+  });
 
   return (
     <div style={{
@@ -2662,162 +2687,163 @@ function LoginScreen({ logo, theme }) {
         }
       `}</style>
       <BackgroundDecor variant="login" />
-      {mode === 'reset' ? (
-        <form onSubmit={submitReset} className="depot-login-form" style={{
-          background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 400,
-          boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
-          border: `1px solid ${t.lineDim}`, position: 'relative', zIndex: 1,
-        }}>
-          <div style={{
-            background: `linear-gradient(135deg, #FFFCF5 0%, ${t.paper} 100%)`,
-            borderRadius: 10, padding: '22px 20px 16px', marginBottom: 20,
-            border: `1px solid ${t.lineDim}`,
-          }}>
-            <img src={logo} alt="RAS logo" className="depot-logo-float" style={{ width: '100%', height: 'auto', display: 'block' }} />
-          </div>
-          <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
-            Reset Your Password
-          </div>
-          {resetSent ? (
-            <>
-              <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.7)', lineHeight: 1.6, marginBottom: 20 }}>
-                If an account exists for <strong>{email.trim()}</strong>, a password reset link has been sent. Check your inbox (and spam folder).
-              </div>
-              <button type="button" onClick={backToSignIn} style={{
-                width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
-                padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer',
-              }}>
-                Back to Sign In
-              </button>
-            </>
-          ) : (
-            <>
-              <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 20 }}>
-                Enter the email on your account and we\u2019ll send you a link to reset your password.
-              </div>
-              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Email</label>
-              <input
-                type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
-                style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
-              />
-              {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
-              <button type="submit" disabled={busy} style={{
-                width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
-                padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: busy ? 0.6 : 1,
-              }}>
-                {busy ? 'Sending…' : 'Send Reset Link'}
-              </button>
-              <div style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>
-                <button type="button" onClick={backToSignIn} style={{
-                  background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600,
-                  cursor: 'pointer', textDecoration: 'underline', fontSize: 12.5,
-                }}>
-                  Back to Sign In
-                </button>
-              </div>
-            </>
-          )}
-        </form>
-      ) : (
-      <form onSubmit={submit} className="depot-login-form" style={{
-        background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 400,
-        boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
-        border: `1px solid ${t.lineDim}`, position: 'relative', zIndex: 1,
-      }}>
+
+      <div className="depot-login-form" style={cardStyle}>
         <div style={{
           background: `linear-gradient(135deg, #FFFCF5 0%, ${t.paper} 100%)`,
-          borderRadius: 10, padding: '22px 20px 16px', marginBottom: 20,
+          borderRadius: 10, padding: '22px 20px 16px', marginBottom: 16,
           border: `1px solid ${t.lineDim}`,
         }}>
           <img src={logo} alt="RAS logo" className="depot-logo-float" style={{ width: '100%', height: 'auto', display: 'block' }} />
         </div>
-        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
-          {mode === 'signup' ? 'Create Your Account' : 'Welcome Back!'}
-        </div>
-        <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 20 }}>
-          {mode === 'signup' ? 'Sign up for a RAS Client Account' : 'Sign in to Your RAS Client Account'}
-        </div>
-        <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Email</label>
-        <input
-          type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
-          style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
-        />
-        <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Password</label>
-        <input
-          type="password" required value={password} onChange={(e) => setPassword(e.target.value)}
-          style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: mode === 'signup' ? 14 : 6, boxSizing: 'border-box' }}
-        />
-        {mode === 'signin' && (
-          <div style={{ textAlign: 'right', marginBottom: 14 }}>
-            <button type="button" onClick={goToReset} style={{
-              background: 'none', border: 'none', padding: 0, color: t.blueprint,
-              cursor: 'pointer', textDecoration: 'underline', fontSize: 11.5,
-            }}>
-              Forgot password?
-            </button>
-          </div>
-        )}
-        {mode === 'signup' && (
+
+        {mode === 'reset' ? (
+          <form onSubmit={submitReset}>
+            <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
+              Reset Your Password
+            </div>
+            {resetSent ? (
+              <>
+                <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.7)', lineHeight: 1.6, marginBottom: 20, marginTop: 14 }}>
+                  If an account exists for <strong>{email.trim()}</strong>, a password reset link has been sent. Check your inbox (and spam folder).
+                </div>
+                <button type="button" onClick={backToSignIn} style={primaryBtnStyle(false)}>Back to Sign In</button>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 20, marginTop: 6 }}>
+                  Enter the email on your Super Admin account and we'll send you a link to reset your password.
+                </div>
+                <label style={labelStyle}>Email</label>
+                <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} style={inputStyle} />
+                {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
+                <button type="submit" disabled={busy} style={primaryBtnStyle(busy)}>{busy ? 'Sending…' : 'Send Reset Link'}</button>
+                <div style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5 }}>
+                  <button type="button" onClick={backToSignIn} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', fontSize: 12.5 }}>
+                    Back to Sign In
+                  </button>
+                </div>
+              </>
+            )}
+          </form>
+        ) : (
           <>
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Confirm Password</label>
-            <input
-              type="password" required value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)}
-              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
-            />
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Full Name</label>
-            <input
-              type="text" required value={fullName} onChange={(e) => setFullName(e.target.value)}
-              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
-            />
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Username</label>
-            <input
-              type="text" required value={username} onChange={(e) => setUsername(e.target.value)}
-              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
-            />
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Contact Number</label>
-            <input
-              type="tel" required value={contactNumber} onChange={(e) => setContactNumber(e.target.value)}
-              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 14, boxSizing: 'border-box' }}
-            />
-            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5 }}>Address <span style={{ fontWeight: 400 }}>(optional)</span></label>
-            <input
-              type="text" value={address} onChange={(e) => setAddress(e.target.value)}
-              style={{ width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)', fontSize: 13.5, marginBottom: 16, boxSizing: 'border-box' }}
-            />
-            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, color: 'rgba(59,42,31,0.7)', marginBottom: 16, cursor: 'pointer' }}>
-              <input type="checkbox" checked={agreeTerms} onChange={(e) => setAgreeTerms(e.target.checked)} style={{ marginTop: 2 }} />
-              <span>
-                I agree to the{' '}
-                <button type="button" onClick={() => setLegalModal('terms')} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}>Terms of Service</button>
-                {' '}and{' '}
-                <button type="button" onClick={() => setLegalModal('privacy')} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}>Privacy Policy</button>.
-              </span>
-            </label>
+            {/* Role selector - three separate, deliberately distinct sign-in
+                methods rather than one shared form. */}
+            <div style={{ display: 'flex', gap: 4, marginBottom: 18, background: 'rgba(59,42,31,0.06)', borderRadius: 8, padding: 3 }}>
+              {[
+                { key: 'client', label: 'Client Admin' },
+                { key: 'staff', label: 'Staff' },
+                { key: 'superadmin', label: 'Super Admin' },
+              ].map((r) => (
+                <button
+                  key={r.key}
+                  type="button"
+                  onClick={() => switchTab(r.key)}
+                  style={{
+                    flex: 1, padding: '7px 4px', borderRadius: 6, border: 'none', cursor: 'pointer',
+                    fontSize: 11.5, fontWeight: 600, transition: 'all 0.15s ease',
+                    background: roleTab === r.key ? '#fff' : 'transparent',
+                    color: roleTab === r.key ? t.ink : 'rgba(59,42,31,0.5)',
+                    boxShadow: roleTab === r.key ? '0 1px 3px rgba(0,0,0,0.12)' : 'none',
+                  }}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+
+            {roleTab === 'client' && (
+              <div>
+                <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
+                  Welcome, Client Admin
+                </div>
+                <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 18 }}>
+                  Sign in with Google. New here? This creates your account automatically, pending approval.
+                </div>
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, color: 'rgba(59,42,31,0.7)', marginBottom: 16, cursor: 'pointer' }}>
+                  <input type="checkbox" checked={agreeTerms} onChange={(e) => setAgreeTerms(e.target.checked)} style={{ marginTop: 2 }} />
+                  <span>
+                    I agree to the{' '}
+                    <button type="button" onClick={() => setLegalModal('terms')} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}>Terms of Service</button>
+                    {' '}and{' '}
+                    <button type="button" onClick={() => setLegalModal('privacy')} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600, cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}>Privacy Policy</button>.
+                  </span>
+                </label>
+                {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
+                <button
+                  type="button" onClick={submitGoogle} disabled={busy}
+                  style={{
+                    width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+                    background: '#fff', color: '#3c4043', border: '1px solid rgba(59,42,31,0.25)', borderRadius: 6,
+                    padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: busy ? 0.6 : 1,
+                  }}
+                >
+                  <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+                    <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.57 2.7-3.88 2.7-6.62z" />
+                    <path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.81.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.96v2.33A9 9 0 0 0 9 18z" />
+                    <path fill="#FBBC05" d="M3.95 10.7A5.4 5.4 0 0 1 3.67 9c0-.59.1-1.17.28-1.7V4.97H.96A9 9 0 0 0 0 9c0 1.45.35 2.83.96 4.03l2.99-2.33z" />
+                    <path fill="#EA4335" d="M9 3.58c1.32 0 2.51.46 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .96 4.97l2.99 2.33C4.66 5.17 6.65 3.58 9 3.58z" />
+                  </svg>
+                  {busy ? 'Signing in…' : 'Sign in with Google'}
+                </button>
+              </div>
+            )}
+
+            {roleTab === 'staff' && (
+              <form onSubmit={submitStaff}>
+                <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
+                  Staff Sign In
+                </div>
+                <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 18 }}>
+                  Use the Inventory ID and password your Client Admin gave you.
+                </div>
+                <label style={labelStyle}>Inventory ID</label>
+                <input
+                  type="text" required autoCapitalize="characters" value={inventoryId}
+                  onChange={(e) => setInventoryId(e.target.value)} placeholder="U-XXXXXXXX-XXX"
+                  style={{ ...inputStyle, fontFamily: "'IBM Plex Mono', monospace" }}
+                />
+                <label style={labelStyle}>Password</label>
+                <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} style={{ ...inputStyle, marginBottom: 6 }} />
+                <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginBottom: 16 }}>
+                  Forgot your password? Ask your Client Admin - staff accounts don't use email recovery.
+                </div>
+                {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
+                <button type="submit" disabled={busy} style={primaryBtnStyle(busy)}>{busy ? 'Signing in…' : 'Sign In'}</button>
+              </form>
+            )}
+
+            {roleTab === 'superadmin' && (
+              <form onSubmit={submitSuperAdmin}>
+                <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 20, marginBottom: 4, color: t.ink }}>
+                  Super Admin Sign In
+                </div>
+                <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginBottom: 18 }}>
+                  Platform administration - email and password.
+                </div>
+                <label style={labelStyle}>Email</label>
+                <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} style={inputStyle} />
+                <label style={labelStyle}>Password</label>
+                <input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} style={{ ...inputStyle, marginBottom: 6 }} />
+                <div style={{ textAlign: 'right', marginBottom: 14 }}>
+                  <button type="button" onClick={goToReset} style={{ background: 'none', border: 'none', padding: 0, color: t.blueprint, cursor: 'pointer', textDecoration: 'underline', fontSize: 11.5 }}>
+                    Forgot password?
+                  </button>
+                </div>
+                {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
+                <button type="submit" disabled={busy} style={primaryBtnStyle(busy)}>{busy ? 'Signing in…' : 'Sign In'}</button>
+              </form>
+            )}
+
+            <div style={{ textAlign: 'center', marginTop: 16, fontSize: 11, color: 'rgba(59,42,31,0.45)' }}>
+              <button type="button" onClick={() => setLegalModal('terms')} style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>Terms of Service</button>
+              {' · '}
+              <button type="button" onClick={() => setLegalModal('privacy')} style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>Privacy Policy</button>
+            </div>
           </>
         )}
-        {error && <div style={{ fontSize: 12.5, color: t.red, marginBottom: 12 }}>{error}</div>}
-        <button type="submit" disabled={busy} style={{
-          width: '100%', background: t.blueprint, color: '#fff', border: 'none', borderRadius: 6,
-          padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer', opacity: busy ? 0.6 : 1,
-        }}>
-          {busy ? (mode === 'signup' ? 'Creating account…' : 'Signing in…') : (mode === 'signup' ? 'Sign Up' : 'Sign In')}
-        </button>
-        <div style={{ textAlign: 'center', marginTop: 16, fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>
-          {mode === 'signup' ? 'Already have an account?' : "Don't have an account?"}{' '}
-          <button type="button" onClick={switchMode} style={{
-            background: 'none', border: 'none', padding: 0, color: t.blueprint, fontWeight: 600,
-            cursor: 'pointer', textDecoration: 'underline', fontSize: 12.5,
-          }}>
-            {mode === 'signup' ? 'Sign In' : 'Sign Up'}
-          </button>
-        </div>
-        <div style={{ textAlign: 'center', marginTop: 10, fontSize: 11, color: 'rgba(59,42,31,0.45)' }}>
-          <button type="button" onClick={() => setLegalModal('terms')} style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>Terms of Service</button>
-          {' · '}
-          <button type="button" onClick={() => setLegalModal('privacy')} style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}>Privacy Policy</button>
-        </div>
-      </form>
-      )}
+      </div>
       {legalModal && <LegalModal kind={legalModal} onClose={() => setLegalModal(null)} theme={t} />}
     </div>
   );
@@ -5269,16 +5295,16 @@ function ChangePasswordPanel({ onChangePassword }) {
 
 function AddStaffPanel({ onCreateStaff }) {
   const [open, setOpen] = useState(false);
-  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [username, setUsername] = useState('');
   const [contactNumber, setContactNumber] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [created, setCreated] = useState(null); // { inventoryId, fullName } after a successful create
 
   const reset = () => {
-    setEmail(''); setPassword(''); setFullName(''); setUsername(''); setContactNumber(''); setError('');
+    setPassword(''); setFullName(''); setUsername(''); setContactNumber(''); setError('');
   };
 
   const submit = async (e) => {
@@ -5286,11 +5312,11 @@ function AddStaffPanel({ onCreateStaff }) {
     setError('');
     if (password.length < 6) { setError('Password should be at least 6 characters.'); return; }
     setBusy(true);
-    const result = await onCreateStaff({ email, password, fullName, username, contactNumber });
+    const result = await onCreateStaff({ password, fullName, username, contactNumber });
     setBusy(false);
     if (result?.ok) {
+      setCreated({ inventoryId: result.inventoryId, fullName });
       reset();
-      setOpen(false);
     }
   };
 
@@ -5301,19 +5327,41 @@ function AddStaffPanel({ onCreateStaff }) {
           <UserPlus size={15} />
           <span>STAFF ACCOUNTS</span>
         </div>
-        <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setOpen((v) => !v)}>
+        <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => { setOpen((v) => !v); setCreated(null); }}>
           {open ? 'Cancel' : '+ Add Staff'}
         </button>
       </div>
       {!open ? (
         <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.55)', marginTop: 10 }}>
-          Staff accounts you create here are automatically linked to your inventory and only ever see your business data.
+          Staff accounts you create here are automatically linked to your inventory and only ever see your business data. Staff log in with an Inventory ID + password &mdash; no email needed.
+        </div>
+      ) : created ? (
+        <div style={{ marginTop: 14 }}>
+          <div style={{
+            background: 'rgba(79,138,99,0.08)', border: '1px solid rgba(79,138,99,0.3)', borderRadius: 8, padding: 14,
+          }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--green)', marginBottom: 6 }}>
+              Staff account created for {created.fullName || 'this staff member'}
+            </div>
+            <div style={{ fontSize: 12.5, color: 'var(--ink)', marginBottom: 4 }}>
+              Give them this Inventory ID and the password you just set &mdash; this is how they'll sign in:
+            </div>
+            <div style={{
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: 16, fontWeight: 600, letterSpacing: '0.03em',
+              background: '#fff', border: '1px solid rgba(59,42,31,0.15)', borderRadius: 6, padding: '8px 12px', display: 'inline-block',
+            }}>
+              {created.inventoryId}
+            </div>
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 8 }}>
+              This won't be shown again here, but it's always visible on that staff member's profile as their Unique ID Number.
+            </div>
+          </div>
+          <button className="depot-btn" style={{ ...styles.smallAmberBtn, marginTop: 10 }} onClick={() => setCreated(null)}>
+            Add Another Staff Member
+          </button>
         </div>
       ) : (
         <form onSubmit={submit} style={{ marginTop: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }} className="depot-form-grid">
-          <Field label="Email">
-            <input type="email" required className="depot-input" style={styles.modalInput} value={email} onChange={(e) => setEmail(e.target.value)} />
-          </Field>
           <Field label="Temporary Password">
             <input type="password" required className="depot-input" style={styles.modalInput} value={password} onChange={(e) => setPassword(e.target.value)} />
           </Field>
@@ -5334,6 +5382,9 @@ function AddStaffPanel({ onCreateStaff }) {
           {error && (
             <div style={{ gridColumn: '1 / -1', fontSize: 12, color: 'var(--red)' }}>{error}</div>
           )}
+          <div style={{ gridColumn: '1 / -1', fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>
+            A unique Inventory ID is generated automatically once you submit &mdash; that plus this password is all they'll need to sign in.
+          </div>
         </form>
       )}
     </div>
