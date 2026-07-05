@@ -6,22 +6,23 @@ import { initializeApp, deleteApp } from 'firebase/app';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth,
   updatePassword, reauthenticateWithCredential, EmailAuthProvider, sendPasswordResetEmail,
+  inMemoryPersistence, setPersistence,
 } from 'firebase/auth';
 import {
-  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where,
+  collection, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, query, where, arrayUnion, arrayRemove,
 } from 'firebase/firestore';
 import {
   Package, AlertTriangle, Search, Plus, Pencil, Trash2, X,
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
 } from 'recharts';
 
-const FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=Nunito:wght@400;500;600;700&display=swap');";
+const FONT_IMPORT = "@import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=Nunito:wght@400;500;600;700&family=Poppins:wght@500;600;700&family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');";
 
 const RESPONSIVE_CSS = `
   html, body { -webkit-text-size-adjust: 100%; }
@@ -172,6 +173,60 @@ function printPage() {
   window.print();
 }
 
+const ACTIVITY_TYPE_LABELS = {
+  login: 'Login',
+  logout: 'Logout',
+  staff_created: 'Staff Created',
+  inventory_added: 'Inventory Added',
+  inventory_edited: 'Inventory Edited',
+  inventory_assigned: 'Inventory Assigned',
+  inventory_returned: 'Inventory Returned',
+  subscription_created: 'Subscription Created',
+  subscription_marked_paid: 'Subscription Marked Paid',
+  subscription_marked_unpaid: 'Subscription Marked Unpaid',
+  price_changed: 'Base Price Changed',
+  markup_changed: 'Markup Changed',
+  sale_completed: 'Sale Completed',
+  report_generated: 'Report Generated',
+};
+
+function describeActivity(l) {
+  const m = l.meta || {};
+  switch (l.type) {
+    case 'login': return 'Signed in';
+    case 'logout': return 'Signed out';
+    case 'staff_created': return `Created staff account for ${m.targetEmail || '—'}`;
+    case 'inventory_added': return `Added item ${m.itemSku || ''}${m.itemName ? ` — ${m.itemName}` : ''}`;
+    case 'inventory_edited': return `Edited item ${m.itemSku || ''}${m.itemName ? ` — ${m.itemName}` : ''}`;
+    case 'inventory_assigned': return `Assigned ${m.qty ?? ''} × ${m.itemSku || ''} to ${m.targetEmail || '—'}`;
+    case 'inventory_returned': return `Returned ${m.qty ?? ''} × ${m.itemSku || ''}${m.byEmail ? ` (by ${m.byEmail})` : ''}`;
+    case 'subscription_created': return `Created ${m.monthLabel || ''} subscription for ${m.targetName || m.targetEmail || '—'}`;
+    case 'subscription_marked_paid': return `Marked ${m.monthLabel || ''} as Paid for ${m.targetName || m.targetEmail || '—'}`;
+    case 'subscription_marked_unpaid': return `Marked ${m.monthLabel || ''} as Unpaid for ${m.targetName || m.targetEmail || '—'}`;
+    case 'price_changed': return `Changed base cost of ${m.itemSku || ''} from ${currency(m.oldCost ?? 0)} to ${currency(m.newCost ?? 0)}`;
+    case 'markup_changed': return `Updated markup on ${m.itemSku || ''} to ${m.markupType === 'fixed' ? currency(m.markupValue ?? 0) + ' flat' : `${m.markupValue ?? 0}%`}`;
+    case 'sale_completed': return `Completed sale ${m.receiptNo || ''} (${currency(m.total ?? 0)})`;
+    case 'report_generated': return `Generated ${m.report || 'a report'}${m.format ? ` (${m.format})` : ''}`;
+    default: return ACTIVITY_TYPE_LABELS[l.type] || l.type;
+  }
+}
+
+function activityBadgeColors(type) {
+  if (type === 'login' || type === 'sale_completed' || type === 'subscription_marked_paid') return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' };
+  if (type === 'logout') return { bg: 'rgba(20,33,61,0.08)', color: 'var(--ink)' };
+  if (type === 'price_changed' || type === 'markup_changed' || type === 'inventory_returned' || type === 'subscription_marked_unpaid') return { bg: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' };
+  if (type === 'staff_created' || type === 'inventory_assigned' || type === 'subscription_created') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
+  return { bg: 'rgba(20,33,61,0.06)', color: 'var(--ink)' };
+}
+
+// Every onSnapshot below is wired with this, so if a listener ever gets
+// blocked (e.g. by a rules change), the console tells us exactly which
+// one - rather than every listener producing the same generic, impossible
+// to distinguish "permission-denied" message.
+function logSnapErr(label) {
+  return (err) => console.error(`[snapshot:${label}]`, err?.code || err);
+}
+
 // Lightweight, dependency-free sound effects using the Web Audio API - no
 // external audio files to host, license, or fetch. Every entry point below
 // is wrapped in try/catch so a sound failure (e.g. an older browser, or a
@@ -277,6 +332,82 @@ function computeSellingPrice(baseCost, markupType, markupValue) {
   const markup = Math.max(0, Number(markupValue) || 0);
   const price = markupType === 'fixed' ? cost + markup : cost * (1 + markup / 100);
   return Math.round(price * 100) / 100;
+}
+
+// Reverse direction: Base Price and Selling Price are entered directly, and
+// the markup (both as a peso amount and as a percentage) is derived purely
+// for display - it's read-only, never the source of truth. Guards against
+// divide-by-zero when base cost is 0.
+function computeMarkupFromPrices(baseCost, sellingPrice) {
+  const cost = Math.max(0, Number(baseCost) || 0);
+  const price = Math.max(0, Number(sellingPrice) || 0);
+  const amount = Math.round((price - cost) * 100) / 100;
+  const percent = cost > 0 ? Math.round((amount / cost) * 10000) / 100 : 0;
+  return { amount, percent };
+}
+
+// --- Subscription helpers -------------------------------------------------
+// A Client Admin's subscription lives entirely on their own users/{uid}
+// doc as `subscription: { history: [...] }` - Super Admin writes it,
+// everyone (the Client Admin + their staff) can read it. Status is always
+// computed LIVE against the current date rather than trusting a stored
+// "active" flag, since there's no backend cron job here to flip a flag the
+// moment a period lapses - only a real date comparison is trustworthy.
+
+// Month is 1-indexed (1 = January) to match how a person actually thinks
+// about "July 2026", not JS Date's 0-indexed convention.
+function computeSubscriptionPeriod(month, year) {
+  const start = new Date(year, month - 1, 1, 0, 0, 0, 0).getTime();
+  const end = new Date(year, month, 0, 23, 59, 59, 999).getTime(); // day 0 of next month = last day of this one
+  return { start, end };
+}
+
+function getLatestSubscriptionPeriod(subscription) {
+  const history = subscription?.history || [];
+  if (history.length === 0) return null;
+  return history.reduce((latest, p) => (!latest || p.year > latest.year || (p.year === latest.year && p.month > latest.month) ? p : latest), null);
+}
+
+// No subscription history at all (brand new client Super Admin hasn't set
+// up yet) is treated as active/not-paused - a friendlier default than
+// instantly locking out a client the moment they're approved, before
+// Super Admin has had a chance to configure anything.
+function isSubscriptionActive(subscription) {
+  const latest = getLatestSubscriptionPeriod(subscription);
+  if (!latest) return true;
+  return latest.endDate >= Date.now();
+}
+
+// Days remaining until the current period lapses (negative if already
+// expired). Used for the "expiring within 5 days" warning.
+function daysUntilExpiration(subscription) {
+  const latest = getLatestSubscriptionPeriod(subscription);
+  if (!latest) return null;
+  return Math.ceil((latest.endDate - Date.now()) / DAY_MS);
+}
+
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+// Convert between a timestamp and the yyyy-mm-dd string an <input type="date">
+// needs, in LOCAL time (not UTC) so the date shown always matches the date
+// actually intended, regardless of timezone offset.
+function timestampToDateInputValue(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// endOfDay=true gives 23:59:59.999 that date (for an end date), otherwise
+// midnight (for a start date) - both in local time.
+function dateInputValueToTimestamp(value, endOfDay) {
+  if (!value) return null;
+  const [y, m, d] = value.split('-').map(Number);
+  return endOfDay
+    ? new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+    : new Date(y, m - 1, d, 0, 0, 0, 0).getTime();
 }
 
 function ExportBar({ onPrint, onDownload, onDownloadPDF }) {
@@ -410,12 +541,16 @@ const ROLES = {
 
 const PERMISSIONS = {
   superadmin: {
-    viewInventory: true, editInventory: true, deleteInventory: true,
-    manageCategories: true, manageSuppliers: true, manageLocations: true, manageOrders: true,
-    stockReceive: true, stockIssue: true, editMarkup: true,
-    pos: true, viewReports: true, viewSalesReports: false, print: true, cancelSales: true,
+    // Super Admin no longer runs their own inventory/POS/reports - their
+    // role is purely platform management: approving Client Admin accounts
+    // (Team Access), managing subscriptions (Client Accounts), and
+    // reviewing the platform-wide Activity Log.
+    viewInventory: false, editInventory: false, deleteInventory: false,
+    manageCategories: false, manageSuppliers: false, manageLocations: false, manageOrders: false,
+    stockReceive: false, stockIssue: false, editMarkup: false,
+    pos: false, viewReports: false, viewSalesReports: false, print: false, cancelSales: false,
     manageUsers: true, manageAllRoles: true, manageSystem: true,
-    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: true,
+    viewOwnSales: false, viewActivityLogs: true, manageUserProfiles: true, createStaff: false,
   },
   client: {
     viewInventory: true, editInventory: true, deleteInventory: true,
@@ -445,6 +580,7 @@ const VIEW_PERMISSIONS = {
   pos: 'pos',
   inventory: 'viewInventory',
   staffInventory: 'editInventory',
+  clientAccounts: 'manageSystem',
   suppliers: 'manageSuppliers',
   categories: 'manageCategories',
   locations: 'manageLocations',
@@ -536,22 +672,70 @@ const THEMES = {
     paper: '#F2F4F6', paperDim: '#E4E8EC', ink: '#232B35', amber: '#4A7FB5', amberDeep: '#2F5C8A',
     green: '#4F8A6E', red: '#C1543C',
   },
+  roseBlush: {
+    label: 'Rose Blush', swatch: '#B5586F',
+    blueprint: '#7A3B4A', blueprintDeep: '#54222D', line: '#E0A3AF', lineDim: 'rgba(224,163,175,0.28)',
+    paper: '#FBF0EE', paperDim: '#F3DEDC', ink: '#3D2228', amber: '#D98C55', amberDeep: '#A9601D',
+    green: '#6B8F6A', red: '#C1503A',
+  },
+  forestDeep: {
+    label: 'Forest Deep', swatch: '#1F4D3D',
+    blueprint: '#1F4D3D', blueprintDeep: '#123126', line: '#7FBFA0', lineDim: 'rgba(127,191,160,0.28)',
+    paper: '#EEF3EE', paperDim: '#DFE9DF', ink: '#16281E', amber: '#C9A441', amberDeep: '#8F7420',
+    green: '#3F8A5C', red: '#B84B3A',
+  },
+  midnightPurple: {
+    label: 'Midnight Purple', swatch: '#453166',
+    blueprint: '#453166', blueprintDeep: '#2B1F44', line: '#B39DDB', lineDim: 'rgba(179,157,219,0.28)',
+    paper: '#F3F0F8', paperDim: '#E6E0EF', ink: '#241A38', amber: '#C98A4A', amberDeep: '#9A621F',
+    green: '#4F8A63', red: '#C1503A',
+  },
+  sandstone: {
+    label: 'Sandstone', swatch: '#8C6A4E',
+    blueprint: '#6B5236', blueprintDeep: '#453420', line: '#C7A87B', lineDim: 'rgba(199,168,123,0.28)',
+    paper: '#F6F1E7', paperDim: '#EBE1CD', ink: '#332A1E', amber: '#B9803C', amberDeep: '#8A5C21',
+    green: '#6B8757', red: '#B8543C',
+  },
 };
 const DEFAULT_THEME_KEY = 'cozyGrocery';
 
-function themeCssVars(theme) {
+// Applied app-wide via a global !important rule (see themeCssVars), since
+// most text elements set their font-family inline rather than through a
+// shared class - a plain CSS var alone wouldn't be able to override that
+// without !important backing it.
+const FONT_PRESETS = {
+  quicksandNunito: { label: 'Quicksand + Nunito (Default)', family: "'Quicksand', 'Nunito', sans-serif" },
+  poppinsInter: { label: 'Poppins + Inter (Modern)', family: "'Poppins', 'Inter', sans-serif" },
+  playfairSource: { label: 'Playfair Display + Source Sans (Elegant)', family: "'Playfair Display', 'Source Sans 3', serif" },
+  georgiaVerdana: { label: 'Georgia + Verdana (Classic)', family: "Georgia, 'Verdana', serif" },
+  courierMono: { label: 'Courier Mono (Utilitarian)', family: "'IBM Plex Mono', 'Courier New', monospace" },
+};
+const DEFAULT_FONT_KEY = 'quicksandNunito';
+
+function themeCssVars(theme, fontFamily, customInk, customPanelBg) {
   return `
+    :root {
           --blueprint: ${theme.blueprint};
           --blueprint-deep: ${theme.blueprintDeep};
           --line: ${theme.line};
           --line-dim: ${theme.lineDim};
           --paper: ${theme.paper};
           --paper-dim: ${theme.paperDim};
-          --ink: ${theme.ink};
+          --ink: ${customInk || theme.ink};
           --amber: ${theme.amber};
           --amber-deep: ${theme.amberDeep};
           --green: ${theme.green};
           --red: ${theme.red};
+          --panel-bg: ${customPanelBg || '#ffffff'};
+          --font-body: ${fontFamily || FONT_PRESETS[DEFAULT_FONT_KEY].family};
+    }
+    /* Most text elements in this app set font-family inline rather than
+       through a shared class, so a plain CSS var alone can't override
+       them - !important is required to make the font picker actually
+       take effect app-wide. Text COLOR mostly already flows through
+       var(--ink) directly in shared styles, so it doesn't need the same
+       !important treatment. */
+    .depot-wrap, .depot-wrap * { font-family: var(--font-body) !important; }
   `;
 }
 
@@ -559,6 +743,7 @@ export default function InventorySystem() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [myProfile, setMyProfile] = useState(null);
+  const [employerProfile, setEmployerProfile] = useState(null);
   const [profileChecked, setProfileChecked] = useState(false);
   const [pendingUsers, setPendingUsers] = useState([]);
   const [approvedUsers, setApprovedUsers] = useState([]);
@@ -584,6 +769,8 @@ export default function InventorySystem() {
   const [orderModal, setOrderModal] = useState(null);
   const [assignModal, setAssignModal] = useState(null);
   const [markupModal, setMarkupModal] = useState(null);
+  const [returnModal, setReturnModal] = useState(null);
+  const [subscriptionModal, setSubscriptionModal] = useState(null);
   const [selectedStaffUid, setSelectedStaffUid] = useState('');
   const [confirmModal, setConfirmModal] = useState(null); // {kind: 'item'|'supplier'|'order', target}
   const [deliveryStatusModal, setDeliveryStatusModal] = useState(null);
@@ -623,7 +810,7 @@ export default function InventorySystem() {
       unsub = onSnapshot(doc(db, 'users', user.uid), (d) => {
         setMyProfile(d.exists() ? d.data() : null);
         setProfileChecked(true);
-      });
+      }, logSnapErr('myProfile'));
     })();
     return () => { if (unsub) unsub(); };
   }, [user]);
@@ -642,6 +829,25 @@ export default function InventorySystem() {
   const ownerId = !user ? null
     : myRole === 'staff' ? (myProfile?.parentId || null)
     : user.uid;
+
+  // Staff read their employer's (Client Admin's) profile doc to check
+  // subscription status - a plain get() on one known document, not a list
+  // query, so it's not subject to the Firestore list-query limitation
+  // we've hit elsewhere in this app.
+  useEffect(() => {
+    if (myRole !== 'staff' || !ownerId) { setEmployerProfile(null); return; }
+    const unsub = onSnapshot(doc(db, 'users', ownerId), (d) => {
+      setEmployerProfile(d.exists() ? d.data() : null);
+    }, logSnapErr('employerProfile'));
+    return unsub;
+  }, [myRole, ownerId]);
+
+  // Whichever profile actually carries subscription data for this
+  // session: a Client Admin's own subscription, or (for staff) their
+  // employer's. Computed live against today's date every render - see the
+  // subscription helpers for why this can't just trust a stored flag.
+  const mySubscription = myRole === 'staff' ? employerProfile?.subscription : myProfile?.subscription;
+  const accessPaused = (myRole === 'client' || myRole === 'staff') && !isSubscriptionActive(mySubscription);
 
   // Activity log: record a "login" entry each time a session starts. This is
   // a client-side approximation - it can't distinguish "just signed in" from
@@ -683,7 +889,7 @@ export default function InventorySystem() {
   useEffect(() => {
     const unsub = onSnapshot(doc(db, 'config', 'branding'), (d) => {
       setBranding(d.exists() ? d.data() : {});
-    }, () => setBranding({}));
+    }, (err) => { logSnapErr('platformBranding')(err); setBranding({}); });
     return unsub;
   }, []);
 
@@ -695,7 +901,7 @@ export default function InventorySystem() {
     if (!ownerId) { setTenantBranding(null); return; }
     const unsub = onSnapshot(doc(db, 'config', 'branding_' + ownerId), (d) => {
       setTenantBranding(d.exists() ? d.data() : {});
-    }, () => setTenantBranding({}));
+    }, (err) => { logSnapErr('tenantBranding')(err); setTenantBranding({}); });
     return unsub;
   }, [ownerId]);
 
@@ -704,26 +910,58 @@ export default function InventorySystem() {
   const effectiveBranding = {
     logoDataUri: tenantBranding?.logoDataUri ?? branding?.logoDataUri,
     themeKey: tenantBranding?.themeKey ?? branding?.themeKey,
+    fontKey: tenantBranding?.fontKey ?? branding?.fontKey,
+    customInk: tenantBranding?.customInk ?? branding?.customInk,
+    customPanelBg: tenantBranding?.customPanelBg ?? branding?.customPanelBg,
   };
   const effectiveLogo = effectiveBranding.logoDataUri || LOGO_DATA_URI;
   const activeTheme = THEMES[effectiveBranding.themeKey] || THEMES[DEFAULT_THEME_KEY];
+  const activeFontFamily = (FONT_PRESETS[effectiveBranding.fontKey] || FONT_PRESETS[DEFAULT_FONT_KEY]).family;
 
-  // Super Admin manages Team Access for the whole platform (every account).
-  // A Client only ever subscribes to the staff THEY created - scoped via
-  // `parentId`, matching Firestore rules - so they can never see another
-  // Client's roster or other Client/Super Admin accounts.
+  // Super Admin manages Team Access for the whole platform (every account) -
+  // an unfiltered collection listener, which works fine for them since
+  // isSuperAdmin() alone (not combined with per-document field matching)
+  // is trivially provable across the whole collection.
+  //
+  // A Client reads each of THEIR staff individually, driven by the
+  // `staffUids` array recorded on their own profile (see
+  // createStaffAccount). This sidesteps a Firestore list-query edge case:
+  // a collection query filtered by `where('parentId', '==', myUid)` -
+  // logically sound and confirmed correct against the security rules -
+  // was nonetheless silently denied by Firestore with no reliable fix
+  // found. Reading each staff document individually (a plain get(), not a
+  // list) avoids that edge case entirely.
+  const staffUidsKey = JSON.stringify(myProfile?.staffUids || []);
   useEffect(() => {
     if (!user || !isManager) { setPendingUsers([]); setApprovedUsers([]); return; }
-    const usersQuery = myRole === 'superadmin'
-      ? collection(db, 'users')
-      : query(collection(db, 'users'), where('parentId', '==', user.uid));
-    const unsub = onSnapshot(usersQuery, (snap) => {
-      const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
+
+    if (myRole === 'superadmin') {
+      const unsub = onSnapshot(collection(db, 'users'), (snap) => {
+        const all = snap.docs.map((d) => ({ id: d.id, ...d.data(), role: resolveRole(d.data()) }));
+        setPendingUsers(all.filter((u) => !u.approved));
+        setApprovedUsers(all.filter((u) => u.approved));
+      }, logSnapErr('teamRoster'));
+      return unsub;
+    }
+
+    const staffUids = JSON.parse(staffUidsKey);
+    if (staffUids.length === 0) { setPendingUsers([]); setApprovedUsers([]); return; }
+
+    const docsMap = {};
+    const refresh = () => {
+      const all = Object.values(docsMap);
       setPendingUsers(all.filter((u) => !u.approved));
       setApprovedUsers(all.filter((u) => u.approved));
-    });
-    return unsub;
-  }, [user, isManager, myRole]);
+    };
+    const unsubs = staffUids.map((uid) =>
+      onSnapshot(doc(db, 'users', uid), (d) => {
+        if (d.exists()) docsMap[uid] = { id: d.id, ...d.data(), role: resolveRole(d.data()) };
+        else delete docsMap[uid];
+        refresh();
+      }, logSnapErr('teamRoster'))
+    );
+    return () => unsubs.forEach((u) => u());
+  }, [user, isManager, myRole, staffUidsKey]);
 
   // Lets a Client Admin (or Super Admin, for support) provision a Staff
   // account directly - no self-signup/approval step. Uses a throwaway
@@ -740,6 +978,13 @@ export default function InventorySystem() {
     try {
       secondaryApp = initializeApp(auth.app.options, 'staff-creation-' + Date.now());
       const secondaryAuth = getAuth(secondaryApp);
+      // Critical: without this, the secondary app shares the SAME
+      // persisted auth storage as our own (primary) session by default -
+      // signing in/out a brand-new user on it can silently corrupt the
+      // admin's own active session, causing their live listeners to start
+      // throwing permission-denied shortly after. In-memory persistence
+      // keeps it fully isolated.
+      await setPersistence(secondaryAuth, inMemoryPersistence);
       const cred = await createUserWithEmailAndPassword(secondaryAuth, email.trim(), password);
       await setDoc(doc(db, 'users', cred.user.uid), {
         email: email.trim(), approved: true, isAdmin: false, role: 'staff',
@@ -748,8 +993,18 @@ export default function InventorySystem() {
         contactNumber: (contactNumber || '').trim(), address: (address || '').trim(),
         userIdNumber: generateUserIdNumber(),
       });
+      // Record this staff member on OUR OWN profile too. This is what lets
+      // Team Access find "my staff" via a simple read of our own document
+      // instead of a collection-wide query for "anyone whose parentId is
+      // me" - the former is a plain, reliable single-document read; the
+      // latter turned out to be an unreliable Firestore list-query edge
+      // case that silently denied results with no clear fix.
+      await setDoc(doc(db, 'users', user.uid), {
+        staffUids: arrayUnion(cred.user.uid),
+      }, { merge: true });
       await signOut(secondaryAuth);
       playAddSound();
+      logActivity('staff_created', { targetEmail: email.trim(), targetUid: cred.user.uid });
       showToast(`Staff account created for ${email.trim()}`);
       return { ok: true };
     } catch (e) {
@@ -786,6 +1041,12 @@ export default function InventorySystem() {
   const revokeUser = async (uid) => {
     try {
       await deleteDoc(doc(db, 'users', uid));
+      // Only relevant when a Client revokes their own staff (their roster
+      // is driven by this array) - harmless no-op for Super Admin removing
+      // any other account, since Super Admin's list isn't array-driven.
+      if (myRole === 'client') {
+        try { await setDoc(doc(db, 'users', user.uid), { staffUids: arrayRemove(uid) }, { merge: true }); } catch {}
+      }
       showToast('Access revoked');
     } catch (e) {
       showToast('Could not revoke access — check your connection');
@@ -799,6 +1060,37 @@ export default function InventorySystem() {
       showToast(`Role updated to ${ROLES[newRole] || newRole}`);
     } catch (e) {
       showToast('Could not update role — check your connection');
+    }
+  };
+
+  // Super Admin only. Month/Year still label and identify each period (used
+  // to file it under a specific month for the Monthly Report and history
+  // list), but the actual startDate/endDate are now whatever the admin
+  // sets them to - not forced to calendar-month boundaries, so a
+  // subscription can start/end on any specific date. Creating a period for
+  // a month/year that doesn't exist yet in this client's history appends a
+  // new entry; picking one that already exists updates it in place.
+  const saveSubscriptionPeriod = async (clientUid, { month, year, startDate, endDate, paymentStatus }) => {
+    if (myRole !== 'superadmin') { showToast("You don't have permission to manage subscriptions"); return; }
+    const client = approvedUsers.find((u) => u.id === clientUid);
+    if (!client) { showToast('Client not found'); return; }
+    if (!startDate || !endDate || endDate < startDate) { showToast('Pick a valid start and end date (end must be after start)'); return; }
+    const history = client.subscription?.history || [];
+    const idx = history.findIndex((p) => p.month === month && p.year === year);
+    const isNew = idx < 0;
+    const entry = { month, year, startDate, endDate, paymentStatus, setAt: Date.now(), setBy: user.email || user.uid };
+    const newHistory = isNew ? [...history, entry] : history.map((p, i) => (i === idx ? entry : p));
+    const monthLabel = `${MONTH_NAMES[month - 1]} ${year}`;
+
+    try {
+      await setDoc(doc(db, 'users', clientUid), { subscription: { history: newHistory } }, { merge: true });
+      const activityType = isNew ? 'subscription_created' : (paymentStatus === 'paid' ? 'subscription_marked_paid' : 'subscription_marked_unpaid');
+      logActivity(activityType, { targetEmail: client.email, targetName: client.fullName, monthLabel, paymentStatus });
+      showToast(`${monthLabel} subscription ${isNew ? 'created' : 'updated'} for ${client.fullName || client.email}`);
+      return { ok: true };
+    } catch (e) {
+      showToast('Could not update subscription — check your connection');
+      return { ok: false };
     }
   };
 
@@ -859,40 +1151,50 @@ export default function InventorySystem() {
   // other Client Admin's portal.
   const brandingDocFor = (role) => (role === 'superadmin' ? 'branding' : 'branding_' + ownerId);
 
-  const saveLogo = async (dataUri) => {
+  // Shared plumbing for every branding field (logo, theme, font, custom
+  // colors) - routes to the platform default doc for Super Admin, or the
+  // caller's own tenant-scoped doc for a Client Admin.
+  const updateBranding = async (fields, successMsg) => {
     if (!isManager) return;
     try {
       await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
-        logoDataUri: dataUri, ...(myRole === 'superadmin' ? {} : { ownerId }),
+        ...fields, ...(myRole === 'superadmin' ? {} : { ownerId }),
       }, { merge: true });
-      showToast(myRole === 'superadmin' ? 'Logo updated for everyone' : 'Logo updated for your inventory portal');
+      if (successMsg) showToast(successMsg);
     } catch (e) {
-      showToast('Could not save logo — check your connection');
+      showToast('Could not update branding — check your connection');
     }
+  };
+
+  const saveLogo = async (dataUri) => {
+    await updateBranding(
+      { logoDataUri: dataUri },
+      myRole === 'superadmin' ? 'Logo updated for everyone' : 'Logo updated for your inventory portal'
+    );
   };
 
   const resetLogo = async () => {
-    if (!isManager) return;
-    try {
-      await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
-        logoDataUri: null, ...(myRole === 'superadmin' ? {} : { ownerId }),
-      }, { merge: true });
-      showToast('Reverted to the default logo');
-    } catch (e) {
-      showToast('Could not reset logo — check your connection');
-    }
+    await updateBranding({ logoDataUri: null }, 'Reverted to the default logo');
   };
 
   const setThemeKey = async (key) => {
-    if (!isManager) return;
-    try {
-      await setDoc(doc(db, 'config', brandingDocFor(myRole)), {
-        themeKey: key, ...(myRole === 'superadmin' ? {} : { ownerId }),
-      }, { merge: true });
-      showToast(`Theme changed to ${THEMES[key]?.label || key}`);
-    } catch (e) {
-      showToast('Could not change theme — check your connection');
-    }
+    await updateBranding({ themeKey: key }, `Theme changed to ${THEMES[key]?.label || key}`);
+  };
+
+  const setFontKey = async (key) => {
+    await updateBranding({ fontKey: key }, `Text format changed to ${FONT_PRESETS[key]?.label || key}`);
+  };
+
+  const setCustomInk = async (hex) => {
+    await updateBranding({ customInk: hex }, 'Text color updated');
+  };
+
+  const setCustomPanelBg = async (hex) => {
+    await updateBranding({ customPanelBg: hex }, 'Panel color updated');
+  };
+
+  const resetCustomColors = async () => {
+    await updateBranding({ customInk: null, customPanelBg: null }, 'Reverted to theme default colors');
   };
 
 
@@ -950,40 +1252,40 @@ export default function InventorySystem() {
         : query(collection(db, 'items'), where('ownerId', '==', ownerId), where('holderId', '==', user.uid));
       unsubs.push(onSnapshot(itemsQuery, (snap) => {
         setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      }));
+      }, logSnapErr('items')));
       unsubs.push(onSnapshot(query(collection(db, 'suppliers'), where('ownerId', '==', ownerId)), (snap) => {
         setSuppliers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      }));
+      }, logSnapErr('suppliers')));
       unsubs.push(onSnapshot(doc(db, 'config', categoriesDocId), (d) => {
         setCategories(d.exists() ? (d.data().list || []) : DEFAULT_CATEGORIES.slice());
-      }));
+      }, logSnapErr('categories')));
       unsubs.push(onSnapshot(doc(db, 'config', locationsDocId), (d) => {
         setLocations(d.exists() ? (d.data().list || []) : DEFAULT_LOCATIONS.slice());
-      }));
+      }, logSnapErr('locations')));
 
       // Report-like data: only managers (Client + Super Admin) can read these under
       // the Firestore rules, so staff skip subscribing to avoid permission errors.
       if (isManager) {
         unsubs.push(onSnapshot(query(collection(db, 'movements'), where('ownerId', '==', ownerId)), (snap) => {
           setMovements(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-        }));
+        }, logSnapErr('movements')));
         unsubs.push(onSnapshot(query(collection(db, 'deliveryStatus'), where('ownerId', '==', ownerId)), (snap) => {
           const map = {};
           snap.docs.forEach((d) => { map[d.id] = d.data(); });
           setDeliveryStatuses(map);
-        }));
+        }, logSnapErr('deliveryStatus')));
         // Super Admin has no sales report access at all per policy - skip
         // the subscription entirely rather than just hiding it in the UI.
         if (myRole !== 'superadmin') {
           unsubs.push(onSnapshot(query(collection(db, 'sales'), where('ownerId', '==', ownerId)), (snap) => {
             setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-          }));
+          }, logSnapErr('sales-manager')));
         } else {
           setSales([]);
         }
         unsubs.push(onSnapshot(query(collection(db, 'orders'), where('ownerId', '==', ownerId)), (snap) => {
           setOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.orderDate - a.orderDate));
-        }));
+        }, logSnapErr('orders')));
         // Super Admin monitors login activity platform-wide; a Client only
         // sees activity for their own tenant (themselves + their staff).
         const logsQuery = myRole === 'superadmin'
@@ -991,7 +1293,7 @@ export default function InventorySystem() {
           : query(collection(db, 'loginLogs'), where('ownerId', '==', ownerId));
         unsubs.push(onSnapshot(logsQuery, (snap) => {
           setLoginLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-        }));
+        }, logSnapErr('loginLogs')));
       } else {
         setMovements([]);
         setDeliveryStatuses({});
@@ -1001,7 +1303,7 @@ export default function InventorySystem() {
         // rule) scopes this, so there's no risk of over-fetching then hiding.
         unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
           setSales(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.timestamp - a.timestamp));
-        }));
+        }, logSnapErr('sales-staff')));
       }
 
       setLoaded(true);
@@ -1015,17 +1317,44 @@ export default function InventorySystem() {
     setTimeout(() => setToast(null), 2400);
   };
 
+  // Extends the same tenant-scoped, already-permissioned loginLogs
+  // collection to cover the full activity vocabulary (not just login/
+  // logout) - staff creation, inventory changes, price/markup changes,
+  // sales, and report generation. One shared shape keeps Activity Log's
+  // filters simple: every entry has {type, meta, uid, email, timestamp,
+  // ownerId}.
+  const logActivity = async (type, meta = {}) => {
+    if (!ownerId || !user) return;
+    try {
+      const logId = 'l' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'loginLogs', logId), {
+        uid: user.uid, email: user.email || '', type, meta, timestamp: Date.now(), ownerId,
+      });
+    } catch (e) {
+      console.error('Activity log error:', e);
+    }
+  };
+
   const saveItem = async (draft) => {
     if (!can(myRole, 'editInventory')) { showToast("You don't have permission to edit inventory"); return; }
+    const isNew = !draft.id;
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
-    const markupType = draft.markupType === 'fixed' ? 'fixed' : 'percent';
-    const markupValue = Math.max(0, Number(draft.markupValue) || 0);
-    const sellingPrice = computeSellingPrice(unitCost, markupType, markupValue);
+    const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
+    const { percent: markupValue } = computeMarkupFromPrices(unitCost, sellingPrice);
+    const markupType = 'percent';
+    const previous = isNew ? null : items.find((i) => i.id === id);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, unitCost, markupType, markupValue, sellingPrice });
-      if (!draft.id) playAddSound();
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, unitCost, sellingPrice, markupType, markupValue });
+      if (isNew) {
+        playAddSound();
+        logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
+      } else if (previous && previous.unitCost !== unitCost) {
+        logActivity('price_changed', { itemSku: draft.sku, oldCost: previous.unitCost, newCost: unitCost });
+      } else {
+        logActivity('inventory_edited', { itemSku: draft.sku, itemName: draft.name });
+      }
       showToast(draft.id ? `Updated ${draft.sku}` : `Added ${draft.sku} to the manifest`);
     } catch (e) {
       showToast('Could not save item — check your connection');
@@ -1055,80 +1384,160 @@ export default function InventorySystem() {
   // creating a duplicate line. The staff member's copy gets its own
   // independent quantity and starts with no markup - they set their own
   // from there.
-  const assignInventoryToStaff = async ({ sourceItemId, staffUid, quantity, unitCost }) => {
+  // Assigns a whole batch of items to one staff member in a single action -
+  // each line gets its own quantity/base cost, transferred out of the
+  // admin's own stock and into (or topped up in) that staff member's own
+  // separate inventory, with movements logged on both sides for every line.
+  const assignInventoryToStaff = async (staffUid, lines) => {
     if (!can(myRole, 'editInventory')) { showToast("You don't have permission to assign inventory"); return; }
-    const source = items.find((i) => i.id === sourceItemId);
     const staff = approvedUsers.find((u) => u.id === staffUid);
-    if (!source || !staff) { showToast('Pick an item and a staff member'); return; }
-    const qty = Math.max(1, Number(quantity) || 0);
-    if (qty > source.quantity) { showToast(`Only ${source.quantity} available to assign`); return; }
-    const cost = Math.max(0, Number(unitCost) || 0) || source.unitCost;
+    if (!staff || !lines || lines.length === 0) { showToast('Pick a staff member and at least one item'); return; }
+
     const now = Date.now();
-    const existing = items.find((i) => i.holderId === staffUid && i.sourceItemId === sourceItemId);
+    let successCount = 0;
+    const failedSkus = [];
 
-    try {
-      await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty });
-
-      let staffItemId;
-      if (existing) {
-        staffItemId = existing.id;
-        const newQty = existing.quantity + qty;
-        await setDoc(doc(db, 'items', existing.id), {
-          ...existing, quantity: newQty, unitCost: cost,
-          sellingPrice: computeSellingPrice(cost, existing.markupType || 'percent', existing.markupValue || 0),
-        });
-      } else {
-        staffItemId = 'i' + Math.random().toString(36).slice(2, 9);
-        const markupType = 'percent';
-        const markupValue = 0;
-        await setDoc(doc(db, 'items', staffItemId), {
-          id: staffItemId, ownerId, holderId: staffUid, sourceItemId: source.id,
-          sku: source.sku, name: source.name, category: source.category,
-          quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
-          location: source.location, supplierIds: getSupplierIds(source),
-          markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
-        });
+    for (const line of lines) {
+      const source = items.find((i) => i.id === line.itemId);
+      const qty = Math.max(1, Number(line.quantity) || 0);
+      if (!source || qty > source.quantity) {
+        failedSkus.push(source?.sku || line.itemId);
+        continue;
       }
+      const cost = Math.max(0, Number(line.unitCost) || 0) || source.unitCost;
+      const existing = items.find((i) => i.holderId === staffUid && i.sourceItemId === source.id);
 
-      const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
-      await setDoc(doc(db, 'movements', mvOut), {
-        id: mvOut, itemId: source.id, type: 'out', qty,
-        reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId,
-      });
-      const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
-      await setDoc(doc(db, 'movements', mvIn), {
-        id: mvIn, itemId: staffItemId, type: 'in', qty,
-        reason: 'Received from Client Admin', timestamp: now, ownerId,
-      });
+      try {
+        await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty });
 
-      playAddSound();
-      showToast(`Assigned ${qty} × ${source.sku} to ${staff.fullName || staff.email}`);
-    } catch (e) {
-      showToast('Could not assign inventory — check your connection');
+        let staffItemId;
+        if (existing) {
+          staffItemId = existing.id;
+          await setDoc(doc(db, 'items', existing.id), {
+            ...existing, quantity: existing.quantity + qty, unitCost: cost,
+            sellingPrice: computeSellingPrice(cost, existing.markupType || 'percent', existing.markupValue || 0),
+          });
+        } else {
+          staffItemId = 'i' + Math.random().toString(36).slice(2, 9);
+          const markupType = 'percent';
+          const markupValue = 0;
+          await setDoc(doc(db, 'items', staffItemId), {
+            id: staffItemId, ownerId, holderId: staffUid, sourceItemId: source.id,
+            sku: source.sku, name: source.name, category: source.category,
+            quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
+            location: source.location, supplierIds: getSupplierIds(source),
+            markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
+          });
+        }
+
+        const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'movements', mvOut), {
+          id: mvOut, itemId: source.id, type: 'out', qty,
+          reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId,
+        });
+        const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'movements', mvIn), {
+          id: mvIn, itemId: staffItemId, type: 'in', qty,
+          reason: 'Received from Client Admin', timestamp: now, ownerId,
+        });
+
+        logActivity('inventory_assigned', { itemSku: source.sku, itemName: source.name, qty, targetEmail: staff.email });
+        successCount++;
+      } catch (e) {
+        failedSkus.push(source.sku);
+      }
+    }
+
+    if (successCount > 0) playAddSound();
+    if (failedSkus.length === 0) {
+      showToast(`Assigned ${successCount} item${successCount === 1 ? '' : 's'} to ${staff.fullName || staff.email}`);
+    } else {
+      showToast(`Assigned ${successCount} item(s); couldn't assign: ${failedSkus.join(', ')}`);
     }
     setAssignModal(null);
   };
 
-  // Staff can only ever touch the markup on their OWN assigned items - base
-  // cost, quantity, SKU, and everything else stays admin-controlled. Also
-  // usable by a manager adjusting markup directly, since it's just a subset
-  // of what saveItem already allows them.
-  const updateMarkup = async (item, markupType, markupValue) => {
+  // Staff can only ever touch the selling price on their OWN assigned
+  // items - base cost, quantity, SKU, and everything else stays
+  // admin-controlled. Also usable by a manager adjusting price directly,
+  // since it's just a subset of what saveItem already allows them.
+  const updateMarkup = async (item, sellingPriceInput) => {
     const isOwnItem = item.holderId === user.uid;
     if (!isOwnItem && !can(myRole, 'editInventory')) {
       showToast("You don't have permission to edit this item");
       return;
     }
-    const mt = markupType === 'fixed' ? 'fixed' : 'percent';
-    const mv = Math.max(0, Number(markupValue) || 0);
-    const sellingPrice = computeSellingPrice(item.unitCost, mt, mv);
+    const sellingPrice = Math.max(0, Number(sellingPriceInput) || 0);
+    const { percent: markupValue } = computeMarkupFromPrices(item.unitCost, sellingPrice);
+    const markupType = 'percent';
     try {
-      await setDoc(doc(db, 'items', item.id), { markupType: mt, markupValue: mv, sellingPrice }, { merge: true });
-      showToast(`Markup updated for ${item.sku}`);
+      await setDoc(doc(db, 'items', item.id), { markupType, markupValue, sellingPrice }, { merge: true });
+      logActivity('markup_changed', { itemSku: item.sku, itemName: item.name, markupType, markupValue });
+      showToast(`Price updated for ${item.sku}`);
     } catch (e) {
-      showToast('Could not update markup — check your connection');
+      showToast('Could not update price — check your connection');
     }
     setMarkupModal(null);
+  };
+
+  // The inverse of assignInventoryToStaff: moves stock OUT of a staff
+  // member's own inventory and back INTO the Client Admin's own inventory
+  // (matched via sourceItemId, the same link assignInventoryToStaff sets
+  // up). Usable by the staff member themselves (returning their own stock)
+  // or by a Client Admin pulling stock back from a staff member directly.
+  const returnInventoryToAdmin = async (staffItem, quantityInput) => {
+    const isOwnItem = staffItem.holderId === user.uid;
+    const isManagerCaller = can(myRole, 'editInventory');
+    if (!isOwnItem && !isManagerCaller) {
+      showToast("You don't have permission to return this item");
+      return;
+    }
+    const qty = Math.max(1, Number(quantityInput) || 0);
+    if (qty > staffItem.quantity) { showToast(`Only ${staffItem.quantity} available to return`); return; }
+
+    // Only a manager (who already has full write access across the whole
+    // tenant) can credit the admin's own item in the same action - a
+    // staff-initiated return only ever touches their OWN held item
+    // (already within their existing quantity permission), never writes to
+    // someone else's inventory doc. If a Client Admin wants to formally
+    // receive stock back, they use this same action themselves.
+    const adminItem = (isManagerCaller && staffItem.sourceItemId)
+      ? items.find((i) => i.id === staffItem.sourceItemId)
+      : null;
+    const now = Date.now();
+    const staffUser = approvedUsers.find((u) => u.id === staffItem.holderId);
+    const staffLabel = isOwnItem ? (user.email || 'you') : (staffUser?.fullName || staffUser?.email || 'staff');
+
+    try {
+      // Never delete the doc here (delete stays manager-only under current
+      // rules) - just reduce to 0. The admin can clean up a zero-quantity
+      // item manually if they want to.
+      const remaining = Math.max(0, staffItem.quantity - qty);
+      await setDoc(doc(db, 'items', staffItem.id), { ...staffItem, quantity: remaining });
+
+      if (adminItem) {
+        await setDoc(doc(db, 'items', adminItem.id), { ...adminItem, quantity: adminItem.quantity + qty });
+      }
+
+      const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'movements', mvOut), {
+        id: mvOut, itemId: staffItem.id, type: 'out', qty,
+        reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+      });
+      if (adminItem) {
+        const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
+        await setDoc(doc(db, 'movements', mvIn), {
+          id: mvIn, itemId: adminItem.id, type: 'in', qty,
+          reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+        });
+      }
+
+      logActivity('inventory_returned', { itemSku: staffItem.sku, itemName: staffItem.name, qty, byEmail: isOwnItem ? user.email : staffUser?.email });
+      showToast(`Returned ${qty} × ${staffItem.sku}${adminItem ? ' to your inventory' : ''}`);
+    } catch (e) {
+      showToast('Could not process return — check your connection');
+    }
+    setReturnModal(null);
   };
 
   const saveSupplier = async (draft) => {
@@ -1320,6 +1729,7 @@ export default function InventorySystem() {
       }));
       await setDoc(doc(db, 'sales', sale.id), sale);
       playSaleSound();
+      logActivity('sale_completed', { receiptNo, total, itemCount: saleLines.length });
       showToast(`Sale ${receiptNo} recorded — ${currency(total)}`);
       return sale;
     } catch (e) {
@@ -1350,6 +1760,23 @@ export default function InventorySystem() {
       showToast(`Sale ${sale.receiptNo} cancelled — stock restored`);
     } catch (e) {
       showToast('Could not cancel sale — check your connection');
+    }
+    setConfirmModal(null);
+  };
+
+  // Client Admin only (not Super Admin, who has no sales access at all) -
+  // permanently removes an already-cancelled sale record from the table.
+  // Only ever allowed on sales that are already cancelled, since a live
+  // sale should go through Cancel first (which restores stock) rather
+  // than being deleted outright.
+  const deleteSale = async (sale) => {
+    if (myRole !== 'client') { showToast("You don't have permission to delete sales"); return; }
+    if (!sale.cancelled) { showToast('Only cancelled sales can be deleted'); return; }
+    try {
+      await deleteDoc(doc(db, 'sales', sale.id));
+      showToast(`Sale ${sale.receiptNo} deleted`);
+    } catch (e) {
+      showToast('Could not delete sale — check your connection');
     }
     setConfirmModal(null);
   };
@@ -1431,6 +1858,30 @@ export default function InventorySystem() {
     if (myRole === 'staff') return items;
     return items.filter((it) => !it.holderId || it.holderId === ownerId);
   }, [items, myRole, ownerId]);
+
+  // Total value of stock currently OUT with staff (assigned, not sitting in
+  // the admin's own inventory), broken down per staff member - managers
+  // only, since it's derived from the whole-tenant `items` state they alone
+  // have access to.
+  const staffInventoryStats = useMemo(() => {
+    if (myRole === 'staff') return { total: 0, byStaff: [] };
+    const staffItems = items.filter((it) => it.holderId && it.holderId !== ownerId);
+    const total = staffItems.reduce((s, it) => s + it.quantity * it.unitCost, 0);
+    const byStaffMap = {};
+    staffItems.forEach((it) => {
+      if (!byStaffMap[it.holderId]) byStaffMap[it.holderId] = { staffUid: it.holderId, value: 0, skuCount: 0, units: 0 };
+      byStaffMap[it.holderId].value += it.quantity * it.unitCost;
+      byStaffMap[it.holderId].skuCount += 1;
+      byStaffMap[it.holderId].units += it.quantity;
+    });
+    const byStaff = Object.values(byStaffMap)
+      .map((s) => {
+        const staffUser = approvedUsers.find((u) => u.id === s.staffUid);
+        return { ...s, name: staffUser?.fullName || staffUser?.email || 'Unknown Staff' };
+      })
+      .sort((a, b) => b.value - a.value);
+    return { total, byStaff };
+  }, [items, ownerId, myRole, approvedUsers]);
 
   const filtered = useMemo(() => {
     let list = myOwnItems.filter((it) => {
@@ -1568,6 +2019,10 @@ export default function InventorySystem() {
     return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} onSignOut={handleSignOut} />;
   }
 
+  if (accessPaused) {
+    return <SubscriptionPausedScreen role={myRole} onSignOut={handleSignOut} />;
+  }
+
   if (!loaded) {
     return (
       <div style={{ ...styles.wrap, alignItems: 'center', justifyContent: 'center', display: 'flex' }}>
@@ -1584,11 +2039,9 @@ export default function InventorySystem() {
       <style>{`
         ${FONT_IMPORT}
         ${RESPONSIVE_CSS}
-        :root {
-          ${themeCssVars(activeTheme)}
-        }
+        ${themeCssVars(activeTheme, activeFontFamily, effectiveBranding.customInk, effectiveBranding.customPanelBg)}
         * { box-sizing: border-box; }
-        .depot-btn { cursor: pointer; border: none; font-family: 'Nunito', sans-serif; transition: all 0.15s ease; }
+        .depot-btn { cursor: pointer; border: none; font-family: var(--font-body); transition: all 0.15s ease; }
         .depot-btn:active { transform: translateY(1px); }
         .depot-row:hover { background: rgba(15,42,71,0.04); }
         .depot-input:focus, .depot-select:focus { outline: 2px solid var(--blueprint); outline-offset: 1px; }
@@ -1624,7 +2077,15 @@ export default function InventorySystem() {
         ) : (
         <>
         {view === 'overview' && (
-          <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} role={myRole} onQuickMove={(it) => setMoveModal(it)} />
+          myRole === 'superadmin' ? (
+            <ClientAccountsView
+              clients={approvedUsers.filter((u) => u.role === 'client')}
+              allUsers={approvedUsers}
+              onManageSubscription={(client) => setSubscriptionModal(client)}
+            />
+          ) : (
+            <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} staffInventoryStats={staffInventoryStats} role={myRole} subscription={mySubscription} onQuickMove={(it) => setMoveModal(it)} />
+          )
         )}
 
         {view === 'inventory' && (
@@ -1640,6 +2101,7 @@ export default function InventorySystem() {
             onDelete={(it) => setConfirmModal({ kind: 'item', target: it })}
             onMove={(it) => setMoveModal(it)}
             onEditMarkup={(it) => setMarkupModal(it)}
+            onReturn={(it) => setReturnModal(it)}
           />
         )}
 
@@ -1653,6 +2115,15 @@ export default function InventorySystem() {
             onEdit={(it) => setItemModal(it)}
             onDelete={(it) => setConfirmModal({ kind: 'item', target: it })}
             onMove={(it) => setMoveModal(it)}
+            onReturn={(it) => setReturnModal(it)}
+          />
+        )}
+
+        {view === 'clientAccounts' && (
+          <ClientAccountsView
+            clients={approvedUsers.filter((u) => u.role === 'client')}
+            allUsers={approvedUsers}
+            onManageSubscription={(client) => setSubscriptionModal(client)}
           />
         )}
 
@@ -1709,7 +2180,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'sales' && (
-          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} />
+          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onDeleteSale={(sale) => setConfirmModal({ kind: 'sale-delete', target: sale })} onLogActivity={logActivity} />
         )}
 
         {view === 'mysales' && (
@@ -1743,6 +2214,10 @@ export default function InventorySystem() {
             onSaveLogo={saveLogo}
             onResetLogo={resetLogo}
             onSetTheme={setThemeKey}
+            onSetFont={setFontKey}
+            onSetInk={setCustomInk}
+            onSetPanelBg={setCustomPanelBg}
+            onResetColors={resetCustomColors}
           />
         )}
 
@@ -1751,7 +2226,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'myprofile' && (
-          <MyProfileView profile={myProfile} uid={user.uid} onSave={updateUserProfile} onChangePassword={changePassword} />
+          <MyProfileView profile={myProfile} uid={user.uid} role={myRole} subscription={mySubscription} onSave={updateUserProfile} onChangePassword={changePassword} />
         )}
         </>
         )}
@@ -1816,6 +2291,23 @@ export default function InventorySystem() {
         />
       )}
 
+      {returnModal && (
+        <ReturnInventoryModal
+          item={returnModal}
+          hasDestination={!!(can(myRole, 'editInventory') && returnModal.sourceItemId && items.some((i) => i.id === returnModal.sourceItemId))}
+          onClose={() => setReturnModal(null)}
+          onSave={returnInventoryToAdmin}
+        />
+      )}
+
+      {subscriptionModal && (
+        <SubscriptionModal
+          client={subscriptionModal}
+          onClose={() => setSubscriptionModal(null)}
+          onSave={saveSubscriptionPeriod}
+        />
+      )}
+
       {confirmModal && confirmModal.kind === 'item' && (
         <ConfirmModal
           title="REMOVE ITEM"
@@ -1869,6 +2361,16 @@ export default function InventorySystem() {
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelSale(confirmModal.target)}
           confirmLabel="Cancel Sale"
+        />
+      )}
+
+      {confirmModal && confirmModal.kind === 'sale-delete' && (
+        <ConfirmModal
+          title="DELETE SALE RECORD"
+          message={<>Permanently delete the cancelled sale <strong>{confirmModal.target.receiptNo}</strong>? This only removes the record from your table &mdash; it does not affect stock, since cancelling already restored it. This can't be undone.</>}
+          onCancel={() => setConfirmModal(null)}
+          onConfirm={() => deleteSale(confirmModal.target)}
+          confirmLabel="Delete Sale"
         />
       )}
 
@@ -2363,6 +2865,51 @@ function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
   );
 }
 
+function SubscriptionPausedScreen({ role, onSignOut }) {
+  return (
+    <div style={{
+      minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'var(--paper, #F7EFDD)', fontFamily: "'Nunito', sans-serif", borderRadius: 8,
+      position: 'relative', overflow: 'hidden',
+    }}>
+      <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
+      <BackgroundDecor variant="login" />
+      <div className="depot-login-form" style={{
+        background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
+        boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(193,80,58,0.2)',
+        border: '1px solid rgba(193,80,58,0.35)', position: 'relative', zIndex: 1,
+      }}>
+        <div style={{
+          width: 52, height: 52, borderRadius: '50%', background: 'var(--red, #C1503A)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px',
+        }}>
+          <AlertTriangle size={26} color="#fff" />
+        </div>
+        <div style={{ fontFamily: "'Quicksand', sans-serif", fontWeight: 600, fontSize: 19, marginBottom: 8, color: '#3B2A1F' }}>
+          Subscription Paused
+        </div>
+        <div style={{ fontSize: 13, color: 'rgba(59,42,31,0.65)', lineHeight: 1.6, marginBottom: 4 }}>
+          {role === 'client'
+            ? 'Access to Stock IT is currently paused because your subscription has expired. Please contact your platform administrator to renew.'
+            : 'Access to Stock IT is currently paused because your Client Admin\u2019s subscription has expired. Please check with them, or contact the platform administrator.'}
+        </div>
+        <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginTop: 10, marginBottom: 22 }}>
+          This page will update automatically once the subscription is renewed &mdash; no need to refresh.
+        </div>
+        <button
+          onClick={onSignOut}
+          style={{
+            width: '100%', background: 'transparent', border: '1px solid rgba(59,42,31,0.2)', color: '#3B2A1F',
+            borderRadius: 6, padding: '10px 0', fontSize: 13.5, fontWeight: 500, cursor: 'pointer',
+          }}
+        >
+          Sign Out
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
   const structure = [
     { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
@@ -2397,7 +2944,13 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
         return canAccessView(role, entry.key) ? entry : null;
       }
       const children = entry.children.filter((c) => canAccessView(role, c.key));
-      return children.length ? { ...entry, children } : null;
+      if (children.length === 0) return null;
+      if (children.length === 1) {
+        // Only one visible child - show it as a flat item instead of a
+        // dropdown group wrapping a single link.
+        return { type: 'item', key: children[0].key, label: children[0].label, icon: children[0].icon, badge: children[0].badge };
+      }
+      return { ...entry, children };
     })
     .filter(Boolean);
 
@@ -2500,9 +3053,13 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
 
 function TopBar({ view, role, onAdd }) {
   const titles = {
-    overview: ['Overview', 'Warehouse status at a glance'],
+    overview: role === 'superadmin'
+      ? ['Client Accounts', 'Manage subscriptions for every business on the platform']
+      : ['Overview', 'Warehouse status at a glance'],
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
+    staffInventory: ['Staff Inventory', 'Stock assigned to each staff member'],
+    clientAccounts: ['Client Accounts', 'Manage subscriptions for every business on the platform'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     orders: ['Orders', 'Purchase orders placed with your suppliers'],
     categories: ['Categories', 'Organize items into your own groups'],
@@ -2518,6 +3075,7 @@ function TopBar({ view, role, onAdd }) {
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'))
     || (view === 'orders' && can(role, 'manageOrders'));
+  const showManualLink = view === 'overview';
   return (
     <div style={styles.topbar} className="depot-topbar">
       <div>
@@ -2528,6 +3086,16 @@ function TopBar({ view, role, onAdd }) {
         <button className="depot-btn depot-no-print depot-topbar-btn" style={styles.primaryBtn} onClick={onAdd}>
           <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : 'New Item'}
         </button>
+      )}
+      {showManualLink && (
+        <a
+          href="/Stock-IT-User-Manual.pdf"
+          download
+          className="depot-btn depot-no-print depot-topbar-btn"
+          style={{ ...styles.primaryBtn, textDecoration: 'none' }}
+        >
+          <Download size={16} /> Download User Manual
+        </a>
       )}
     </div>
   );
@@ -2547,10 +3115,51 @@ function StatCard({ icon: Icon, label, value, accent }) {
   );
 }
 
-function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
+// Shown to a Client Admin only (their own subscription). This is
+// deliberately NOT dismissible - it's computed live from the real
+// subscription data every render, so the only way it goes away is if
+// Super Admin actually sets a later expiration date. There's no stored
+// "dismissed" flag to work around.
+function SubscriptionStatusBanner({ subscription }) {
+  const latest = getLatestSubscriptionPeriod(subscription);
+  if (!latest) return null; // Super Admin hasn't set up a subscription yet - nothing to show
+  const days = daysUntilExpiration(subscription);
+  const expiringSoon = days !== null && days >= 0 && days <= 5;
+
+  if (expiringSoon) {
+    return (
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderRadius: 8,
+        background: 'rgba(193,80,58,0.1)', border: '1px solid rgba(193,80,58,0.35)', marginBottom: 16,
+      }}>
+        <AlertTriangle size={18} color="var(--red)" style={{ flexShrink: 0 }} />
+        <div style={{ fontSize: 13, color: 'var(--ink)' }}>
+          <strong>Your subscription expires in {days} day{days === 1 ? '' : 's'}</strong>, on {formatDate(latest.endDate)}.
+          Please contact your platform administrator to renew &mdash; this notice will stay until it's renewed.
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', borderRadius: 8,
+      background: 'rgba(79,138,99,0.08)', border: '1px solid rgba(79,138,99,0.25)', marginBottom: 16,
+    }}>
+      <CheckCircle2 size={16} color="var(--green)" style={{ flexShrink: 0 }} />
+      <div style={{ fontSize: 12.5, color: 'var(--ink)' }}>
+        Subscription active until <strong>{formatDate(latest.endDate)}</strong>.
+      </div>
+    </div>
+  );
+}
+
+function Overview({ totals, categoryData, profitStats, staffInventoryStats, role, subscription, onQuickMove }) {
   const canViewProfit = can(role, 'viewSalesReports');
+  const canViewMySales = can(role, 'viewOwnSales');
+  const canViewStaffInventory = can(role, 'editInventory');
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {role === 'client' && <SubscriptionStatusBanner subscription={subscription} />}
       <div style={styles.statGrid} className="depot-stat-grid">
         <StatCard icon={Package} label="SKUs Tracked" value={totals.totalSkus} accent="var(--blueprint)" />
         <StatCard icon={Boxes} label="Units on Hand" value={totals.totalUnits.toLocaleString()} accent="#2E5C87" />
@@ -2676,18 +3285,105 @@ function Overview({ totals, categoryData, profitStats, role, onQuickMove }) {
           </div>
         </>
       )}
+
+      {/* Value of stock currently out with staff, broken down per staff
+          member - managers only, same tier as the Staff Inventory
+          management page itself. */}
+      {canViewStaffInventory && (
+        <>
+          <div style={{ ...styles.panelHeader, marginTop: 24, marginBottom: 10 }}>
+            <User size={15} />
+            <span>STAFF INVENTORY VALUE</span>
+          </div>
+          <div style={styles.statGrid} className="depot-stat-grid">
+            <StatCard icon={PesoIcon} label="Total Value With Staff" value={currency(staffInventoryStats.total)} accent="var(--green)" />
+            <StatCard icon={User} label="Staff Holding Stock" value={staffInventoryStats.byStaff.length} accent="var(--blueprint)" />
+          </div>
+          <div style={styles.panel}>
+            {staffInventoryStats.byStaff.length === 0 ? (
+              <div style={styles.emptyState}>No inventory has been assigned to staff yet.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 }}>
+                {staffInventoryStats.byStaff.map((s) => (
+                  <div key={s.staffUid} style={styles.watchRow}>
+                    <div>
+                      <div style={styles.watchSku}>{s.name}</div>
+                      <div style={styles.watchName}>{s.skuCount} SKU{s.skuCount === 1 ? '' : 's'} · {s.units} unit{s.units === 1 ? '' : 's'}</div>
+                    </div>
+                    <span style={{ fontWeight: 700, fontFamily: "'Quicksand', sans-serif", color: 'var(--ink)' }}>{currency(s.value)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* A staff member's own sales performance - their own scoped data
+          only, since `profitStats` is already computed from whatever
+          `sales` this role can see (their own sales, for staff). */}
+      {canViewMySales && (
+        <>
+          <div style={{ ...styles.panelHeader, marginTop: 24, marginBottom: 10 }}>
+            <Receipt size={15} />
+            <span>MY SALES</span>
+          </div>
+          <div style={styles.statGrid} className="depot-stat-grid">
+            <StatCard icon={Receipt} label="My Total Revenue" value={currency(profitStats.totalRevenue)} accent="var(--blueprint)" />
+            <StatCard icon={PesoIcon} label="My Total Profit" value={currency(profitStats.totalProfit)} accent={profitStats.totalProfit >= 0 ? 'var(--green)' : 'var(--red)'} />
+            <StatCard icon={CheckCircle2} label="My Margin" value={`${profitStats.margin.toFixed(1)}%`} accent={profitStats.margin >= 0 ? 'var(--green)' : 'var(--red)'} />
+          </div>
+          <div style={styles.panel}>
+            <div style={styles.panelHeader}>
+              <ScrollText size={15} />
+              <span>MY RECENT SALES</span>
+            </div>
+            {profitStats.perSale.length === 0 ? (
+              <div style={styles.emptyState}>No sales recorded yet — ring one up in Point of Sale.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+                {profitStats.perSale.map((s) => (
+                  <div key={s.id} style={styles.watchRow}>
+                    <div>
+                      <div style={styles.watchSku}>{s.receiptNo}</div>
+                      <div style={styles.watchName}>{formatDate(s.timestamp)} · Revenue {currency(s.revenue)}</div>
+                    </div>
+                    <span style={{ fontWeight: 700, color: s.profit >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(s.profit)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove, onEditMarkup }) {
+function InventoryView({ filtered, supplierMap, categories, role, search, setSearch, categoryFilter, setCategoryFilter, sortKey, setSortKey, onEdit, onDelete, onMove, onEditMarkup, onReturn }) {
   const supplierNames = (it) => getSupplierIds(it).map((sid) => supplierMap[sid]?.name).filter(Boolean);
+  const itemMarkup = (it) => computeMarkupFromPrices(it.unitCost, it.sellingPrice ?? it.unitCost);
+  const itemEstProfit = (it) => it.quantity * itemMarkup(it).amount;
 
-  const exportHeaders = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Value'];
-  const exportRows = () => filtered.map((it) => [
-    it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
-    it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2), (it.quantity * it.unitCost).toFixed(2),
-  ]);
+  const totalQty = filtered.reduce((s, it) => s + it.quantity, 0);
+  const totalBaseCostValue = filtered.reduce((s, it) => s + it.quantity * it.unitCost, 0);
+  const totalSellingValue = filtered.reduce((s, it) => s + it.quantity * (it.sellingPrice ?? it.unitCost), 0);
+  const totalEstProfit = totalSellingValue - totalBaseCostValue;
+
+  const exportHeaders = ['SKU', 'Name', 'Category', 'Suppliers', 'Location', 'Quantity', 'Base Cost', 'Selling Price', 'Markup', 'Base Cost Total Value', 'Selling Price Total Value', 'Est. Profit'];
+  const exportRows = () => [
+    ...filtered.map((it) => {
+      const markup = itemMarkup(it);
+      return [
+        it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
+        it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2),
+        `${currency(markup.amount)} (${markup.percent.toFixed(1)}%)`,
+        (it.quantity * it.unitCost).toFixed(2), (it.quantity * (it.sellingPrice ?? it.unitCost)).toFixed(2),
+        itemEstProfit(it).toFixed(2),
+      ];
+    }),
+    ['TOTAL', '', '', '', '', totalQty, '', '', '', totalBaseCostValue.toFixed(2), totalSellingValue.toFixed(2), totalEstProfit.toFixed(2)],
+  ];
   const handleDownload = () => downloadCSV('inventory.csv', exportHeaders, exportRows());
   const handleDownloadPDF = () => downloadPDF('inventory.pdf', 'Inventory', exportHeaders, exportRows());
   const canEdit = can(role, 'editInventory');
@@ -2726,14 +3422,14 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
         <table style={styles.table} className="depot-table">
           <thead>
             <tr>
-              {['SKU', 'Item', 'Category', 'Suppliers', 'Location', 'Qty', 'Base Cost', 'Selling Price', 'Value', ...(showActionsCol ? [''] : [])].map((h) => (
+              {['SKU', 'Item', 'Category', 'Suppliers', 'Location', 'Qty', 'Base Cost', 'Selling Price', 'Markup', 'Base Cost Total Value', 'Selling Price Total Value', 'Est. Profit', ...(showActionsCol ? [''] : [])].map((h) => (
                 <th key={h} style={styles.th}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {filtered.length === 0 && (
-              <tr><td colSpan={10} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your search.</td></tr>
+              <tr><td colSpan={13} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your search.</td></tr>
             )}
             {filtered.map((it) => {
               const low = it.quantity <= it.reorderPoint;
@@ -2755,18 +3451,37 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                   </td>
                   <td style={styles.td}>{currency(it.unitCost)}</td>
                   <td style={styles.td}>{currency(it.sellingPrice ?? it.unitCost)}</td>
+                  <td style={{ ...styles.td, fontSize: 12.5 }}>
+                    {(() => { const m = itemMarkup(it); return `${currency(m.amount)} (${m.percent.toFixed(1)}%)`; })()}
+                  </td>
                   <td style={styles.td}>{currency(it.quantity * it.unitCost)}</td>
+                  <td style={{ ...styles.td, fontWeight: 600, color: 'var(--green)' }}>{currency(it.quantity * (it.sellingPrice ?? it.unitCost))}</td>
+                  <td style={{ ...styles.td, fontWeight: 600, color: itemEstProfit(it) >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(itemEstProfit(it))}</td>
                   {showActionsCol && (
                     <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       {canMove && <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>}
                       {canEdit && <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>}
                       {!canEdit && canEditMarkup && <IconBtn onClick={() => onEditMarkup(it)} title="Update markup"><PesoIcon size={14} /></IconBtn>}
+                      {!canEdit && canEditMarkup && <IconBtn onClick={() => onReturn(it)} title="Return to Client Admin"><Undo2 size={14} /></IconBtn>}
                       {canDelete && <IconBtn onClick={() => onDelete(it)} title="Delete" danger><Trash2 size={14} /></IconBtn>}
                     </td>
                   )}
                 </tr>
               );
             })}
+            {filtered.length > 0 && (
+              <tr style={{ borderTop: '2px solid rgba(59,42,31,0.25)', fontWeight: 700 }}>
+                <td style={styles.td} colSpan={5}>TOTAL</td>
+                <td style={styles.td}>{totalQty}</td>
+                <td style={styles.td}></td>
+                <td style={styles.td}></td>
+                <td style={styles.td}></td>
+                <td style={styles.td}>{currency(totalBaseCostValue)}</td>
+                <td style={{ ...styles.td, color: 'var(--green)' }}>{currency(totalSellingValue)}</td>
+                <td style={{ ...styles.td, color: totalEstProfit >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(totalEstProfit)}</td>
+                {showActionsCol && <td className="depot-no-print" style={styles.td}></td>}
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -2774,7 +3489,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
   );
 }
 
-function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedStaffUid, onAssign, onEdit, onDelete, onMove }) {
+function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedStaffUid, onAssign, onEdit, onDelete, onMove, onReturn }) {
   const staffItems = useMemo(
     () => items.filter((it) => it.holderId === selectedStaffUid),
     [items, selectedStaffUid]
@@ -2833,6 +3548,7 @@ function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedSta
                     <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>
                       <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>
+                      <IconBtn onClick={() => onReturn(it)} title="Return to my inventory"><Undo2 size={14} /></IconBtn>
                       <IconBtn onClick={() => onDelete(it)} title="Remove" danger><Trash2 size={14} /></IconBtn>
                     </td>
                   </tr>
@@ -2842,6 +3558,414 @@ function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedSta
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+function ClientAccountsView({ clients, allUsers, onManageSubscription }) {
+  const [expandedUid, setExpandedUid] = useState(null);
+  const today = new Date();
+  const [reportMonth, setReportMonth] = useState(today.getMonth() + 1);
+  const [reportYear, setReportYear] = useState(today.getFullYear());
+
+  const staffFor = (clientUid) => allUsers.filter((u) => u.role === 'staff' && u.parentId === clientUid);
+  const staffCountFor = (clientUid) => staffFor(clientUid).length;
+
+  const expiringWarnings = useMemo(() => {
+    return clients
+      .map((c) => ({ client: c, days: daysUntilExpiration(c.subscription) }))
+      .filter((x) => x.days !== null && x.days >= 0 && x.days <= 5);
+  }, [clients]);
+
+  // --- Reports --------------------------------------------------------
+  // All six reuse the same downloadCSV helper used everywhere else in the
+  // app - CSV opens fine in Excel, so no separate library/format needed.
+  const clientRow = (c) => {
+    const latest = getLatestSubscriptionPeriod(c.subscription);
+    return {
+      name: c.fullName || '—', email: c.email, staff: staffCountFor(c.id),
+      period: latest ? `${MONTH_NAMES[latest.month - 1]} ${latest.year}` : '—',
+      start: latest ? formatDate(latest.startDate) : '—',
+      end: latest ? formatDate(latest.endDate) : '—',
+      payment: latest ? (latest.paymentStatus === 'paid' ? 'Paid' : 'Unpaid') : '—',
+      active: isSubscriptionActive(c.subscription),
+      days: daysUntilExpiration(c.subscription),
+    };
+  };
+
+  const downloadMonthlyReport = () => {
+    const monthLabel = `${MONTH_NAMES[reportMonth - 1]} ${reportYear}`;
+    const headers = ['Client', 'Email', 'Staff', 'Payment Status (this month)', 'Start', 'End'];
+    const rows = clients.map((c) => {
+      const p = (c.subscription?.history || []).find((x) => x.month === reportMonth && x.year === reportYear);
+      return [
+        c.fullName || '—', c.email, staffCountFor(c.id),
+        p ? (p.paymentStatus === 'paid' ? 'Paid' : 'Unpaid') : 'No record',
+        p ? formatDate(p.startDate) : '—', p ? formatDate(p.endDate) : '—',
+      ];
+    });
+    downloadCSV(`subscription-report-${monthLabel.replace(' ', '-')}.csv`, headers, rows);
+  };
+
+  const downloadFiltered = (filename, headers, filterFn, mapFn) => {
+    const rows = clients.filter(filterFn).map(mapFn);
+    downloadCSV(filename, headers, rows);
+  };
+
+  const downloadPaidClients = () => downloadFiltered(
+    'paid-clients.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Staff'],
+    (c) => { const r = clientRow(c); return r.payment === 'Paid'; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.staff]; }
+  );
+
+  const downloadUnpaidClients = () => downloadFiltered(
+    'unpaid-clients.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Staff'],
+    (c) => { const r = clientRow(c); return r.payment === 'Unpaid'; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.staff]; }
+  );
+
+  const downloadExpiredSubscriptions = () => downloadFiltered(
+    'expired-subscriptions.csv', ['Client', 'Email', 'Last Period', 'Expired On', 'Days Since Expired', 'Staff'],
+    (c) => { const r = clientRow(c); return !r.active && r.period !== '—'; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.days !== null ? Math.abs(r.days) : '—', r.staff]; }
+  );
+
+  const downloadUpcomingExpiration = () => downloadFiltered(
+    'upcoming-expiration.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Days Remaining', 'Payment Status', 'Staff'],
+    (c) => { const r = clientRow(c); return r.active && r.days !== null && r.days <= 30; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.days, r.payment, r.staff]; }
+  );
+
+  const downloadActiveSubscribers = () => downloadFiltered(
+    'active-subscribers.csv', ['Client', 'Email', 'Current Period', 'Expires', 'Payment Status', 'Staff'],
+    (c) => { const r = clientRow(c); return r.active; },
+    (c) => { const r = clientRow(c); return [r.name, r.email, r.period, r.end, r.payment, r.staff]; }
+  );
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={styles.statGrid} className="depot-stat-grid">
+        <StatCard icon={Building2} label="Total Clients" value={clients.length} accent="var(--blueprint)" />
+        <StatCard icon={CheckCircle2} label="Active Subscriptions" value={clients.filter((c) => isSubscriptionActive(c.subscription)).length} accent="var(--green)" />
+        <StatCard icon={AlertTriangle} label="Expired Subscriptions" value={clients.filter((c) => !isSubscriptionActive(c.subscription)).length} accent="var(--red)" />
+        <StatCard icon={User} label="Total Staff" value={allUsers.filter((u) => u.role === 'staff').length} accent="#2E5C87" />
+      </div>
+
+      {expiringWarnings.length > 0 && (
+        <div style={{ ...styles.panel, marginBottom: 16, border: '1px solid rgba(232,163,61,0.4)' }}>
+          <div style={styles.panelHeader}>
+            <AlertTriangle size={15} color="var(--amber-deep)" />
+            <span>ABOUT TO EXPIRE SUBSCRIPTIONS</span>
+          </div>
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 4, marginBottom: 10 }}>
+            Active subscriptions expiring within the next 5 days.
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={styles.table} className="depot-table">
+              <thead>
+                <tr>
+                  {['Client', 'Expires In', 'Expiration Date', 'Payment Status', 'Staff', ''].map((h) => (
+                    <th key={h} style={styles.th}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {expiringWarnings
+                  .slice()
+                  .sort((a, b) => a.days - b.days)
+                  .map(({ client, days }) => {
+                    const latest = getLatestSubscriptionPeriod(client.subscription);
+                    return (
+                      <tr key={client.id} className="depot-row">
+                        <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500 }}>
+                          {client.fullName || '—'}<br />
+                          <span style={{ fontFamily: "'Nunito', sans-serif", fontWeight: 400, fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>{client.email}</span>
+                        </td>
+                        <td style={styles.td}>
+                          <span style={{ ...styles.statusPill, background: 'rgba(232,163,61,0.14)', color: 'var(--amber-deep)' }}>
+                            {days} day{days === 1 ? '' : 's'}
+                          </span>
+                        </td>
+                        <td style={styles.td}>{latest ? formatDate(latest.endDate) : '—'}</td>
+                        <td style={styles.td}>
+                          {latest && (
+                            <span style={{ ...styles.statusPill, background: latest.paymentStatus === 'paid' ? 'rgba(79,138,99,0.1)' : 'rgba(193,80,58,0.1)', color: latest.paymentStatus === 'paid' ? 'var(--green)' : 'var(--red)' }}>
+                              {latest.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                            </span>
+                          )}
+                        </td>
+                        <td style={styles.td}>{staffCountFor(client.id)}</td>
+                        <td style={{ ...styles.td, textAlign: 'right' }}>
+                          <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onManageSubscription(client)}>
+                            Manage
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <div style={{ ...styles.panel, marginBottom: 16 }}>
+        <div style={styles.panelHeader}>
+          <Download size={15} />
+          <span>SUBSCRIPTION REPORTS</span>
+        </div>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap', marginTop: 12, marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 4 }}>Monthly Subscription Report</div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <select className="depot-select" value={reportMonth} onChange={(e) => setReportMonth(Number(e.target.value))} style={{ ...styles.select, padding: '7px 8px' }}>
+                {MONTH_NAMES.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+              </select>
+              <input className="depot-input" type="number" value={reportYear} onChange={(e) => setReportYear(Number(e.target.value))} style={{ ...styles.select, width: 80, padding: '7px 8px' }} />
+              <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadMonthlyReport}>
+                <Download size={13} /> Export
+              </button>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadPaidClients}><Download size={13} /> Paid Clients</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadUnpaidClients}><Download size={13} /> Unpaid Clients</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadExpiredSubscriptions}><Download size={13} /> Expired Subscriptions</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadUpcomingExpiration}><Download size={13} /> Upcoming Expiration (30 days)</button>
+          <button className="depot-btn" style={styles.smallAmberBtn} onClick={downloadActiveSubscribers}><Download size={13} /> Active Subscribers</button>
+        </div>
+      </div>
+
+      {clients.length === 0 ? (
+        <div style={styles.panel}><div style={styles.emptyState}>No Client Admin accounts yet.</div></div>
+      ) : (
+        <div style={styles.tableWrap} className="depot-scroll">
+          <table style={styles.table} className="depot-table">
+            <thead>
+              <tr>
+                {['Client', 'Subscription', 'Start', 'Expires', 'Payment', 'Staff', ''].map((h) => (
+                  <th key={h} style={styles.th}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {clients.map((c) => {
+                const latest = getLatestSubscriptionPeriod(c.subscription);
+                const active = isSubscriptionActive(c.subscription);
+                const staff = staffFor(c.id);
+                const isOpen = expandedUid === c.id;
+                return (
+                  <React.Fragment key={c.id}>
+                    <tr className="depot-row">
+                      <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontWeight: 500 }}>
+                        {c.fullName || '—'}<br />
+                        <span style={{ fontFamily: "'Nunito', sans-serif", fontWeight: 400, fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>{c.email}</span>
+                      </td>
+                      <td style={styles.td}>
+                        <span style={{ ...styles.statusPill, background: active ? 'rgba(79,138,99,0.1)' : 'rgba(193,80,58,0.1)', color: active ? 'var(--green)' : 'var(--red)' }}>
+                          {active ? 'Active' : 'Expired'}
+                        </span>
+                      </td>
+                      <td style={styles.td}>{latest ? formatDate(latest.startDate) : '—'}</td>
+                      <td style={styles.td}>{latest ? formatDate(latest.endDate) : '—'}</td>
+                      <td style={styles.td}>
+                        {latest ? (
+                          <span style={{ ...styles.statusPill, background: latest.paymentStatus === 'paid' ? 'rgba(79,138,99,0.1)' : 'rgba(232,163,61,0.14)', color: latest.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)' }}>
+                            {latest.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                          </span>
+                        ) : '—'}
+                      </td>
+                      <td style={styles.td}>
+                        <button
+                          className="depot-btn"
+                          onClick={() => setExpandedUid(isOpen ? null : c.id)}
+                          style={{ display: 'flex', alignItems: 'center', gap: 5, background: 'transparent', border: 'none', padding: 0, color: 'var(--blueprint)', fontSize: 13 }}
+                        >
+                          <ChevronDown size={14} style={{ transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s ease' }} />
+                          {staff.length} staff
+                        </button>
+                      </td>
+                      <td className="depot-no-print" style={{ ...styles.td, textAlign: 'right' }}>
+                        <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onManageSubscription(c)}>
+                          Manage Subscription
+                        </button>
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr>
+                        <td colSpan={7} style={{ ...styles.td, background: 'rgba(20,33,61,0.02)', padding: '10px 14px' }}>
+                          {staff.length === 0 ? (
+                            <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)' }}>No staff accounts under this client yet.</div>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              {staff.map((s) => (
+                                <div key={s.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5 }}>
+                                  <span>{s.fullName || s.email}</span>
+                                  <span style={{ color: 'rgba(59,42,31,0.55)' }}>{s.approved ? 'Active' : 'Pending'}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SubscriptionModal({ client, onClose, onSave }) {
+  const today = new Date();
+  const [month, setMonth] = useState(today.getMonth() + 1);
+  const [year, setYear] = useState(today.getFullYear());
+  const [paymentStatus, setPaymentStatus] = useState('unpaid');
+  const [busy, setBusy] = useState(false);
+
+  const defaultPeriod = computeSubscriptionPeriod(today.getMonth() + 1, today.getFullYear());
+  const [startDateStr, setStartDateStr] = useState(timestampToDateInputValue(defaultPeriod.start));
+  const [endDateStr, setEndDateStr] = useState(timestampToDateInputValue(defaultPeriod.end));
+
+  const history = (client.subscription?.history || []).slice().sort((a, b) => (b.year - a.year) || (b.month - a.month));
+  const existing = history.find((p) => p.month === month && p.year === year);
+
+  // Changing Month/Year re-fills the date pickers with that calendar
+  // month's defaults (or the existing period's real dates, if one's
+  // already saved for that month) - a convenient starting point that can
+  // still be adjusted freely afterward.
+  const handleMonthYearChange = (newMonth, newYear) => {
+    setMonth(newMonth); setYear(newYear);
+    const match = history.find((p) => p.month === newMonth && p.year === newYear);
+    if (match) {
+      setStartDateStr(timestampToDateInputValue(match.startDate));
+      setEndDateStr(timestampToDateInputValue(match.endDate));
+      setPaymentStatus(match.paymentStatus);
+    } else {
+      const period = computeSubscriptionPeriod(newMonth, newYear);
+      setStartDateStr(timestampToDateInputValue(period.start));
+      setEndDateStr(timestampToDateInputValue(period.end));
+    }
+  };
+
+  const loadPeriod = (p) => {
+    setMonth(p.month); setYear(p.year); setPaymentStatus(p.paymentStatus);
+    setStartDateStr(timestampToDateInputValue(p.startDate));
+    setEndDateStr(timestampToDateInputValue(p.endDate));
+  };
+
+  const startTs = dateInputValueToTimestamp(startDateStr, false);
+  const endTs = dateInputValueToTimestamp(endDateStr, true);
+  const datesValid = startTs && endTs && endTs >= startTs;
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!datesValid) return;
+    setBusy(true);
+    await onSave(client.id, { month, year, startDate: startTs, endDate: endTs, paymentStatus });
+    setBusy(false);
+  };
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={{ ...styles.modal, maxWidth: 520 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>MANAGE SUBSCRIPTION — {client.fullName || client.email}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <form onSubmit={submit}>
+          <div style={styles.modalBody}>
+            <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+              <Field label="Month" grow>
+                <select className="depot-select" style={styles.modalInput} value={month} onChange={(e) => handleMonthYearChange(Number(e.target.value), year)}>
+                  {MONTH_NAMES.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+                </select>
+              </Field>
+              <Field label="Year" grow>
+                <input className="depot-input" type="number" style={styles.modalInput} value={year} onChange={(e) => handleMonthYearChange(month, Number(e.target.value))} />
+              </Field>
+            </div>
+            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginBottom: 10 }}>
+              Month/Year files this period for reports and history &mdash; the actual dates below are fully adjustable and don't have to match the calendar month.
+            </div>
+            <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+              <Field label="Start Date" grow>
+                <input className="depot-input" type="date" style={styles.modalInput} value={startDateStr} onChange={(e) => setStartDateStr(e.target.value)} />
+              </Field>
+              <Field label="End Date" grow>
+                <input className="depot-input" type="date" style={styles.modalInput} value={endDateStr} onChange={(e) => setEndDateStr(e.target.value)} />
+              </Field>
+            </div>
+            {!datesValid && (
+              <div style={{ fontSize: 12, color: 'var(--red)', marginBottom: 6 }}>End date must be on or after the start date.</div>
+            )}
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginBottom: 10 }}>
+              {existing ? 'A period already exists for this month — saving will update it.' : 'This will be saved as a new period.'}
+            </div>
+            <Field label="Payment Status">
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button type="button" onClick={() => setPaymentStatus('paid')}
+                  className="depot-btn"
+                  style={{
+                    flex: 1, padding: '10px 0', borderRadius: 6, fontSize: 13, fontWeight: 600,
+                    background: paymentStatus === 'paid' ? 'var(--green)' : 'transparent',
+                    color: paymentStatus === 'paid' ? '#fff' : 'var(--ink)',
+                    border: `1px solid ${paymentStatus === 'paid' ? 'var(--green)' : 'rgba(59,42,31,0.2)'}`,
+                  }}>
+                  Mark as Paid
+                </button>
+                <button type="button" onClick={() => setPaymentStatus('unpaid')}
+                  className="depot-btn"
+                  style={{
+                    flex: 1, padding: '10px 0', borderRadius: 6, fontSize: 13, fontWeight: 600,
+                    background: paymentStatus === 'unpaid' ? 'var(--red)' : 'transparent',
+                    color: paymentStatus === 'unpaid' ? '#fff' : 'var(--ink)',
+                    border: `1px solid ${paymentStatus === 'unpaid' ? 'var(--red)' : 'rgba(59,42,31,0.2)'}`,
+                  }}>
+                  Mark as Unpaid
+                </button>
+              </div>
+            </Field>
+
+            {history.length > 0 && (
+              <div style={{ marginTop: 16 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Subscription History</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 160, overflowY: 'auto' }} className="depot-scroll">
+                  {history.map((p) => (
+                    <button
+                      type="button"
+                      key={`${p.year}-${p.month}`}
+                      onClick={() => loadPeriod(p)}
+                      className="depot-btn"
+                      style={{
+                        display: 'flex', justifyContent: 'space-between', padding: '6px 10px', borderRadius: 6,
+                        background: (p.month === month && p.year === year) ? 'rgba(15,42,71,0.06)' : 'transparent',
+                        border: '1px solid rgba(59,42,31,0.1)', fontSize: 12,
+                      }}
+                    >
+                      <span>{MONTH_NAMES[p.month - 1]} {p.year}</span>
+                      <span style={{ color: p.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)', fontWeight: 600 }}>
+                        {p.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          <div style={styles.modalFooter}>
+            <button type="button" className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+            <button type="submit" className="depot-btn" style={{ ...styles.primaryBtn, opacity: (busy || !datesValid) ? 0.6 : 1 }} disabled={busy || !datesValid}>
+              {busy ? 'Saving…' : 'Save Subscription'}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }
@@ -3410,8 +4534,9 @@ function POSView({ items, onCompleteSale }) {
   );
 }
 
-function SalesHistoryView({ sales, role, onCancelSale }) {
+function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivity }) {
   const canCancel = can(role, 'cancelSales');
+  const canDeleteSale = role === 'client';
   const [cashierFilter, setCashierFilter] = useState('All');
   const [expandedId, setExpandedId] = useState(null);
   const [dateFrom, setDateFrom] = useState('');
@@ -3479,8 +4604,8 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
     sale.total.toFixed(2),
     sale.cancelled ? 'Cancelled' : 'Completed',
   ]);
-  const handleDownload = () => downloadCSV('sales-history.csv', exportHeaders, exportRows());
-  const handleDownloadPDF = () => downloadPDF('sales-history.pdf', 'Sales History', exportHeaders, exportRows());
+  const handleDownload = () => { downloadCSV('sales-history.csv', exportHeaders, exportRows()); onLogActivity?.('report_generated', { report: 'Sales History', format: 'CSV' }); };
+  const handleDownloadPDF = () => { downloadPDF('sales-history.pdf', 'Sales History', exportHeaders, exportRows()); onLogActivity?.('report_generated', { report: 'Sales History', format: 'PDF' }); };
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
@@ -3546,7 +4671,7 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Receipt', 'Date', 'Cashier', 'Items', ...(showMatchedQtyCol ? ['Qty Sold'] : []), 'Payment', 'Total', 'Status', ...(canCancel ? [''] : [])].map((h) => (
+                {['Receipt', 'Date', 'Cashier', 'Items', ...(showMatchedQtyCol ? ['Qty Sold'] : []), 'Payment', 'Total', 'Status', ...((canCancel || canDeleteSale) ? [''] : [])].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
@@ -3554,7 +4679,7 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
             <tbody>
               {filtered.map((sale) => {
                 const isOpen = expandedId === sale.id;
-                const colCount = 7 + (showMatchedQtyCol ? 1 : 0) + (canCancel ? 1 : 0);
+                const colCount = 7 + (showMatchedQtyCol ? 1 : 0) + ((canCancel || canDeleteSale) ? 1 : 0);
                 return (
                 <React.Fragment key={sale.id}>
                 <tr className="depot-row" style={sale.cancelled ? { opacity: 0.55 } : undefined}>
@@ -3586,11 +4711,16 @@ function SalesHistoryView({ sales, role, onCancelSale }) {
                       <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Completed</span>
                     )}
                   </td>
-                  {canCancel && (
+                  {(canCancel || canDeleteSale) && (
                     <td className="depot-no-print" style={{ ...styles.td, textAlign: 'right' }}>
-                      {!sale.cancelled && (
+                      {!sale.cancelled && canCancel && (
                         <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onCancelSale(sale)}>
                           Cancel
+                        </button>
+                      )}
+                      {sale.cancelled && canDeleteSale && (
+                        <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'var(--red)', color: '#fff' }} onClick={() => onDeleteSale(sale)}>
+                          Delete
                         </button>
                       )}
                     </td>
@@ -3689,6 +4819,9 @@ function MySalesView({ sales }) {
 
 function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
   const [userFilter, setUserFilter] = useState('All');
+  const [roleFilter, setRoleFilter] = useState('All');
+  const [typeFilter, setTypeFilter] = useState('All');
+  const [itemFilter, setItemFilter] = useState('All');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   const roleByUid = useMemo(() => {
@@ -3704,56 +4837,93 @@ function ActivityLogView({ logs, myRole, approvedUsers, pendingUsers }) {
     return Array.from(set).sort();
   }, [dateFiltered]);
 
-  const filtered = userFilter === 'All' ? dateFiltered : dateFiltered.filter((l) => l.email === userFilter);
+  const types = useMemo(() => {
+    const set = new Set(dateFiltered.map((l) => l.type).filter(Boolean));
+    return Array.from(set).sort();
+  }, [dateFiltered]);
 
-  const exportHeaders = ['Email', 'Role', 'Type', 'Timestamp'];
-  const exportRows = () => filtered.map((l) => [l.email, ROLES[roleByUid[l.uid]] || '—', l.type, new Date(l.timestamp).toLocaleString('en-PH')]);
+  const items = useMemo(() => {
+    const set = new Set(dateFiltered.map((l) => l.meta?.itemSku).filter(Boolean));
+    return Array.from(set).sort();
+  }, [dateFiltered]);
+
+  const filtered = useMemo(() => {
+    return dateFiltered.filter((l) => {
+      const matchesUser = userFilter === 'All' || l.email === userFilter;
+      const matchesRole = roleFilter === 'All' || roleByUid[l.uid] === roleFilter;
+      const matchesType = typeFilter === 'All' || l.type === typeFilter;
+      const matchesItem = itemFilter === 'All' || l.meta?.itemSku === itemFilter;
+      return matchesUser && matchesRole && matchesType && matchesItem;
+    });
+  }, [dateFiltered, userFilter, roleFilter, typeFilter, itemFilter, roleByUid]);
+
+  const exportHeaders = ['Email', 'Role', 'Type', 'Details', 'Timestamp'];
+  const exportRows = () => filtered.map((l) => [
+    l.email, ROLES[roleByUid[l.uid]] || '—', ACTIVITY_TYPE_LABELS[l.type] || l.type,
+    describeActivity(l), new Date(l.timestamp).toLocaleString('en-PH'),
+  ]);
   const handleDownload = () => downloadCSV('activity-log.csv', exportHeaders, exportRows());
   const handleDownloadPDF = () => downloadPDF('activity-log.pdf', 'Activity Log', exportHeaders, exportRows());
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
       <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
-      <div style={{ ...styles.filterBar, marginBottom: users.length > 0 ? 8 : 16 }} className="depot-no-print depot-filterbar">
+      <div style={{ ...styles.filterBar, marginBottom: 8 }} className="depot-no-print depot-filterbar">
         <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
       </div>
-      {users.length > 0 && (
-        <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+      <div style={{ ...styles.filterBar, flexWrap: 'wrap' }} className="depot-no-print depot-filterbar">
+        {users.length > 0 && (
           <select className="depot-select" value={userFilter} onChange={(e) => setUserFilter(e.target.value)} style={styles.select}>
             <option value="All">All Users</option>
             {users.map((u) => <option key={u} value={u}>{u}</option>)}
           </select>
-        </div>
-      )}
+        )}
+        <select className="depot-select" value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)} style={styles.select}>
+          <option value="All">All Roles</option>
+          {Object.keys(ROLES).map((r) => <option key={r} value={r}>{ROLES[r]}</option>)}
+        </select>
+        <select className="depot-select" value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} style={styles.select}>
+          <option value="All">All Activity Types</option>
+          {types.map((t) => <option key={t} value={t}>{ACTIVITY_TYPE_LABELS[t] || t}</option>)}
+        </select>
+        {items.length > 0 && (
+          <select className="depot-select" value={itemFilter} onChange={(e) => setItemFilter(e.target.value)} style={styles.select}>
+            <option value="All">All Items</option>
+            {items.map((sku) => <option key={sku} value={sku}>{sku}</option>)}
+          </select>
+        )}
+      </div>
       {filtered.length === 0 ? (
-        <div style={styles.panel}><div style={styles.emptyState}>No activity recorded yet.</div></div>
+        <div style={styles.panel}><div style={styles.emptyState}>No activity matches your filters.</div></div>
       ) : (
         <div style={styles.tableWrap} className="depot-scroll">
           <table style={styles.table} className="depot-table">
             <thead>
               <tr>
-                {['Email', 'Role', 'Event', 'Timestamp'].map((h) => (
+                {['Email', 'Role', 'Event', 'Details', 'Timestamp'].map((h) => (
                   <th key={h} style={styles.th}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {filtered.map((l) => (
-                <tr key={l.id} className="depot-row">
-                  <td style={styles.td}>{l.email}</td>
-                  <td style={styles.td}><span style={styles.pill}>{ROLES[roleByUid[l.uid]] || '—'}</span></td>
-                  <td style={styles.td}>
-                    {l.type === 'login' ? (
-                      <span style={{ ...styles.statusPill, background: 'rgba(79,138,99,0.1)', color: 'var(--green)' }}>Login</span>
-                    ) : (
-                      <span style={{ ...styles.statusPill, background: 'rgba(20,33,61,0.08)', color: 'var(--ink)' }}>Logout</span>
-                    )}
-                  </td>
-                  <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
-                    {new Date(l.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                  </td>
-                </tr>
-              ))}
+              {filtered.map((l) => {
+                const badge = activityBadgeColors(l.type);
+                return (
+                  <tr key={l.id} className="depot-row">
+                    <td style={styles.td}>{l.email}</td>
+                    <td style={styles.td}><span style={styles.pill}>{ROLES[roleByUid[l.uid]] || '—'}</span></td>
+                    <td style={styles.td}>
+                      <span style={{ ...styles.statusPill, background: badge.bg, color: badge.color }}>
+                        {ACTIVITY_TYPE_LABELS[l.type] || l.type}
+                      </span>
+                    </td>
+                    <td style={{ ...styles.td, fontSize: 12.5, color: 'rgba(59,42,31,0.75)' }}>{describeActivity(l)}</td>
+                    <td style={{ ...styles.td, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5 }}>
+                      {new Date(l.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -3892,12 +5062,47 @@ function UserProfilesView({ approvedUsers, myRole, onSave }) {
   );
 }
 
-function MyProfileView({ profile, uid, onSave, onChangePassword }) {
+function MyProfileView({ profile, uid, role, subscription, onSave, onChangePassword }) {
   const [editing, setEditing] = useState(false);
   const me = { id: uid, ...(profile || {}) };
+  const latestPeriod = getLatestSubscriptionPeriod(subscription);
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {role === 'client' && (
+        <div style={{ ...styles.panel, maxWidth: 480, marginBottom: 16 }}>
+          <div style={styles.panelHeader}>
+            <PesoIcon size={15} />
+            <span>SUBSCRIPTION</span>
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <SubscriptionStatusBanner subscription={subscription} />
+          </div>
+          {latestPeriod && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12.5 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Current Period</span>
+                <span style={{ fontWeight: 600 }}>{MONTH_NAMES[latestPeriod.month - 1]} {latestPeriod.year}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Start Date</span>
+                <span>{formatDate(latestPeriod.startDate)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Expiration Date</span>
+                <span>{formatDate(latestPeriod.endDate)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Payment Status</span>
+                <span style={{ fontWeight: 600, color: latestPeriod.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)' }}>
+                  {latestPeriod.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       <div style={{ ...styles.panel, maxWidth: 480 }}>
         <div style={styles.panelHeader}>
           <User size={15} />
@@ -4088,11 +5293,12 @@ function AddStaffPanel({ onCreateStaff }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme }) {
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme, onSetFont, onSetInk, onSetPanelBg, onResetColors }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
   const [editingUser, setEditingUser] = useState(null);
   const activeThemeKey = branding?.themeKey || DEFAULT_THEME_KEY;
+  const activeFontKey = branding?.fontKey || DEFAULT_FONT_KEY;
 
   const handleLogoFile = (e) => {
     const file = e.target.files?.[0];
@@ -4101,6 +5307,16 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
     reader.onload = () => setLogoPreview(reader.result);
     reader.readAsDataURL(file);
   };
+
+  // Super Admin's approvedUsers list is unscoped (every account on the
+  // platform), so it doubles as a lookup for "which Client does this staff
+  // member belong to" - built once here rather than searching the array
+  // per row.
+  const usersByUid = useMemo(() => {
+    const map = {};
+    approvedUsers.forEach((u) => { map[u.id] = u; });
+    return map;
+  }, [approvedUsers]);
 
   // A Client can only promote/demote within reach of their own permissions -
   // in practice that means they don't get a role selector at all; only
@@ -4172,7 +5388,15 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
                   <div>
                     <div style={styles.watchSku}>{u.fullName ? `${u.fullName} — ${u.email}` : u.email}</div>
                     <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: 'rgba(59,42,31,0.4)' }}>ID: {u.userIdNumber || u.id}</div>
-                    <div style={styles.watchName}>{ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}</div>
+                    <div style={styles.watchName}>
+                      {ROLES[u.role] || 'Staff'}{u.id === currentUid ? ' (you)' : ''}
+                      {isSuperAdmin && u.role === 'staff' && (
+                        <>
+                          {' · Client: '}
+                          {usersByUid[u.parentId] ? (usersByUid[u.parentId].fullName || usersByUid[u.parentId].email) : (u.parentId ? 'Unknown (orphaned)' : '—')}
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
@@ -4187,7 +5411,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
                     </select>
                   )}
                   <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => setEditingUser(u)}>Edit</button>
-                  {isSuperAdmin && u.id !== currentUid && (
+                  {(isSuperAdmin || myRole === 'client') && u.id !== currentUid && (
                     <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--red)', border: '1px solid rgba(193,80,58,0.3)' }} onClick={() => onRevoke(u.id)}>Revoke</button>
                   )}
                 </div>
@@ -4249,23 +5473,68 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
 
           <div style={{ marginTop: 20 }}>
             <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Background / Color Scheme</div>
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <select
+              className="depot-select"
+              value={activeThemeKey}
+              onChange={(e) => onSetTheme(e.target.value)}
+              style={{ ...styles.modalInput, maxWidth: 320 }}
+            >
               {Object.entries(THEMES).map(([key, theme]) => (
-                <button
-                  key={key}
-                  className="depot-btn"
-                  onClick={() => onSetTheme(key)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderRadius: 8,
-                    border: activeThemeKey === key ? '2px solid var(--ink)' : '1px solid rgba(20,33,61,0.15)',
-                    background: '#fff', fontSize: 12.5, fontWeight: 500,
-                  }}
-                >
-                  <span style={{ width: 16, height: 16, borderRadius: '50%', background: theme.swatch, display: 'inline-block' }} />
-                  {theme.label}
-                  {activeThemeKey === key && <CheckCircle2 size={13} color="var(--green)" />}
-                </button>
+                <option key={key} value={key}>{theme.label}</option>
               ))}
+            </select>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+              <span style={{ width: 20, height: 20, borderRadius: '50%', background: THEMES[activeThemeKey].swatch, display: 'inline-block', border: '1px solid rgba(20,33,61,0.15)' }} />
+              <span style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>Currently: {THEMES[activeThemeKey].label}</span>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Text Format</div>
+            <select
+              className="depot-select"
+              value={activeFontKey}
+              onChange={(e) => onSetFont(e.target.value)}
+              style={{ ...styles.modalInput, maxWidth: 320, fontFamily: FONT_PRESETS[activeFontKey].family }}
+            >
+              {Object.entries(FONT_PRESETS).map(([key, f]) => (
+                <option key={key} value={key} style={{ fontFamily: f.family }}>{f.label}</option>
+              ))}
+            </select>
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 6, maxWidth: 320 }}>
+              Changes the font used throughout the app.
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Color Panels</div>
+            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', marginBottom: 5 }}>Text Color</div>
+                <input
+                  type="color"
+                  value={branding?.customInk || THEMES[activeThemeKey].ink}
+                  onChange={(e) => onSetInk(e.target.value)}
+                  style={{ width: 48, height: 32, border: '1px solid rgba(20,33,61,0.15)', borderRadius: 6, cursor: 'pointer', padding: 2, background: '#fff' }}
+                />
+              </div>
+              <div>
+                <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', marginBottom: 5 }}>Panel Background</div>
+                <input
+                  type="color"
+                  value={branding?.customPanelBg || '#ffffff'}
+                  onChange={(e) => onSetPanelBg(e.target.value)}
+                  style={{ width: 48, height: 32, border: '1px solid rgba(20,33,61,0.15)', borderRadius: 6, cursor: 'pointer', padding: 2, background: '#fff' }}
+                />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+                <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--ink)', border: '1px solid rgba(20,33,61,0.2)' }} onClick={onResetColors}>
+                  Reset to Theme Defaults
+                </button>
+              </div>
+            </div>
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 8, maxWidth: 460 }}>
+              These override the color scheme's defaults for the main text color and card/panel backgrounds throughout the app. Some muted/secondary text tones are calculated automatically and may not shift with a custom text color.
             </div>
           </div>
         </div>
@@ -4392,18 +5661,17 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
     if (!draft) {
       return {
         sku: '', name: '', category: categories[0] || '', quantity: 0, reorderPoint: 10, unitCost: 0,
-        location: locations[0] || '', supplierIds: [], markupType: 'percent', markupValue: 0,
+        location: locations[0] || '', supplierIds: [], sellingPrice: 0,
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
     return {
       ...rest, supplierIds: getSupplierIds(draft),
-      markupType: draft.markupType === 'fixed' ? 'fixed' : 'percent',
-      markupValue: draft.markupValue ?? 0,
+      sellingPrice: draft.sellingPrice ?? draft.unitCost ?? 0,
     };
   });
   const valid = form.sku.trim() && form.name.trim();
-  const sellingPricePreview = computeSellingPrice(form.unitCost, form.markupType, form.markupValue);
+  const markup = computeMarkupFromPrices(form.unitCost, form.sellingPrice);
   const toggleSupplier = (sid) => {
     setForm({
       ...form,
@@ -4477,20 +5745,18 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Markup Type" grow>
-              <select className="depot-select" style={styles.modalInput} value={form.markupType}
-                onChange={(e) => setForm({ ...form, markupType: e.target.value })}>
-                <option value="percent">Percentage</option>
-                <option value="fixed">Fixed Amount (₱)</option>
-              </select>
+            <Field label="Selling Price (₱)" grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.sellingPrice}
+                onChange={(e) => setForm({ ...form, sellingPrice: Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label={form.markupType === 'fixed' ? 'Markup (₱)' : 'Markup (%)'} grow>
-              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.markupValue}
-                onChange={(e) => setForm({ ...form, markupValue: Math.max(0, Number(e.target.value)) })} />
-            </Field>
-            <Field label="Selling Price" grow>
-              <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(79,138,99,0.08)', fontWeight: 700, color: 'var(--green)' }}>
-                {currency(sellingPricePreview)}
+            <Field label="Markup" grow>
+              <div style={{
+                ...styles.modalInput, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                background: markup.amount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                fontWeight: 700, color: markup.amount >= 0 ? 'var(--green)' : 'var(--red)',
+              }}>
+                <span>{currency(markup.amount)}</span>
+                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markup.percent.toFixed(1)}%</span>
               </div>
             </Field>
           </div>
@@ -4561,38 +5827,91 @@ function SupplierModal({ draft, onClose, onSave }) {
   );
 }
 
-function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
-  const [sourceItemId, setSourceItemId] = useState('');
-  const [staffUid, setStaffUid] = useState('');
-  const [quantity, setQuantity] = useState(1);
-  const [unitCost, setUnitCost] = useState(0);
-
-  const source = myOwnItems.find((it) => it.id === sourceItemId);
-
-  const handleItemChange = (id) => {
-    setSourceItemId(id);
-    const it = myOwnItems.find((i) => i.id === id);
-    if (it) setUnitCost(it.unitCost);
-  };
-
-  const valid = sourceItemId && staffUid && Number(quantity) > 0 && source && Number(quantity) <= source.quantity;
+function ReturnInventoryModal({ item, hasDestination, onClose, onSave }) {
+  const [quantity, setQuantity] = useState(item.quantity);
+  const valid = Number(quantity) > 0 && Number(quantity) <= item.quantity;
 
   return (
     <div style={styles.overlay} onClick={onClose}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
+          <span>RETURN ITEM — {item.sku}</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
+            {item.name} — currently {item.quantity} on hand.
+          </div>
+          <Field label="Quantity to Return">
+            <input className="depot-input" type="number" min="1" max={item.quantity} style={styles.modalInput}
+              value={quantity} onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
+          </Field>
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 4 }}>
+            {hasDestination
+              ? 'This moves the quantity back into the Client Admin\u2019s own inventory.'
+              : 'The original source item no longer exists, so this will remove the quantity without crediting it elsewhere.'}
+          </div>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
+            disabled={!valid} onClick={() => onSave(item, quantity)}>
+            Return {quantity > 0 ? quantity : ''} Item{quantity === 1 ? '' : 's'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
+  const [staffUid, setStaffUid] = useState('');
+  const [lines, setLines] = useState([]); // [{itemId, quantity, unitCost}]
+  const [draftItemId, setDraftItemId] = useState('');
+  const [draftQty, setDraftQty] = useState(1);
+  const [draftCost, setDraftCost] = useState(0);
+
+  const draftSource = myOwnItems.find((it) => it.id === draftItemId);
+  const availableItems = myOwnItems.filter((it) => it.quantity > 0);
+
+  const handleDraftItemChange = (id) => {
+    setDraftItemId(id);
+    const it = myOwnItems.find((i) => i.id === id);
+    if (it) setDraftCost(it.unitCost);
+  };
+
+  const draftValid = draftItemId && Number(draftQty) > 0 && draftSource && Number(draftQty) <= draftSource.quantity;
+
+  const addLine = () => {
+    if (!draftValid) return;
+    setLines((prev) => {
+      // If this item's already queued, just update it rather than adding a
+      // confusing duplicate row.
+      const existingIdx = prev.findIndex((l) => l.itemId === draftItemId);
+      const newLine = { itemId: draftItemId, quantity: Number(draftQty), unitCost: Number(draftCost) };
+      if (existingIdx >= 0) {
+        const copy = [...prev];
+        copy[existingIdx] = newLine;
+        return copy;
+      }
+      return [...prev, newLine];
+    });
+    setDraftItemId(''); setDraftQty(1); setDraftCost(0);
+  };
+
+  const removeLine = (itemId) => setLines((prev) => prev.filter((l) => l.itemId !== itemId));
+
+  const total = lines.reduce((s, l) => s + l.quantity * l.unitCost, 0);
+  const canSubmit = staffUid && lines.length > 0;
+
+  return (
+    <div style={styles.overlay} onClick={onClose}>
+      <div style={{ ...styles.modal, maxWidth: 560 }} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
           <span>ASSIGN INVENTORY TO STAFF</span>
           <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
         </div>
         <div style={styles.modalBody}>
-          <Field label="Item (from your own inventory)">
-            <select className="depot-select" style={styles.modalInput} value={sourceItemId}
-              onChange={(e) => handleItemChange(e.target.value)}>
-              <option value="">— Select an item —</option>
-              {myOwnItems.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name} ({it.quantity} on hand)</option>)}
-            </select>
-          </Field>
-
           <Field label="Staff Member">
             <select className="depot-select" style={styles.modalInput} value={staffUid} onChange={(e) => setStaffUid(e.target.value)}>
               <option value="">— Select a staff member —</option>
@@ -4600,28 +5919,82 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
             </select>
           </Field>
 
-          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Quantity to Assign" grow>
-              <input className="depot-input" type="number" min="1" max={source?.quantity || 1} style={styles.modalInput}
-                value={quantity} onChange={(e) => setQuantity(Math.max(1, Number(e.target.value)))} />
-            </Field>
-            <Field label="Base Cost (₱)" grow>
-              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
-                value={unitCost} onChange={(e) => setUnitCost(Math.max(0, Number(e.target.value)))} />
-            </Field>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginTop: 14, marginBottom: 8 }}>
+            Add items to this assignment
           </div>
-          {source && Number(quantity) > source.quantity && (
-            <div style={{ fontSize: 12, color: 'var(--red)' }}>Only {source.quantity} available in your inventory.</div>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+            <div style={{ flex: '2 1 200px' }}>
+              <Field label="Item (from your own inventory)">
+                <select className="depot-select" style={styles.modalInput} value={draftItemId} onChange={(e) => handleDraftItemChange(e.target.value)}>
+                  <option value="">— Select an item —</option>
+                  {availableItems.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name} ({it.quantity} on hand)</option>)}
+                </select>
+              </Field>
+            </div>
+            <div style={{ flex: '1 1 90px' }}>
+              <Field label="Qty">
+                <input className="depot-input" type="number" min="1" max={draftSource?.quantity || 1} style={styles.modalInput}
+                  value={draftQty} onChange={(e) => setDraftQty(Math.max(1, Number(e.target.value)))} />
+              </Field>
+            </div>
+            <div style={{ flex: '1 1 110px' }}>
+              <Field label="Base Cost (₱)">
+                <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
+                  value={draftCost} onChange={(e) => setDraftCost(Math.max(0, Number(e.target.value)))} />
+              </Field>
+            </div>
+            <div style={{ flex: '0 0 auto', paddingBottom: 2 }}>
+              <button type="button" className="depot-btn" style={{ ...styles.smallAmberBtn, opacity: draftValid ? 1 : 0.45 }} disabled={!draftValid} onClick={addLine}>
+                <Plus size={14} /> Add
+              </button>
+            </div>
+          </div>
+          {draftSource && Number(draftQty) > draftSource.quantity && (
+            <div style={{ fontSize: 12, color: 'var(--red)', marginTop: 4 }}>Only {draftSource.quantity} available in your inventory.</div>
           )}
-          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)' }}>
+
+          {lines.length > 0 && (
+            <div style={{ marginTop: 16, border: '1px solid rgba(59,42,31,0.15)', borderRadius: 6, overflow: 'hidden' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr>
+                    {['Item', 'Qty', 'Base Cost', 'Line Total', ''].map((h) => (
+                      <th key={h} style={{ ...styles.th, padding: '6px 10px', fontSize: 10.5 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {lines.map((l) => {
+                    const it = myOwnItems.find((i) => i.id === l.itemId);
+                    return (
+                      <tr key={l.itemId}>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5 }}>{it ? `${it.sku} — ${it.name}` : l.itemId}</td>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5 }}>{l.quantity}</td>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5 }}>{currency(l.unitCost)}</td>
+                        <td style={{ padding: '6px 10px', fontSize: 12.5, fontWeight: 600 }}>{currency(l.quantity * l.unitCost)}</td>
+                        <td style={{ padding: '6px 10px', textAlign: 'right' }}>
+                          <IconBtn onClick={() => removeLine(l.itemId)} title="Remove" danger><X size={13} /></IconBtn>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <div style={{ padding: '8px 10px', fontSize: 12.5, textAlign: 'right', borderTop: '1px solid rgba(59,42,31,0.1)', background: 'rgba(20,33,61,0.02)' }}>
+                {lines.length} item{lines.length === 1 ? '' : 's'} · Total value: <strong>{currency(total)}</strong>
+              </div>
+            </div>
+          )}
+
+          <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 14 }}>
             This moves stock out of your own inventory into this staff member's separate inventory. They'll set their own markup from there.
           </div>
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
-            disabled={!valid} onClick={() => onSave({ sourceItemId, staffUid, quantity, unitCost })}>
-            Assign
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: canSubmit ? 1 : 0.45 }}
+            disabled={!canSubmit} onClick={() => onSave(staffUid, lines)}>
+            Assign {lines.length > 0 ? `${lines.length} Item${lines.length === 1 ? '' : 's'}` : ''}
           </button>
         </div>
       </div>
@@ -4630,20 +6003,19 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
 }
 
 function MarkupModal({ item, onClose, onSave }) {
-  const [markupType, setMarkupType] = useState(item.markupType === 'fixed' ? 'fixed' : 'percent');
-  const [markupValue, setMarkupValue] = useState(item.markupValue || 0);
-  const sellingPricePreview = computeSellingPrice(item.unitCost, markupType, markupValue);
+  const [sellingPrice, setSellingPrice] = useState(item.sellingPrice ?? item.unitCost ?? 0);
+  const markup = computeMarkupFromPrices(item.unitCost, sellingPrice);
 
   return (
     <div style={styles.overlay} onClick={onClose}>
       <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
         <div style={styles.modalHeader}>
-          <span>UPDATE MARKUP — {item.sku}</span>
+          <span>UPDATE PRICE — {item.sku}</span>
           <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
         </div>
         <div style={styles.modalBody}>
           <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
-            Base cost is set by your Client Admin and can't be changed here — only your markup.
+            Base cost is set by your Client Admin and can't be changed here — only your selling price.
           </div>
           <Field label="Base Cost (₱)">
             <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(59,42,31,0.05)', color: 'rgba(59,42,31,0.6)' }}>
@@ -4651,27 +6023,26 @@ function MarkupModal({ item, onClose, onSave }) {
             </div>
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Markup Type" grow>
-              <select className="depot-select" style={styles.modalInput} value={markupType} onChange={(e) => setMarkupType(e.target.value)}>
-                <option value="percent">Percentage</option>
-                <option value="fixed">Fixed Amount (₱)</option>
-              </select>
-            </Field>
-            <Field label={markupType === 'fixed' ? 'Markup (₱)' : 'Markup (%)'} grow>
+            <Field label="Selling Price (₱)" grow>
               <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
-                value={markupValue} onChange={(e) => setMarkupValue(Math.max(0, Number(e.target.value)))} />
+                value={sellingPrice} onChange={(e) => setSellingPrice(Math.max(0, Number(e.target.value)))} />
             </Field>
-            <Field label="Selling Price" grow>
-              <div style={{ ...styles.modalInput, display: 'flex', alignItems: 'center', background: 'rgba(79,138,99,0.08)', fontWeight: 700, color: 'var(--green)' }}>
-                {currency(sellingPricePreview)}
+            <Field label="Markup" grow>
+              <div style={{
+                ...styles.modalInput, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                background: markup.amount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                fontWeight: 700, color: markup.amount >= 0 ? 'var(--green)' : 'var(--red)',
+              }}>
+                <span>{currency(markup.amount)}</span>
+                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markup.percent.toFixed(1)}%</span>
               </div>
             </Field>
           </div>
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item, markupType, markupValue)}>
-            Save Markup
+          <button className="depot-btn" style={styles.primaryBtn} onClick={() => onSave(item, sellingPrice)}>
+            Save Price
           </button>
         </div>
       </div>
@@ -4994,14 +6365,14 @@ const styles = {
   },
   statGrid: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 20 },
   statCard: {
-    background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16,
+    background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16,
     display: 'flex', alignItems: 'center', gap: 12, animation: 'slideUp 0.3s ease',
   },
   statIcon: { width: 38, height: 38, borderRadius: 7, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   statValue: { fontFamily: "'Quicksand', sans-serif", fontSize: 19, fontWeight: 600, lineHeight: 1.1 },
   statLabel: { fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 3 },
   overviewGrid: { display: 'grid', gridTemplateColumns: '1.3fr 1fr', gap: 16 },
-  panel: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18 },
+  panel: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18 },
   panelHeader: {
     display: 'flex', alignItems: 'center', gap: 7, fontFamily: "'Quicksand', sans-serif",
     fontSize: 11.5, fontWeight: 600, letterSpacing: '0.08em', color: 'var(--blueprint)',
@@ -5038,7 +6409,7 @@ const styles = {
     background: '#fff', border: '1px solid rgba(59,42,31,0.15)', borderRadius: 6, padding: '9px 10px',
     fontSize: 13, fontFamily: "'Nunito', sans-serif", color: 'var(--ink)',
   },
-  tableWrap: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, overflowX: 'auto' },
+  tableWrap: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, overflowX: 'auto' },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: 13 },
   th: {
     textAlign: 'left', padding: '11px 14px', fontFamily: "'Quicksand', sans-serif", fontSize: 10.5,
@@ -5057,11 +6428,11 @@ const styles = {
     display: 'block', fontSize: 9.5, color: 'rgba(59,42,31,0.4)', marginTop: 3, fontStyle: 'italic',
   },
   supplierGrid: { display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14 },
-  supplierCard: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16, animation: 'slideUp 0.3s ease' },
+  supplierCard: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 16, animation: 'slideUp 0.3s ease' },
   supplierCardHead: { display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12 },
   supplierIcon: { width: 32, height: 32, borderRadius: 7, background: 'var(--blueprint)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   categoryCard: {
-    display: 'flex', alignItems: 'center', gap: 10, background: '#fff', border: '1px solid rgba(59,42,31,0.08)',
+    display: 'flex', alignItems: 'center', gap: 10, background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)',
     borderRadius: 8, padding: '12px 14px', animation: 'slideUp 0.3s ease',
   },
   categoryIcon: { width: 32, height: 32, borderRadius: 7, background: 'var(--amber-deep)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
@@ -5071,12 +6442,12 @@ const styles = {
   },
   posItemCard: {
     display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start', textAlign: 'left',
-    background: '#fff', border: '1px solid rgba(59,42,31,0.1)', borderRadius: 8, padding: '10px 12px',
+    background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.1)', borderRadius: 8, padding: '10px 12px',
   },
   posItemSku: { fontFamily: "'Quicksand', sans-serif", fontSize: 11, color: 'var(--blueprint)', fontWeight: 600 },
   posItemName: { fontSize: 12.5, fontWeight: 500, lineHeight: 1.3 },
   posItemFooter: { display: 'flex', justifyContent: 'space-between', width: '100%', fontSize: 11, marginTop: 4, fontFamily: "'Quicksand', sans-serif" },
-  cartPanel: { background: '#fff', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18, position: 'sticky', top: 0 },
+  cartPanel: { background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)', borderRadius: 8, padding: 18, position: 'sticky', top: 0 },
   cartLine: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid rgba(59,42,31,0.06)' },
   qtyStepper: { display: 'flex', alignItems: 'center', gap: 6 },
   qtyBtn: {
@@ -5102,7 +6473,7 @@ const styles = {
   supplierNotes: { fontSize: 12, color: 'rgba(59,42,31,0.55)', fontStyle: 'italic', marginTop: 4 },
   ledger: { display: 'flex', flexDirection: 'column', gap: 8 },
   ledgerRow: {
-    display: 'flex', alignItems: 'center', gap: 12, background: '#fff', border: '1px solid rgba(59,42,31,0.08)',
+    display: 'flex', alignItems: 'center', gap: 12, background: 'var(--panel-bg)', border: '1px solid rgba(59,42,31,0.08)',
     borderRadius: 8, padding: '12px 16px',
   },
   ledgerIcon: { width: 32, height: 32, borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
