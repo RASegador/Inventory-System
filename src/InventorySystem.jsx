@@ -2084,7 +2084,7 @@ export default function InventorySystem() {
               onManageSubscription={(client) => setSubscriptionModal(client)}
             />
           ) : (
-            <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} staffInventoryStats={staffInventoryStats} role={myRole} onQuickMove={(it) => setMoveModal(it)} />
+            <Overview totals={totals} categoryData={categoryData} profitStats={profitStats} staffInventoryStats={staffInventoryStats} role={myRole} subscription={mySubscription} onQuickMove={(it) => setMoveModal(it)} />
           )
         )}
 
@@ -2226,7 +2226,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'myprofile' && (
-          <MyProfileView profile={myProfile} uid={user.uid} onSave={updateUserProfile} onChangePassword={changePassword} />
+          <MyProfileView profile={myProfile} uid={user.uid} role={myRole} subscription={mySubscription} onSave={updateUserProfile} onChangePassword={changePassword} />
         )}
         </>
         )}
@@ -3115,12 +3115,51 @@ function StatCard({ icon: Icon, label, value, accent }) {
   );
 }
 
-function Overview({ totals, categoryData, profitStats, staffInventoryStats, role, onQuickMove }) {
+// Shown to a Client Admin only (their own subscription). This is
+// deliberately NOT dismissible - it's computed live from the real
+// subscription data every render, so the only way it goes away is if
+// Super Admin actually sets a later expiration date. There's no stored
+// "dismissed" flag to work around.
+function SubscriptionStatusBanner({ subscription }) {
+  const latest = getLatestSubscriptionPeriod(subscription);
+  if (!latest) return null; // Super Admin hasn't set up a subscription yet - nothing to show
+  const days = daysUntilExpiration(subscription);
+  const expiringSoon = days !== null && days >= 0 && days <= 5;
+
+  if (expiringSoon) {
+    return (
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderRadius: 8,
+        background: 'rgba(193,80,58,0.1)', border: '1px solid rgba(193,80,58,0.35)', marginBottom: 16,
+      }}>
+        <AlertTriangle size={18} color="var(--red)" style={{ flexShrink: 0 }} />
+        <div style={{ fontSize: 13, color: 'var(--ink)' }}>
+          <strong>Your subscription expires in {days} day{days === 1 ? '' : 's'}</strong>, on {formatDate(latest.endDate)}.
+          Please contact your platform administrator to renew &mdash; this notice will stay until it's renewed.
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', borderRadius: 8,
+      background: 'rgba(79,138,99,0.08)', border: '1px solid rgba(79,138,99,0.25)', marginBottom: 16,
+    }}>
+      <CheckCircle2 size={16} color="var(--green)" style={{ flexShrink: 0 }} />
+      <div style={{ fontSize: 12.5, color: 'var(--ink)' }}>
+        Subscription active until <strong>{formatDate(latest.endDate)}</strong>.
+      </div>
+    </div>
+  );
+}
+
+function Overview({ totals, categoryData, profitStats, staffInventoryStats, role, subscription, onQuickMove }) {
   const canViewProfit = can(role, 'viewSalesReports');
   const canViewMySales = can(role, 'viewOwnSales');
   const canViewStaffInventory = can(role, 'editInventory');
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {role === 'client' && <SubscriptionStatusBanner subscription={subscription} />}
       <div style={styles.statGrid} className="depot-stat-grid">
         <StatCard icon={Package} label="SKUs Tracked" value={totals.totalSkus} accent="var(--blueprint)" />
         <StatCard icon={Boxes} label="Units on Hand" value={totals.totalUnits.toLocaleString()} accent="#2E5C87" />
@@ -4981,12 +5020,47 @@ function UserProfilesView({ approvedUsers, myRole, onSave }) {
   );
 }
 
-function MyProfileView({ profile, uid, onSave, onChangePassword }) {
+function MyProfileView({ profile, uid, role, subscription, onSave, onChangePassword }) {
   const [editing, setEditing] = useState(false);
   const me = { id: uid, ...(profile || {}) };
+  const latestPeriod = getLatestSubscriptionPeriod(subscription);
 
   return (
     <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      {role === 'client' && (
+        <div style={{ ...styles.panel, maxWidth: 480, marginBottom: 16 }}>
+          <div style={styles.panelHeader}>
+            <PesoIcon size={15} />
+            <span>SUBSCRIPTION</span>
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <SubscriptionStatusBanner subscription={subscription} />
+          </div>
+          {latestPeriod && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontSize: 12.5 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Current Period</span>
+                <span style={{ fontWeight: 600 }}>{MONTH_NAMES[latestPeriod.month - 1]} {latestPeriod.year}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Start Date</span>
+                <span>{formatDate(latestPeriod.startDate)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Expiration Date</span>
+                <span>{formatDate(latestPeriod.endDate)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'rgba(59,42,31,0.55)' }}>Payment Status</span>
+                <span style={{ fontWeight: 600, color: latestPeriod.paymentStatus === 'paid' ? 'var(--green)' : 'var(--amber-deep)' }}>
+                  {latestPeriod.paymentStatus === 'paid' ? 'Paid' : 'Unpaid'}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       <div style={{ ...styles.panel, maxWidth: 480 }}>
         <div style={styles.panelHeader}>
           <User size={15} />
