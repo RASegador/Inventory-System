@@ -16,7 +16,8 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2,
+  Wrench, Hammer, Ruler, PaintBucket, SprayCan, Droplet, Sparkles, FlaskConical, ShoppingBag, Shirt, Gem, Footprints
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -28,6 +29,28 @@ const RESPONSIVE_CSS = `
   html, body { -webkit-text-size-adjust: 100%; }
   .depot-wrap { box-sizing: border-box; }
   .depot-wrap *, .depot-wrap *::before, .depot-wrap *::after { box-sizing: border-box; }
+
+  /* Animated background decoration - gentle drift + rotate, three slightly
+     different patterns cycled across icons so the whole layer doesn't
+     move in obvious lockstep. */
+  @keyframes decor-float-0 {
+    0%, 100% { transform: translate(0, 0) rotate(var(--decor-rotate)); }
+    50% { transform: translate(6px, -10px) rotate(calc(var(--decor-rotate) + 4deg)); }
+  }
+  @keyframes decor-float-1 {
+    0%, 100% { transform: translate(0, 0) rotate(var(--decor-rotate)); }
+    50% { transform: translate(-8px, 8px) rotate(calc(var(--decor-rotate) - 5deg)); }
+  }
+  @keyframes decor-float-2 {
+    0%, 100% { transform: translate(0, 0) rotate(var(--decor-rotate)); }
+    50% { transform: translate(5px, 9px) rotate(calc(var(--decor-rotate) + 3deg)); }
+  }
+
+  /* A touch more interactivity on the most-hovered surfaces. */
+  .depot-stat-card { transition: transform 0.15s ease, box-shadow 0.15s ease; }
+  .depot-stat-card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(20,33,61,0.1); }
+  .depot-btn { transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease; }
+  .depot-btn:hover { box-shadow: 0 2px 8px rgba(20,33,61,0.12); }
 
   /* Tablet and below: sidebar becomes a horizontal top bar */
   @media (max-width: 1024px) {
@@ -471,64 +494,92 @@ function DateRangeFilter({ from, to, onFrom, onTo }) {
   );
 }
 
-const DECOR_SETS = {
-  login: [
-    { Icon: Leaf, top: '8%', left: '10%', size: 46, rotate: -18, color: '#5C8A5A' },
-    { Icon: ShoppingBasket, top: '72%', left: '8%', size: 54, rotate: 12, color: '#D9A441' },
-    { Icon: Apple, top: '14%', left: '86%', size: 42, rotate: 15, color: '#C1503A' },
-    { Icon: Tag, top: '80%', left: '88%', size: 38, rotate: -10, color: '#A9701D' },
-    { Icon: Leaf, top: '55%', left: '92%', size: 30, rotate: 30, color: '#5C8A5A', opacity: 0.21 },
-    { Icon: ShoppingCart, top: '85%', left: '48%', size: 40, rotate: -6, color: '#2F4A32' },
-    { Icon: Package, top: '4%', left: '46%', size: 30, rotate: 8, color: '#A9701D', opacity: 0.21 },
-    { Icon: Leaf, top: '38%', left: '4%', size: 26, rotate: -35, color: '#5C8A5A', opacity: 0.23 },
-    { Icon: Tag, top: '25%', left: '95%', size: 26, rotate: -22, color: '#C1503A', opacity: 0.21 },
-    { Icon: Apple, top: '92%', left: '18%', size: 30, rotate: 20, color: '#5C8A5A', opacity: 0.23 },
-    { Icon: ShoppingBasket, top: '48%', left: '2%', size: 24, rotate: -10, color: '#D9A441', opacity: 0.18 },
-    { Icon: Leaf, top: '95%', left: '68%', size: 34, rotate: 12, color: '#2F4A32', opacity: 0.21 },
-    { Icon: ShoppingCart, top: '2%', left: '68%', size: 24, rotate: 18, color: '#A9701D', opacity: 0.18 },
-    { Icon: Apple, top: '65%', left: '3%', size: 22, rotate: -14, color: '#C1503A', opacity: 0.18 },
-    { Icon: Package, top: '35%', left: '78%', size: 28, rotate: -6, color: '#2F4A32', opacity: 0.18 },
-    { Icon: Tag, top: '60%', left: '38%', size: 20, rotate: 26, color: '#D9A441', opacity: 0.16 },
-    { Icon: Leaf, top: '15%', left: '58%', size: 22, rotate: -40, color: '#5C8A5A', opacity: 0.18 },
-    { Icon: ShoppingBasket, top: '30%', left: '30%', size: 20, rotate: 15, color: '#A9701D', opacity: 0.16 },
-    { Icon: Apple, top: '5%', left: '25%', size: 24, rotate: 10, color: '#C1503A', opacity: 0.18 },
-    { Icon: ShoppingCart, top: '78%', left: '75%', size: 26, rotate: -12, color: '#2F4A32', opacity: 0.18 },
-  ],
-  app: [
-    { Icon: Leaf, top: '4%', left: '3%', size: 40, rotate: -20, color: 'var(--green)' },
-    { Icon: ShoppingBasket, top: '90%', left: '4%', size: 46, rotate: 10, color: 'var(--amber)' },
-    { Icon: Tag, top: '8%', left: '97%', size: 34, rotate: 16, color: 'var(--amber-deep)' },
-    { Icon: Apple, top: '92%', left: '95%', size: 36, rotate: -12, color: 'var(--red)' },
-    { Icon: Package, top: '48%', left: '98%', size: 32, rotate: 8, color: 'var(--blueprint)' },
-    { Icon: Leaf, top: '65%', left: '1%', size: 26, rotate: 25, color: 'var(--green)', opacity: 0.21 },
-    { Icon: ShoppingCart, top: '30%', left: '2%', size: 28, rotate: -8, color: 'var(--amber-deep)', opacity: 0.21 },
-    { Icon: Tag, top: '70%', left: '99%', size: 24, rotate: -18, color: 'var(--red)', opacity: 0.18 },
-    { Icon: Apple, top: '18%', left: '99%', size: 26, rotate: 14, color: 'var(--green)', opacity: 0.21 },
-    { Icon: ShoppingBasket, top: '99%', left: '55%', size: 30, rotate: -6, color: 'var(--amber)', opacity: 0.18 },
-    { Icon: Leaf, top: '2%', left: '55%', size: 22, rotate: 20, color: 'var(--amber-deep)', opacity: 0.16 },
-    { Icon: Package, top: '80%', left: '2%', size: 24, rotate: -10, color: 'var(--red)', opacity: 0.18 },
-    { Icon: Tag, top: '40%', left: '1%', size: 20, rotate: 30, color: 'var(--green)', opacity: 0.16 },
-    { Icon: ShoppingCart, top: '55%', left: '99%', size: 24, rotate: -22, color: 'var(--blueprint)', opacity: 0.18 },
-    { Icon: Apple, top: '99%', left: '25%', size: 22, rotate: 12, color: 'var(--amber-deep)', opacity: 0.16 },
-  ],
+// Each theme is just an icon+color POOL - they all share the exact same
+// hand-tuned position/size/rotation layout (DECOR_LAYOUT below), so adding
+// a new theme is just a new short icon list, never a second full layout to
+// maintain. Colors are literal hex (not CSS vars) so the exact same pool
+// works on both the pre-login screen and the authenticated app without
+// caring whether :root theme variables exist yet.
+const ANIMATION_THEMES = {
+  grocery: {
+    label: 'Groceries',
+    icons: [
+      { Icon: Leaf, color: '#5C8A5A' }, { Icon: ShoppingBasket, color: '#D9A441' },
+      { Icon: Apple, color: '#C1503A' }, { Icon: Tag, color: '#A9701D' },
+      { Icon: ShoppingCart, color: '#2F4A32' }, { Icon: Package, color: '#A9701D' },
+    ],
+  },
+  hardware: {
+    label: 'Hardware & Equipment',
+    icons: [
+      { Icon: Wrench, color: '#6B5236' }, { Icon: Hammer, color: '#8C6A4E' },
+      { Icon: Ruler, color: '#B9803C' }, { Icon: PaintBucket, color: '#4A7FB5' },
+      { Icon: Package, color: '#6B5236' }, { Icon: Tag, color: '#8C6A4E' },
+    ],
+  },
+  perfumes: {
+    label: 'Perfumes & Beauty',
+    icons: [
+      { Icon: SprayCan, color: '#B5586F' }, { Icon: Droplet, color: '#7A3B4A' },
+      { Icon: Sparkles, color: '#D98C55' }, { Icon: FlaskConical, color: '#E0A3AF' },
+      { Icon: Gem, color: '#B5586F' }, { Icon: Tag, color: '#7A3B4A' },
+    ],
+  },
+  bagsClothes: {
+    label: 'Bags & Clothes',
+    icons: [
+      { Icon: ShoppingBag, color: '#453166' }, { Icon: Shirt, color: '#7A5FA6' },
+      { Icon: Gem, color: '#C98A4A' }, { Icon: Footprints, color: '#241A38' },
+      { Icon: Tag, color: '#453166' }, { Icon: ShoppingBag, color: '#9A621F' },
+    ],
+  },
 };
+const DEFAULT_ANIMATION_THEME = 'grocery';
 
-function BackgroundDecor({ variant = 'app' }) {
-  const set = DECOR_SETS[variant] || DECOR_SETS.app;
+const DECOR_LAYOUT = [
+  { top: '8%', left: '10%', size: 46, rotate: -18, duration: 7.5 },
+  { top: '72%', left: '8%', size: 54, rotate: 12, duration: 9, opacity: 0.24 },
+  { top: '14%', left: '86%', size: 42, rotate: 15, duration: 8 },
+  { top: '80%', left: '88%', size: 38, rotate: -10, duration: 6.5, opacity: 0.22 },
+  { top: '55%', left: '92%', size: 30, rotate: 30, duration: 10, opacity: 0.2 },
+  { top: '85%', left: '48%', size: 40, rotate: -6, duration: 7.5 },
+  { top: '4%', left: '46%', size: 30, rotate: 8, duration: 8.5, opacity: 0.2 },
+  { top: '38%', left: '4%', size: 26, rotate: -35, duration: 6, opacity: 0.22 },
+  { top: '25%', left: '95%', size: 26, rotate: -22, duration: 9.5, opacity: 0.2 },
+  { top: '92%', left: '18%', size: 30, rotate: 20, duration: 7, opacity: 0.22 },
+  { top: '48%', left: '2%', size: 24, rotate: -10, duration: 8, opacity: 0.18 },
+  { top: '95%', left: '68%', size: 34, rotate: 12, duration: 6.5, opacity: 0.2 },
+  { top: '2%', left: '68%', size: 24, rotate: 18, duration: 9, opacity: 0.18 },
+  { top: '65%', left: '3%', size: 22, rotate: -14, duration: 7.5, opacity: 0.18 },
+  { top: '35%', left: '78%', size: 28, rotate: -6, duration: 10, opacity: 0.18 },
+  { top: '60%', left: '38%', size: 20, rotate: 26, duration: 6, opacity: 0.16 },
+  { top: '15%', left: '58%', size: 22, rotate: -40, duration: 8.5, opacity: 0.18 },
+  { top: '30%', left: '30%', size: 20, rotate: 15, duration: 7, opacity: 0.16 },
+  { top: '5%', left: '25%', size: 24, rotate: 10, duration: 9, opacity: 0.18 },
+  { top: '78%', left: '75%', size: 26, rotate: -12, duration: 6.5, opacity: 0.18 },
+];
+
+function BackgroundDecor({ animationTheme }) {
+  const theme = ANIMATION_THEMES[animationTheme] || ANIMATION_THEMES[DEFAULT_ANIMATION_THEME];
   return (
     <div style={styles.decorLayer} aria-hidden="true">
-      {set.map(({ Icon, top, left, size, rotate, color, opacity }, i) => (
-        <Icon
-          key={i}
-          size={size}
-          color={color}
-          strokeWidth={1.4}
-          style={{
-            position: 'absolute', top, left, opacity: opacity ?? 0.24,
-            transform: `rotate(${rotate}deg)`,
-          }}
-        />
-      ))}
+      {DECOR_LAYOUT.map((pos, i) => {
+        const { Icon, color } = theme.icons[i % theme.icons.length];
+        return (
+          <Icon
+            key={i}
+            size={pos.size}
+            color={color}
+            strokeWidth={1.4}
+            style={{
+              position: 'absolute', top: pos.top, left: pos.left, opacity: pos.opacity ?? 0.24,
+              animation: `decor-float-${i % 3} ${pos.duration}s ease-in-out infinite`,
+              animationDelay: `${(i % 5) * 0.6}s`,
+              '--decor-rotate': `${pos.rotate}deg`,
+            }}
+          />
+        );
+      })}
     </div>
   );
 }
@@ -941,6 +992,7 @@ export default function InventorySystem() {
     fontKey: tenantBranding?.fontKey ?? branding?.fontKey,
     customInk: tenantBranding?.customInk ?? branding?.customInk,
     customPanelBg: tenantBranding?.customPanelBg ?? branding?.customPanelBg,
+    animationTheme: tenantBranding?.animationTheme ?? branding?.animationTheme,
   };
   const effectiveLogo = effectiveBranding.logoDataUri || LOGO_DATA_URI;
   const activeTheme = THEMES[effectiveBranding.themeKey] || THEMES[DEFAULT_THEME_KEY];
@@ -1248,6 +1300,10 @@ export default function InventorySystem() {
 
   const resetCustomColors = async () => {
     await updateBranding({ customInk: null, customPanelBg: null }, 'Reverted to theme default colors');
+  };
+
+  const setAnimationTheme = async (key) => {
+    await updateBranding({ animationTheme: key }, `Background theme changed to ${ANIMATION_THEMES[key]?.label || key}`);
   };
 
 
@@ -2057,7 +2113,7 @@ export default function InventorySystem() {
   }
 
   if (!user) {
-    return <LoginScreen logo={effectiveLogo} theme={activeTheme} />;
+    return <LoginScreen logo={effectiveLogo} theme={activeTheme} animationTheme={effectiveBranding.animationTheme} />;
   }
 
   if (!profileChecked) {
@@ -2072,11 +2128,11 @@ export default function InventorySystem() {
   }
 
   if (!myProfile || !myProfile.approved) {
-    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} onSignOut={handleSignOut} />;
+    return <PendingApprovalScreen email={user.email} missingProfile={!myProfile} animationTheme={effectiveBranding.animationTheme} onSignOut={handleSignOut} />;
   }
 
   if (accessPaused) {
-    return <SubscriptionPausedScreen role={myRole} onSignOut={handleSignOut} />;
+    return <SubscriptionPausedScreen role={myRole} animationTheme={effectiveBranding.animationTheme} onSignOut={handleSignOut} />;
   }
 
   if (!loaded) {
@@ -2113,7 +2169,7 @@ export default function InventorySystem() {
         }
       `}</style>
 
-      <BackgroundDecor variant="app" />
+      <BackgroundDecor animationTheme={effectiveBranding.animationTheme} />
 
       <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} onSignOut={handleSignOut} />
 
@@ -2274,6 +2330,7 @@ export default function InventorySystem() {
             onSetInk={setCustomInk}
             onSetPanelBg={setCustomPanelBg}
             onResetColors={resetCustomColors}
+            onSetAnimationTheme={setAnimationTheme}
           />
         )}
 
@@ -2566,7 +2623,7 @@ function LegalModal({ kind, onClose, theme }) {
   );
 }
 
-function LoginScreen({ logo, theme }) {
+function LoginScreen({ logo, theme, animationTheme }) {
   const t = theme || THEMES[DEFAULT_THEME_KEY];
   const [roleTab, setRoleTab] = useState('client'); // 'superadmin' | 'client' | 'staff'
   const [mode, setMode] = useState('signin'); // 'signin' | 'reset' - reset only ever applies to Super Admin
@@ -2690,7 +2747,7 @@ function LoginScreen({ logo, theme }) {
           .depot-logo-float { animation: none; }
         }
       `}</style>
-      <BackgroundDecor variant="login" />
+      <BackgroundDecor animationTheme={animationTheme} />
 
       <div className="depot-login-form" style={cardStyle}>
         <div style={{
@@ -2872,7 +2929,7 @@ function AccessDenied() {
   );
 }
 
-function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
+function PendingApprovalScreen({ email, missingProfile, animationTheme, onSignOut }) {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2880,7 +2937,7 @@ function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
       position: 'relative', overflow: 'hidden',
     }}>
       <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
-      <BackgroundDecor variant="login" />
+      <BackgroundDecor animationTheme={animationTheme} />
       <div className="depot-login-form" style={{
         background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
         boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(217,164,65,0.15)',
@@ -2932,7 +2989,7 @@ function PendingApprovalScreen({ email, missingProfile, onSignOut }) {
   );
 }
 
-function SubscriptionPausedScreen({ role, onSignOut }) {
+function SubscriptionPausedScreen({ role, animationTheme, onSignOut }) {
   return (
     <div style={{
       minHeight: '85vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -2940,7 +2997,7 @@ function SubscriptionPausedScreen({ role, onSignOut }) {
       position: 'relative', overflow: 'hidden',
     }}>
       <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
-      <BackgroundDecor variant="login" />
+      <BackgroundDecor animationTheme={animationTheme} />
       <div className="depot-login-form" style={{
         background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
         boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(193,80,58,0.2)',
@@ -5388,12 +5445,13 @@ function AddStaffPanel({ onCreateStaff }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme, onSetFont, onSetInk, onSetPanelBg, onResetColors }) {
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme, onSetFont, onSetInk, onSetPanelBg, onResetColors, onSetAnimationTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
   const [editingUser, setEditingUser] = useState(null);
   const activeThemeKey = branding?.themeKey || DEFAULT_THEME_KEY;
   const activeFontKey = branding?.fontKey || DEFAULT_FONT_KEY;
+  const activeAnimationKey = branding?.animationTheme || DEFAULT_ANIMATION_THEME;
 
   const handleLogoFile = (e) => {
     const file = e.target.files?.[0];
@@ -5630,6 +5688,23 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
             </div>
             <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 8, maxWidth: 460 }}>
               These override the color scheme's defaults for the main text color and card/panel backgrounds throughout the app. Some muted/secondary text tones are calculated automatically and may not shift with a custom text color.
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--ink)', marginBottom: 8 }}>Background Animation</div>
+            <select
+              className="depot-select"
+              value={activeAnimationKey}
+              onChange={(e) => onSetAnimationTheme(e.target.value)}
+              style={{ ...styles.modalInput, maxWidth: 320 }}
+            >
+              {Object.entries(ANIMATION_THEMES).map(([key, t]) => (
+                <option key={key} value={key}>{t.label}</option>
+              ))}
+            </select>
+            <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 6, maxWidth: 460 }}>
+              Sets the gently floating decorative icons in the background, both on this app and your own sign-in screen &mdash; pick whatever matches your business.
             </div>
           </div>
         </div>
