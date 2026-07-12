@@ -899,7 +899,20 @@ const FONT_PRESETS = {
 };
 const DEFAULT_FONT_KEY = 'quicksandNunito';
 
-function themeCssVars(theme, fontFamily, customInk, customPanelBg) {
+// Darkens a #rrggbb hex color by `percent` (0-100), used to derive the
+// bottom-of-gradient shade for a custom sidebar color the same way each
+// THEME already pairs a `blueprint` color with a darker `blueprintDeep`.
+function shadeHex(hex, percent) {
+  if (!hex || !/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
+  const num = parseInt(hex.slice(1), 16);
+  const amt = Math.round(2.55 * percent);
+  const r = Math.max(0, (num >> 16) - amt);
+  const g = Math.max(0, ((num >> 8) & 0x00ff) - amt);
+  const b = Math.max(0, (num & 0x0000ff) - amt);
+  return `#${(0x1000000 + r * 0x10000 + g * 0x100 + b).toString(16).slice(1)}`;
+}
+
+function themeCssVars(theme, fontFamily, customInk, customPanelBg, customSidebarBg) {
   return `
     :root {
           --blueprint: ${theme.blueprint};
@@ -914,6 +927,8 @@ function themeCssVars(theme, fontFamily, customInk, customPanelBg) {
           --green: ${theme.green};
           --red: ${theme.red};
           --panel-bg: ${customPanelBg || '#ffffff'};
+          --sidebar-bg: ${customSidebarBg || theme.blueprint};
+          --sidebar-bg-deep: ${customSidebarBg ? shadeHex(customSidebarBg, 18) : theme.blueprintDeep};
           --font-body: ${fontFamily || FONT_PRESETS[DEFAULT_FONT_KEY].family};
     }
     /* Most text elements in this app set font-family inline rather than
@@ -1117,6 +1132,7 @@ export default function InventorySystem() {
     fontKey: tenantBranding?.fontKey ?? branding?.fontKey,
     customInk: tenantBranding?.customInk ?? branding?.customInk,
     customPanelBg: tenantBranding?.customPanelBg ?? branding?.customPanelBg,
+    customSidebarBg: tenantBranding?.customSidebarBg ?? branding?.customSidebarBg,
     animationTheme: tenantBranding?.animationTheme ?? branding?.animationTheme,
   };
   const effectiveLogo = effectiveBranding.logoDataUri || LOGO_DATA_URI;
@@ -1423,8 +1439,12 @@ export default function InventorySystem() {
     await updateBranding({ customPanelBg: hex }, 'Panel color updated');
   };
 
+  const setCustomSidebarBg = async (hex) => {
+    await updateBranding({ customSidebarBg: hex }, 'Sidebar color updated');
+  };
+
   const resetCustomColors = async () => {
-    await updateBranding({ customInk: null, customPanelBg: null }, 'Reverted to theme default colors');
+    await updateBranding({ customInk: null, customPanelBg: null, customSidebarBg: null }, 'Reverted to theme default colors');
   };
 
   const setAnimationTheme = async (key) => {
@@ -2287,7 +2307,7 @@ export default function InventorySystem() {
       <style>{`
         ${FONT_IMPORT}
         ${RESPONSIVE_CSS}
-        ${themeCssVars(activeTheme, activeFontFamily, effectiveBranding.customInk, effectiveBranding.customPanelBg)}
+        ${themeCssVars(activeTheme, activeFontFamily, effectiveBranding.customInk, effectiveBranding.customPanelBg, effectiveBranding.customSidebarBg)}
         * { box-sizing: border-box; }
         .depot-btn { cursor: pointer; border: none; font-family: var(--font-body); transition: all 0.15s ease; }
         .depot-btn:active { transform: translateY(1px); }
@@ -2465,6 +2485,7 @@ export default function InventorySystem() {
             onSetFont={setFontKey}
             onSetInk={setCustomInk}
             onSetPanelBg={setCustomPanelBg}
+            onSetSidebarBg={setCustomSidebarBg}
             onResetColors={resetCustomColors}
             onSetAnimationTheme={setAnimationTheme}
           />
@@ -5664,7 +5685,7 @@ function AddStaffPanel({ onCreateStaff }) {
   );
 }
 
-function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme, onSetFont, onSetInk, onSetPanelBg, onResetColors, onSetAnimationTheme }) {
+function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCreateStaff, onCreateStaff, onApprove, onDeny, onRevoke, onChangeRole, onSaveProfile, branding, onSaveLogo, onResetLogo, onSetTheme, onSetFont, onSetInk, onSetPanelBg, onSetSidebarBg, onResetColors, onSetAnimationTheme }) {
   const isSuperAdmin = myRole === 'superadmin';
   const [logoPreview, setLogoPreview] = useState(null);
   const [editingUser, setEditingUser] = useState(null);
@@ -5899,6 +5920,15 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
                   style={{ width: 48, height: 32, border: '1px solid rgba(20,33,61,0.15)', borderRadius: 6, cursor: 'pointer', padding: 2, background: '#fff' }}
                 />
               </div>
+              <div>
+                <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.6)', marginBottom: 5 }}>Sidebar Color</div>
+                <input
+                  type="color"
+                  value={branding?.customSidebarBg || THEMES[activeThemeKey].blueprint}
+                  onChange={(e) => onSetSidebarBg(e.target.value)}
+                  style={{ width: 48, height: 32, border: '1px solid rgba(20,33,61,0.15)', borderRadius: 6, cursor: 'pointer', padding: 2, background: '#fff' }}
+                />
+              </div>
               <div style={{ display: 'flex', alignItems: 'flex-end' }}>
                 <button className="depot-btn" style={{ ...styles.smallAmberBtn, background: 'transparent', color: 'var(--ink)', border: '1px solid rgba(20,33,61,0.2)' }} onClick={onResetColors}>
                   Reset to Theme Defaults
@@ -5906,7 +5936,7 @@ function TeamAccessView({ pendingUsers, approvedUsers, currentUid, myRole, canCr
               </div>
             </div>
             <div style={{ fontSize: 11.5, color: 'rgba(59,42,31,0.55)', marginTop: 8, maxWidth: 460 }}>
-              These override the color scheme's defaults for the main text color and card/panel backgrounds throughout the app. Some muted/secondary text tones are calculated automatically and may not shift with a custom text color.
+              These override the color scheme's defaults for the main text color, card/panel backgrounds, and the sidebar background throughout the app. Some muted/secondary text tones are calculated automatically and may not shift with a custom text color.
             </div>
           </div>
 
@@ -6701,7 +6731,7 @@ function ConfirmModal({ title, message, onCancel, onConfirm, confirmLabel = 'Rem
 
 const styles = {
   wrap: {
-    display: 'flex', minHeight: '85vh', height: '100%', position: 'relative',
+    display: 'flex', height: '100vh', position: 'relative',
     background: `
       radial-gradient(circle at 8% 12%, rgba(217,164,65,0.14) 0%, transparent 32%),
       radial-gradient(circle at 92% 85%, rgba(92,138,90,0.12) 0%, transparent 36%),
@@ -6711,9 +6741,9 @@ const styles = {
     boxShadow: '0 1px 3px rgba(59,42,31,0.08)',
   },
   sidebar: {
-    width: 260, background: 'linear-gradient(180deg, var(--blueprint) 0%, var(--blueprint-deep) 100%)',
+    width: 260, background: 'linear-gradient(180deg, var(--sidebar-bg) 0%, var(--sidebar-bg-deep) 100%)',
     padding: '22px 14px', display: 'flex', flexDirection: 'column', flexShrink: 0,
-    backgroundImage: 'linear-gradient(180deg, var(--blueprint) 0%, var(--blueprint-deep) 100%), repeating-linear-gradient(0deg, rgba(201,169,106,0.05) 0px, rgba(201,169,106,0.05) 1px, transparent 1px, transparent 24px)',
+    backgroundImage: 'linear-gradient(180deg, var(--sidebar-bg) 0%, var(--sidebar-bg-deep) 100%), repeating-linear-gradient(0deg, rgba(201,169,106,0.05) 0px, rgba(201,169,106,0.05) 1px, transparent 1px, transparent 24px)',
     position: 'relative', zIndex: 1,
   },
   brand: { display: 'flex', alignItems: 'center', padding: '0' },
