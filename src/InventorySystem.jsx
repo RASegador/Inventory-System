@@ -2908,7 +2908,8 @@ function LoginScreen({ logo, theme, animationTheme }) {
   const backToSignIn = () => { setMode('signin'); setError(''); setResetSent(false); setPassword(''); };
 
   const cardStyle = {
-    background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 400,
+    background: 'rgba(255,252,245,0.88)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)',
+    padding: '32px 30px', borderRadius: 10, width: 400,
     boxShadow: `0 16px 40px rgba(0,0,0,0.12), 0 0 0 1px ${t.lineDim}`,
     border: `1px solid ${t.lineDim}`, position: 'relative', zIndex: 1,
   };
@@ -3127,7 +3128,8 @@ function PendingApprovalScreen({ email, missingProfile, animationTheme, onSignOu
       <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
       <BackgroundDecor animationTheme={animationTheme} />
       <div className="depot-login-form" style={{
-        background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
+        background: 'rgba(255,252,245,0.88)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)',
+        padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
         boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(217,164,65,0.15)',
         border: '1px solid rgba(217,164,65,0.35)', position: 'relative', zIndex: 1,
       }}>
@@ -3187,7 +3189,8 @@ function SubscriptionPausedScreen({ role, animationTheme, onSignOut }) {
       <style>{FONT_IMPORT}{RESPONSIVE_CSS}</style>
       <BackgroundDecor animationTheme={animationTheme} />
       <div className="depot-login-form" style={{
-        background: '#FFFCF5', padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
+        background: 'rgba(255,252,245,0.88)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)',
+        padding: '32px 30px', borderRadius: 10, width: 380, textAlign: 'center',
         boxShadow: '0 16px 40px rgba(59,42,31,0.12), 0 0 0 1px rgba(193,80,58,0.2)',
         border: '1px solid rgba(193,80,58,0.35)', position: 'relative', zIndex: 1,
       }}>
