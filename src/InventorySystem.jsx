@@ -628,26 +628,54 @@ const ANIMATION_THEMES = {
 const DEFAULT_ANIMATION_THEME = 'grocery';
 
 const DECOR_LAYOUT = [
-  { top: '8%', left: '10%', size: 46, rotate: -18, duration: 7.5 },
-  { top: '72%', left: '8%', size: 54, rotate: 12, duration: 9, opacity: 0.24 },
-  { top: '14%', left: '86%', size: 42, rotate: 15, duration: 8 },
-  { top: '80%', left: '88%', size: 38, rotate: -10, duration: 6.5, opacity: 0.22 },
-  { top: '55%', left: '92%', size: 30, rotate: 30, duration: 10, opacity: 0.2 },
-  { top: '85%', left: '48%', size: 40, rotate: -6, duration: 7.5 },
-  { top: '4%', left: '46%', size: 30, rotate: 8, duration: 8.5, opacity: 0.2 },
-  { top: '38%', left: '4%', size: 26, rotate: -35, duration: 6, opacity: 0.22 },
-  { top: '25%', left: '95%', size: 26, rotate: -22, duration: 9.5, opacity: 0.2 },
-  { top: '92%', left: '18%', size: 30, rotate: 20, duration: 7, opacity: 0.22 },
-  { top: '48%', left: '2%', size: 24, rotate: -10, duration: 8, opacity: 0.18 },
-  { top: '95%', left: '68%', size: 34, rotate: 12, duration: 6.5, opacity: 0.2 },
-  { top: '2%', left: '68%', size: 24, rotate: 18, duration: 9, opacity: 0.18 },
-  { top: '65%', left: '3%', size: 22, rotate: -14, duration: 7.5, opacity: 0.18 },
-  { top: '35%', left: '78%', size: 28, rotate: -6, duration: 10, opacity: 0.18 },
-  { top: '60%', left: '38%', size: 20, rotate: 26, duration: 6, opacity: 0.16 },
-  { top: '15%', left: '58%', size: 22, rotate: -40, duration: 8.5, opacity: 0.18 },
-  { top: '30%', left: '30%', size: 20, rotate: 15, duration: 7, opacity: 0.16 },
-  { top: '5%', left: '25%', size: 24, rotate: 10, duration: 9, opacity: 0.18 },
-  { top: '78%', left: '75%', size: 26, rotate: -12, duration: 6.5, opacity: 0.18 },
+  { top: '10%', left: '2%', size: 34, rotate: -7, duration: 7.1, opacity: 0.5 },
+  { top: '10%', left: '23%', size: 28, rotate: 37, duration: 8.1, opacity: 0.33 },
+  { top: '5%', left: '31%', size: 26, rotate: 33, duration: 7.0, opacity: 0.48 },
+  { top: '9%', left: '41%', size: 44, rotate: -3, duration: 10.0, opacity: 0.32 },
+  { top: '12%', left: '58%', size: 36, rotate: -3, duration: 6.8, opacity: 0.55 },
+  { top: '6%', left: '65%', size: 29, rotate: 7, duration: 10.2, opacity: 0.46 },
+  { top: '12%', left: '84%', size: 43, rotate: -23, duration: 10.9, opacity: 0.41 },
+  { top: '9%', left: '97%', size: 45, rotate: 8, duration: 8.9, opacity: 0.49 },
+  { top: '20%', left: '4%', size: 35, rotate: -28, duration: 10.3, opacity: 0.53 },
+  { top: '24%', left: '18%', size: 52, rotate: 8, duration: 6.8, opacity: 0.41 },
+  { top: '27%', left: '33%', size: 47, rotate: -29, duration: 9.0, opacity: 0.36 },
+  { top: '28%', left: '40%', size: 38, rotate: -4, duration: 10.9, opacity: 0.47 },
+  { top: '26%', left: '58%', size: 52, rotate: -31, duration: 7.1, opacity: 0.33 },
+  { top: '23%', left: '66%', size: 32, rotate: 34, duration: 10.4, opacity: 0.4 },
+  { top: '27%', left: '80%', size: 55, rotate: 20, duration: 6.7, opacity: 0.35 },
+  { top: '28%', left: '94%', size: 49, rotate: 36, duration: 8.1, opacity: 0.46 },
+  { top: '40%', left: '11%', size: 30, rotate: 27, duration: 8.5, opacity: 0.5 },
+  { top: '46%', left: '15%', size: 31, rotate: 16, duration: 9.0, opacity: 0.41 },
+  { top: '43%', left: '31%', size: 34, rotate: 32, duration: 10.3, opacity: 0.32 },
+  { top: '44%', left: '46%', size: 43, rotate: -4, duration: 9.8, opacity: 0.4 },
+  { top: '39%', left: '53%', size: 26, rotate: -5, duration: 10.9, opacity: 0.5 },
+  { top: '42%', left: '65%', size: 46, rotate: 0, duration: 10.2, opacity: 0.44 },
+  { top: '38%', left: '80%', size: 31, rotate: 31, duration: 10.8, opacity: 0.54 },
+  { top: '47%', left: '95%', size: 41, rotate: -36, duration: 6.6, opacity: 0.41 },
+  { top: '64%', left: '9%', size: 33, rotate: -31, duration: 7.2, opacity: 0.46 },
+  { top: '53%', left: '21%', size: 52, rotate: -30, duration: 10.9, opacity: 0.45 },
+  { top: '54%', left: '33%', size: 56, rotate: 32, duration: 6.8, opacity: 0.45 },
+  { top: '60%', left: '48%', size: 55, rotate: 31, duration: 9.8, opacity: 0.49 },
+  { top: '61%', left: '55%', size: 47, rotate: 9, duration: 8.2, opacity: 0.44 },
+  { top: '54%', left: '66%', size: 36, rotate: -36, duration: 8.9, opacity: 0.38 },
+  { top: '55%', left: '77%', size: 46, rotate: -31, duration: 7.1, opacity: 0.54 },
+  { top: '63%', left: '89%', size: 33, rotate: -3, duration: 9.3, opacity: 0.37 },
+  { top: '71%', left: '11%', size: 44, rotate: 35, duration: 8.4, opacity: 0.51 },
+  { top: '79%', left: '16%', size: 29, rotate: 17, duration: 7.8, opacity: 0.42 },
+  { top: '79%', left: '27%', size: 46, rotate: -26, duration: 6.3, opacity: 0.49 },
+  { top: '79%', left: '40%', size: 32, rotate: -14, duration: 8.7, opacity: 0.35 },
+  { top: '71%', left: '56%', size: 53, rotate: -29, duration: 8.2, opacity: 0.53 },
+  { top: '76%', left: '64%', size: 43, rotate: -37, duration: 10.8, opacity: 0.54 },
+  { top: '79%', left: '78%', size: 41, rotate: 23, duration: 7.1, opacity: 0.42 },
+  { top: '70%', left: '93%', size: 38, rotate: -5, duration: 10.6, opacity: 0.51 },
+  { top: '89%', left: '8%', size: 49, rotate: 33, duration: 9.3, opacity: 0.44 },
+  { top: '88%', left: '16%', size: 27, rotate: 36, duration: 9.7, opacity: 0.33 },
+  { top: '89%', left: '27%', size: 41, rotate: 26, duration: 10.6, opacity: 0.45 },
+  { top: '86%', left: '44%', size: 53, rotate: -15, duration: 6.3, opacity: 0.34 },
+  { top: '96%', left: '55%', size: 56, rotate: 34, duration: 7.2, opacity: 0.46 },
+  { top: '93%', left: '68%', size: 44, rotate: 34, duration: 8.6, opacity: 0.54 },
+  { top: '88%', left: '83%', size: 33, rotate: -5, duration: 8.0, opacity: 0.48 },
+  { top: '89%', left: '92%', size: 50, rotate: -29, duration: 6.0, opacity: 0.47 },
 ];
 
 function BackgroundDecor({ animationTheme }) {
@@ -656,16 +684,16 @@ function BackgroundDecor({ animationTheme }) {
     <div style={styles.decorLayer} aria-hidden="true">
       {DECOR_LAYOUT.map((pos, i) => {
         const src = theme.images[i % theme.images.length];
-        // Sticker art reads better a bit larger than the old thin-line icons
-        // did at the same DECOR_LAYOUT size, so it's scaled up ~1.7x here.
-        const px = Math.round(pos.size * 1.7);
+        // Sticker art reads better noticeably larger than the old thin-line
+        // icons did at the same DECOR_LAYOUT size, so it's scaled up 2x here.
+        const px = Math.round(pos.size * 2);
         return (
           <img
             key={i}
             src={src}
             alt=""
             style={{
-              position: 'absolute', top: pos.top, left: pos.left, opacity: pos.opacity ?? 0.24,
+              position: 'absolute', top: pos.top, left: pos.left, opacity: pos.opacity ?? 0.4,
               width: px, height: px, objectFit: 'contain',
               animation: `decor-float-${i % 3} ${pos.duration}s ease-in-out infinite`,
               animationDelay: `${(i % 5) * 0.6}s`,
