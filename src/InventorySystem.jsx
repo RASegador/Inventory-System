@@ -3505,6 +3505,7 @@ function TopBar({ view, role, onAdd }) {
       : ['Overview', 'Warehouse status at a glance'],
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
+    barcodes: ['Barcodes', 'Generate, print, and download barcode labels'],
     staffInventory: ['Staff Inventory', 'Stock assigned to each staff member'],
     clientAccounts: ['Client Accounts', 'Manage subscriptions for every business on the platform'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
