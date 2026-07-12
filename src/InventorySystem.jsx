@@ -2452,7 +2452,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'barcodes' && (
-          <BarcodesView items={myOwnItems} categories={categories} />
+          <BarcodesView items={myOwnItems} categories={categories} canBackfill={can(myRole, 'editInventory')} />
         )}
 
         {view === 'staffInventory' && (
@@ -3845,26 +3845,36 @@ function BarcodeLabel({ item, showPrice = true }) {
   );
 }
 
-function BarcodesView({ items, categories }) {
+function BarcodesView({ items, categories, canBackfill }) {
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All');
   const [selected, setSelected] = useState(() => new Set());
   const [includePrice, setIncludePrice] = useState(true);
   const [printBatch, setPrintBatch] = useState(null);
 
-  // Backfilled items (created before this feature existed) won't have a
-  // barcode yet - they'll get one automatically next time they're edited
-  // and saved, same as any brand-new item.
-  const barcoded = useMemo(() => items.filter((it) => it.barcode), [items]);
+  // Items created before this feature existed won't have a `barcode` yet.
+  // saveItem() only assigns one the next time each item is individually
+  // edited, which would otherwise leave this whole page looking empty for
+  // any pre-existing inventory - so back-fill any missing ones right away
+  // instead of waiting on that. Self-terminating: once an item's barcode
+  // is written, it no longer shows up in `missing` on the next pass.
+  useEffect(() => {
+    if (!canBackfill) return;
+    const missing = items.filter((it) => !it.barcode);
+    if (missing.length === 0) return;
+    missing.forEach((it) => {
+      setDoc(doc(db, 'items', it.id), { barcode: generateBarcodeValue() }, { merge: true }).catch(() => {});
+    });
+  }, [items, canBackfill]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return barcoded.filter((it) => {
+    return items.filter((it) => {
       const matchesSearch = !q || it.name.toLowerCase().includes(q) || (it.sku || '').toLowerCase().includes(q);
       const matchesCat = categoryFilter === 'All' || it.category === categoryFilter;
       return matchesSearch && matchesCat;
     });
-  }, [barcoded, search, categoryFilter]);
+  }, [items, search, categoryFilter]);
 
   const allSelected = filtered.length > 0 && filtered.every((it) => selected.has(it.id));
 
@@ -3889,7 +3899,7 @@ function BarcodesView({ items, categories }) {
     });
   };
 
-  const selectedItems = useMemo(() => barcoded.filter((it) => selected.has(it.id)), [barcoded, selected]);
+  const selectedItems = useMemo(() => items.filter((it) => selected.has(it.id)), [items, selected]);
 
   useEffect(() => {
     const clear = () => setPrintBatch(null);
@@ -4001,8 +4011,8 @@ function BarcodesView({ items, categories }) {
 
       {filtered.length === 0 ? (
         <div className="depot-no-print" style={{ textAlign: 'center', padding: '60px 0', color: 'rgba(59,42,31,0.45)', fontSize: 13.5 }}>
-          {barcoded.length === 0
-            ? 'No barcoded items yet — barcodes are generated automatically the next time each item is added or edited.'
+          {items.length === 0
+            ? 'No inventory items yet — add some from the Inventory tab first.'
             : 'No items match your search/filter.'}
         </div>
       ) : (
