@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { auth, db } from './firebase';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import JsBarcode from 'jsbarcode';
 import { initializeApp, deleteApp } from 'firebase/app';
 import {
   onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth,
@@ -17,7 +18,8 @@ import {
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
   Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2,
-  Wrench, Hammer, Ruler, PaintBucket, SprayCan, Droplet, Sparkles, FlaskConical, ShoppingBag, Shirt, Gem, Footprints
+  Wrench, Hammer, Ruler, PaintBucket, SprayCan, Droplet, Sparkles, FlaskConical, ShoppingBag, Shirt, Gem, Footprints,
+  Barcode, ScanLine, Bluetooth, CheckSquare, Square
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -756,6 +758,7 @@ const VIEW_PERMISSIONS = {
   overview: null,
   pos: 'pos',
   inventory: 'viewInventory',
+  barcodes: 'viewInventory',
   staffInventory: 'editInventory',
   clientAccounts: 'manageSystem',
   suppliers: 'manageSuppliers',
@@ -791,6 +794,60 @@ function resolveRole(profile) {
 // needing a server-side counter.
 function generateUserIdNumber() {
   return 'U-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 5).toUpperCase();
+}
+
+// Auto-generated item barcode: a purely numeric string (Date.now() plus a
+// few random digits) so it renders cleanly as a Code128 barcode and reads
+// like a normal product barcode, rather than reusing the SKU (which staff
+// may type in non-barcode-friendly formats). Timestamp-based, same
+// collision-avoidance reasoning as generateUserIdNumber() above.
+function generateBarcodeValue() {
+  return Date.now().toString() + Math.floor(100 + Math.random() * 900).toString();
+}
+
+// Bluetooth (and USB) barcode scanners almost universally pair as an
+// ordinary HID keyboard once connected in the OS's Bluetooth settings -
+// there's no special pairing code or Web Bluetooth API needed here. Once
+// paired, a scan just "types" the barcode's characters into the page very
+// fast (a few milliseconds apart) followed by Enter, indistinguishable
+// from a keyboard except for that speed. This hook buffers keydowns and
+// only treats a burst as a scan if every character arrived faster than a
+// human could type, so normal typing elsewhere on the same screen is left
+// alone. `enabled` should be scoped to screens that expect scans (POS,
+// receiving, item lookup) rather than left on globally.
+function useBarcodeScanner(onScan, enabled = true) {
+  useEffect(() => {
+    if (!enabled) return;
+    let buffer = '';
+    let lastTime = 0;
+    const SCAN_CHAR_GAP_MS = 40;
+    const MIN_LENGTH = 4;
+    const handleKeyDown = (e) => {
+      const now = Date.now();
+      if (e.key === 'Enter') {
+        if (buffer.length >= MIN_LENGTH) onScan(buffer);
+        buffer = '';
+        return;
+      }
+      if (e.key.length !== 1) return; // ignore Shift, Tab, arrows, F-keys, etc.
+      if (now - lastTime > SCAN_CHAR_GAP_MS) buffer = ''; // gap too long: human typing, restart
+      buffer += e.key;
+      lastTime = now;
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onScan, enabled]);
+}
+
+// Looks up an item by scanned barcode (falling back to SKU, since some
+// tenants may print/scan their own SKU-based labels from before this
+// feature existed) - shared by every scan-to-find flow in the app.
+function findItemByScan(items, code) {
+  const trimmed = (code || '').trim();
+  if (!trimmed) return null;
+  return items.find((it) => it.barcode === trimmed)
+    || items.find((it) => (it.sku || '').toUpperCase() === trimmed.toUpperCase())
+    || null;
 }
 
 // Staff log in with their Inventory ID + password only - no real email.
@@ -1601,8 +1658,11 @@ export default function InventorySystem() {
     const { percent: markupValue } = computeMarkupFromPrices(unitCost, sellingPrice);
     const markupType = 'percent';
     const previous = isNew ? null : items.find((i) => i.id === id);
+    // Auto-assign a barcode the first time an item is created; preserved
+    // as-is on every later edit (never regenerated for an existing item).
+    const barcode = isNew ? (draft.barcode || generateBarcodeValue()) : (draft.barcode || previous?.barcode || generateBarcodeValue());
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -1679,7 +1739,7 @@ export default function InventorySystem() {
           const markupValue = 0;
           await setDoc(doc(db, 'items', staffItemId), {
             id: staffItemId, ownerId, holderId: staffUid, sourceItemId: source.id,
-            sku: source.sku, name: source.name, category: source.category,
+            sku: source.sku, name: source.name, category: source.category, barcode: source.barcode || generateBarcodeValue(),
             quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
             location: source.location, supplierIds: getSupplierIds(source),
             markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
@@ -2246,6 +2306,22 @@ export default function InventorySystem() {
 
   const supplierMap = useMemo(() => Object.fromEntries(suppliers.map((s) => [s.id, s])), [suppliers]);
 
+  // Global scanner support for stock receiving / stock counting / general
+  // inventory updates: while browsing Inventory or Staff Inventory, a scan
+  // jumps straight to that item's Receive/Issue movement modal instead of
+  // requiring it to be found and clicked manually first. (POS has its own
+  // scanner hook, scoped to adding items to the current sale instead.)
+  const inventoryScanEnabled = view === 'inventory' || view === 'staffInventory';
+  const handleInventoryScan = (code) => {
+    const found = findItemByScan(items, code);
+    if (found) {
+      setMoveModal(found);
+    } else {
+      showToast(`No item matches scanned barcode ${code}`);
+    }
+  };
+  useBarcodeScanner(handleInventoryScan, inventoryScanEnabled);
+
   if (!authChecked) {
     return (
       <div style={{ ...styles.wrap, alignItems: 'center', justifyContent: 'center', display: 'flex' }}>
@@ -2322,6 +2398,8 @@ export default function InventorySystem() {
           .depot-main { padding: 0 !important; overflow: visible !important; }
           .depot-print-title { display: block !important; }
           body { background: #fff !important; }
+          .barcode-print-only { display: block !important; }
+          .barcode-browse-grid { display: none !important; }
         }
       `}</style>
 
@@ -2371,6 +2449,10 @@ export default function InventorySystem() {
             onEditMarkup={(it) => setMarkupModal(it)}
             onReturn={(it) => setReturnModal(it)}
           />
+        )}
+
+        {view === 'barcodes' && (
+          <BarcodesView items={myOwnItems} categories={categories} />
         )}
 
         {view === 'staffInventory' && (
@@ -3280,6 +3362,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
     { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
     { type: 'group', label: 'Stock Management', icon: Boxes, children: [
       { key: 'inventory', label: 'Inventory', icon: Boxes },
+      { key: 'barcodes', label: 'Barcodes', icon: Barcode },
       { key: 'staffInventory', label: 'Staff Inventory', icon: User },
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
       { key: 'orders', label: 'Orders', icon: ClipboardList },
@@ -3719,6 +3802,231 @@ function Overview({ totals, categoryData, profitStats, staffInventoryStats, role
             )}
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+// Renders one scannable barcode + item name + SKU + optional price, as a
+// small canvas-based label. Used both in the on-screen browse grid and
+// (via the same component) in the hidden print-only sheet.
+function BarcodeLabel({ item, showPrice = true }) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    if (!canvasRef.current || !item?.barcode) return;
+    try {
+      JsBarcode(canvasRef.current, item.barcode, {
+        format: 'CODE128', width: 1.6, height: 42, displayValue: false, margin: 0,
+        background: '#ffffff', lineColor: '#111111',
+      });
+    } catch (e) {
+      // Non-barcode-safe characters somehow ended up in item.barcode -
+      // leave the canvas blank rather than crashing the whole page.
+    }
+  }, [item?.barcode]);
+  return (
+    <div className="barcode-label" style={{
+      display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+      padding: '10px 12px', border: '1px solid #ddd', borderRadius: 4, background: '#fff', width: 180,
+      breakInside: 'avoid',
+    }}>
+      <div style={{
+        fontSize: 11, fontWeight: 700, textAlign: 'center', color: '#111', width: '100%',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      }}>
+        {item.name}
+      </div>
+      <canvas ref={canvasRef} style={{ maxWidth: '100%' }} />
+      <div style={{ fontSize: 10, color: '#333', letterSpacing: '0.03em', fontFamily: "'IBM Plex Mono', monospace" }}>{item.sku}</div>
+      {showPrice && (
+        <div style={{ fontSize: 12, fontWeight: 700, color: '#111' }}>{currency(item.sellingPrice ?? item.unitCost ?? 0)}</div>
+      )}
+    </div>
+  );
+}
+
+function BarcodesView({ items, categories }) {
+  const [search, setSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('All');
+  const [selected, setSelected] = useState(() => new Set());
+  const [includePrice, setIncludePrice] = useState(true);
+  const [printBatch, setPrintBatch] = useState(null);
+
+  // Backfilled items (created before this feature existed) won't have a
+  // barcode yet - they'll get one automatically next time they're edited
+  // and saved, same as any brand-new item.
+  const barcoded = useMemo(() => items.filter((it) => it.barcode), [items]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return barcoded.filter((it) => {
+      const matchesSearch = !q || it.name.toLowerCase().includes(q) || (it.sku || '').toLowerCase().includes(q);
+      const matchesCat = categoryFilter === 'All' || it.category === categoryFilter;
+      return matchesSearch && matchesCat;
+    });
+  }, [barcoded, search, categoryFilter]);
+
+  const allSelected = filtered.length > 0 && filtered.every((it) => selected.has(it.id));
+
+  const toggleOne = (id) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelected((prev) => {
+      if (allSelected) {
+        const next = new Set(prev);
+        filtered.forEach((it) => next.delete(it.id));
+        return next;
+      }
+      const next = new Set(prev);
+      filtered.forEach((it) => next.add(it.id));
+      return next;
+    });
+  };
+
+  const selectedItems = useMemo(() => barcoded.filter((it) => selected.has(it.id)), [barcoded, selected]);
+
+  useEffect(() => {
+    const clear = () => setPrintBatch(null);
+    window.addEventListener('afterprint', clear);
+    return () => window.removeEventListener('afterprint', clear);
+  }, []);
+
+  const triggerPrint = (list) => {
+    if (list.length === 0) return;
+    setPrintBatch(list);
+    setTimeout(() => window.print(), 60);
+  };
+
+  const downloadPDF = (list) => {
+    if (list.length === 0) return;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+    const pageW = 210, pageH = 297;
+    const marginX = 10, marginY = 12;
+    const labelW = 60, labelH = 32, gapX = 4, gapY = 4;
+    const cols = Math.max(1, Math.floor((pageW - marginX * 2 + gapX) / (labelW + gapX)));
+    let col = 0, x = marginX, y = marginY;
+
+    list.forEach((it) => {
+      const canvas = document.createElement('canvas');
+      let imgData = null;
+      try {
+        JsBarcode(canvas, it.barcode, { format: 'CODE128', width: 2, height: 40, displayValue: false, margin: 0 });
+        imgData = canvas.toDataURL('image/png');
+      } catch (e) { /* skip an unrenderable barcode rather than aborting the whole PDF */ }
+
+      if (y + labelH > pageH - marginY) {
+        doc.addPage();
+        col = 0; x = marginX; y = marginY;
+      }
+
+      doc.setDrawColor(210);
+      doc.rect(x, y, labelW, labelH);
+      doc.setFont(undefined, 'bold');
+      doc.setFontSize(8);
+      const name = (it.name || '').length > 28 ? it.name.slice(0, 27) + '…' : (it.name || '');
+      doc.text(name, x + labelW / 2, y + 5.5, { align: 'center' });
+
+      if (imgData) doc.addImage(imgData, 'PNG', x + 5, y + 8, labelW - 10, 12);
+
+      doc.setFont(undefined, 'normal');
+      doc.setFontSize(7.5);
+      doc.text(it.sku || '', x + labelW / 2, y + 23.5, { align: 'center' });
+
+      if (includePrice) {
+        doc.setFont(undefined, 'bold');
+        doc.setFontSize(9.5);
+        doc.text(currency(it.sellingPrice ?? it.unitCost ?? 0), x + labelW / 2, y + 29, { align: 'center' });
+      }
+
+      col++;
+      if (col >= cols) { col = 0; x = marginX; y += labelH + gapY; }
+      else { x += labelW + gapX; }
+    });
+
+    doc.save(`stock-it-barcodes-${Date.now()}.pdf`);
+  };
+
+  return (
+    <div>
+      <div className="depot-no-print depot-filterbar" style={{ ...styles.filterBar, flexWrap: 'wrap', gap: 10 }}>
+        <div style={{ position: 'relative', flex: '1 1 220px' }}>
+          <Search size={14} style={{ position: 'absolute', left: 10, top: 10, color: 'rgba(59,42,31,0.4)' }} />
+          <input
+            className="depot-input" placeholder="Search by item name or SKU..."
+            style={{ ...styles.modalInput, paddingLeft: 30, width: '100%' }}
+            value={search} onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+        <select className="depot-select" style={{ ...styles.modalInput, width: 170 }}
+          value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+          <option value="All">All Categories</option>
+          {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, color: 'var(--ink)', cursor: 'pointer' }}>
+          <input type="checkbox" checked={includePrice} onChange={(e) => setIncludePrice(e.target.checked)} />
+          Show Selling Price
+        </label>
+      </div>
+
+      <div className="depot-no-print depot-filterbar" style={{ ...styles.filterBar, gap: 10 }}>
+        <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6 }} onClick={toggleAll}>
+          {allSelected ? <CheckSquare size={15} /> : <Square size={15} />}
+          {allSelected ? 'Unselect All' : 'Select All'} ({filtered.length})
+        </button>
+        <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>{selected.size} selected</div>
+        <div style={{ flex: 1 }} />
+        <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: selectedItems.length ? 1 : 0.4 }}
+          disabled={!selectedItems.length} onClick={() => triggerPrint(selectedItems)}>
+          <Printer size={14} /> Print Selected
+        </button>
+        <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: selectedItems.length ? 1 : 0.4 }}
+          disabled={!selectedItems.length} onClick={() => downloadPDF(selectedItems)}>
+          <Download size={14} /> Download Selected
+        </button>
+        <button className="depot-btn" style={{ ...styles.primaryBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: filtered.length ? 1 : 0.4 }}
+          disabled={!filtered.length} onClick={() => triggerPrint(filtered)}>
+          <Printer size={14} /> Print All
+        </button>
+        <button className="depot-btn" style={{ ...styles.primaryBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: filtered.length ? 1 : 0.4 }}
+          disabled={!filtered.length} onClick={() => downloadPDF(filtered)}>
+          <Download size={14} /> Download All
+        </button>
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="depot-no-print" style={{ textAlign: 'center', padding: '60px 0', color: 'rgba(59,42,31,0.45)', fontSize: 13.5 }}>
+          {barcoded.length === 0
+            ? 'No barcoded items yet — barcodes are generated automatically the next time each item is added or edited.'
+            : 'No items match your search/filter.'}
+        </div>
+      ) : (
+        <div className="barcode-browse-grid" style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 4 }}>
+          {filtered.map((it) => (
+            <div key={it.id} style={{ position: 'relative' }}>
+              <label style={{
+                position: 'absolute', top: 6, left: 6, zIndex: 2, background: 'rgba(255,255,255,0.9)',
+                borderRadius: 4, padding: 2, display: 'flex', cursor: 'pointer',
+              }}>
+                <input type="checkbox" checked={selected.has(it.id)} onChange={() => toggleOne(it.id)} />
+              </label>
+              <BarcodeLabel item={it} showPrice={includePrice} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {printBatch && (
+        <div className="barcode-print-only" style={{ display: 'none' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+            {printBatch.map((it) => <BarcodeLabel key={it.id} item={it} showPrice={includePrice} />)}
+          </div>
+        </div>
       )}
     </div>
   );
@@ -4796,6 +5104,28 @@ function POSView({ items, onCompleteSale }) {
 
   const removeLine = (itemId) => setCart((prev) => prev.filter((l) => l.itemId !== itemId));
 
+  // Bluetooth/USB scanner support: a scan is treated exactly like tapping
+  // the matching item card. Works regardless of what's focused on screen,
+  // so cashiers can scan items in quick succession without clicking back
+  // into a search box between each one.
+  const [scanMsg, setScanMsg] = useState(null);
+  useEffect(() => {
+    if (!scanMsg) return;
+    const t = setTimeout(() => setScanMsg(null), 2200);
+    return () => clearTimeout(t);
+  }, [scanMsg]);
+
+  const handleScan = (code) => {
+    const found = findItemByScan(sellable, code);
+    if (found) {
+      addToCart(found);
+      setScanMsg({ ok: true, text: `Scanned: ${found.name}` });
+    } else {
+      setScanMsg({ ok: false, text: `No item matches barcode ${code}` });
+    }
+  };
+  useBarcodeScanner(handleScan, true);
+
   const subtotal = cart.reduce((s, l) => s + priceOf(itemMap[l.itemId] || {}) * l.qty, 0);
   const total = subtotal;
 
@@ -4827,7 +5157,20 @@ function POSView({ items, onCompleteSale }) {
             onChange={(e) => setSearch(e.target.value)}
             style={styles.searchInput}
           />
+          <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'rgba(59,42,31,0.4)', whiteSpace: 'nowrap', paddingRight: 4 }} title="A paired Bluetooth or USB barcode scanner will add items automatically">
+            <Bluetooth size={13} /> Scanner ready
+          </span>
         </div>
+        {scanMsg && (
+          <div style={{
+            marginTop: 8, padding: '7px 12px', borderRadius: 6, fontSize: 12.5, fontWeight: 600,
+            background: scanMsg.ok ? 'rgba(79,138,99,0.12)' : 'rgba(193,80,58,0.12)',
+            color: scanMsg.ok ? 'var(--green)' : 'var(--red)',
+            display: 'flex', alignItems: 'center', gap: 6, animation: 'fadeIn 0.15s ease',
+          }}>
+            <ScanLine size={14} /> {scanMsg.text}
+          </div>
+        )}
         <div style={styles.posGrid} className="depot-pos-grid">
           {filtered.length === 0 && (
             <div style={styles.emptyState}>No sellable items match your search.</div>
@@ -6110,6 +6453,14 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
           <Field label="SKU">
             <input className="depot-input" style={styles.modalInput} value={form.sku}
               onChange={(e) => setForm({ ...form, sku: e.target.value.toUpperCase() })} placeholder="RM-1000" />
+          </Field>
+          <Field label="Barcode">
+            <div style={{
+              ...styles.modalInput, display: 'flex', alignItems: 'center', color: 'rgba(59,42,31,0.6)',
+              fontFamily: "'IBM Plex Mono', 'Courier New', monospace", letterSpacing: '0.04em', fontSize: 12.5,
+            }}>
+              {form.barcode || draft?.barcode || 'Generated automatically when you save'}
+            </div>
           </Field>
           <Field label="Item Name">
             <input className="depot-input" style={styles.modalInput} value={form.name}
