@@ -1,0 +1,13 @@
+# Force Git to treat these as binary and never touch line endings in them,
+# regardless of autocrlf settings. Without this, Git's binary-detection
+# heuristic can occasionally misfire on some binary formats and silently
+# corrupt them via LF/CRLF conversion.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
