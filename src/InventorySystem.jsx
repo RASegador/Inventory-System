@@ -74,6 +74,9 @@ const RESPONSIVE_CSS = `
     .depot-card-grid { grid-template-columns: repeat(2, 1fr) !important; }
     .depot-pos-layout { grid-template-columns: 1fr !important; }
     .depot-pos-layout .depot-cart-panel { position: static !important; }
+    .depot-filterbar { flex-wrap: wrap !important; }
+    .depot-barcode-toolbar { align-items: stretch !important; }
+    .depot-barcode-toolbar .depot-btn { flex: 1 1 calc(50% - 5px) !important; min-width: 0 !important; justify-content: center !important; padding: 10px 8px !important; }
   }
 
   /* Phones */
@@ -803,6 +806,33 @@ function generateUserIdNumber() {
 // collision-avoidance reasoning as generateUserIdNumber() above.
 function generateBarcodeValue() {
   return Date.now().toString() + Math.floor(100 + Math.random() * 900).toString();
+}
+
+// Auto-generated SKU: a 3-letter prefix from the item name (e.g. "Motor
+// Oil" -> "MOT") plus a 6-digit sequential number, formatted like
+// MOT-000001, BRK-000245, PIN-001023. The number is the highest existing
+// suffix for that same prefix (within this tenant's own items) plus one,
+// so SKUs read as a clean running sequence per product family rather than
+// a timestamp. Purely a starting suggestion - staff can always edit it.
+function generateSkuFromName(name, existingItems) {
+  const letters = (name || '').replace(/[^A-Za-z]/g, '').toUpperCase();
+  const prefix = (letters.slice(0, 3) || 'ITM').padEnd(3, 'X');
+  const usedNumbers = (existingItems || [])
+    .map((it) => (it.sku || '').split('-'))
+    .filter((parts) => parts.length === 2 && parts[0] === prefix)
+    .map((parts) => parseInt(parts[1], 10))
+    .filter((n) => !isNaN(n));
+  const next = (usedNumbers.length ? Math.max(...usedNumbers) : 0) + 1;
+  return `${prefix}-${String(next).padStart(6, '0')}`;
+}
+
+// True if another item in this tenant's own inventory already uses this
+// exact SKU (case-insensitive) - `excludeId` skips the item being edited
+// so re-saving it unchanged doesn't flag itself as a duplicate.
+function isDuplicateSku(sku, existingItems, excludeId) {
+  const normalized = (sku || '').trim().toUpperCase();
+  if (!normalized) return false;
+  return (existingItems || []).some((it) => it.id !== excludeId && (it.sku || '').trim().toUpperCase() === normalized);
 }
 
 // Bluetooth (and USB) barcode scanners almost universally pair as an
@@ -2000,7 +2030,7 @@ export default function InventorySystem() {
     setMoveModal(null);
   };
 
-  const completeSale = async (cartLines) => {
+  const completeSale = async (cartLines, amountReceived) => {
     if (cartLines.length === 0) return;
     for (const line of cartLines) {
       const item = items.find((i) => i.id === line.itemId);
@@ -2027,9 +2057,16 @@ export default function InventorySystem() {
     const totalCost = saleLines.reduce((s, l) => s + l.unitCost * l.qty, 0);
     const totalProfit = saleLines.reduce((s, l) => s + l.lineProfit, 0);
     const total = subtotal;
+    // Bill (amount received) is optional at the data layer, even though the
+    // POS UI requires it before allowing checkout - keeps this function
+    // safe to call from anywhere else in the future without a hard
+    // dependency on cash-handling fields.
+    const received = amountReceived != null && amountReceived !== '' ? Number(amountReceived) : null;
+    const change = received != null ? Math.max(0, received - total) : null;
     const sale = {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
-      subtotal, total, totalCost, totalProfit, cashierId: user.uid, cashierEmail: user.email || '', cashierUsername: myProfile?.username || '', ownerId,
+      subtotal, total, totalCost, totalProfit, amountReceived: received, change,
+      cashierId: user.uid, cashierEmail: user.email || '', cashierUsername: myProfile?.username || '', ownerId,
     };
 
     try {
@@ -2590,6 +2627,7 @@ export default function InventorySystem() {
           suppliers={suppliers}
           categories={categories}
           locations={locations}
+          items={myOwnItems}
           onClose={() => setItemModal(null)}
           onSave={saveItem}
         />
@@ -3985,7 +4023,7 @@ function BarcodesView({ items, categories, canBackfill }) {
         </label>
       </div>
 
-      <div className="depot-no-print depot-filterbar" style={{ ...styles.filterBar, gap: 10 }}>
+      <div className="depot-no-print depot-filterbar depot-barcode-toolbar" style={{ ...styles.filterBar, gap: 10, flexWrap: 'wrap' }}>
         <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6 }} onClick={toggleAll}>
           {allSelected ? <CheckSquare size={15} /> : <Square size={15} />}
           {allSelected ? 'Unselect All' : 'Select All'} ({filtered.length})
@@ -5080,6 +5118,7 @@ function POSView({ items, onCompleteSale }) {
   const [cart, setCart] = useState([]); // [{itemId, qty}]
   const [lastReceipt, setLastReceipt] = useState(null);
   const [confirming, setConfirming] = useState(false);
+  const [amountReceived, setAmountReceived] = useState('');
 
   const sellable = useMemo(() => items.filter((it) => it.quantity > 0), [items]);
   const filtered = useMemo(() => {
@@ -5139,16 +5178,20 @@ function POSView({ items, onCompleteSale }) {
 
   const subtotal = cart.reduce((s, l) => s + priceOf(itemMap[l.itemId] || {}) * l.qty, 0);
   const total = subtotal;
+  const receivedNum = amountReceived === '' ? null : Number(amountReceived);
+  const change = receivedNum != null ? receivedNum - total : null;
+  const billValid = receivedNum != null && receivedNum >= total;
 
   const [busy, setBusy] = useState(false);
 
   const checkout = async () => {
     setBusy(true);
     try {
-      const sale = await onCompleteSale(cart);
+      const sale = await onCompleteSale(cart, amountReceived);
       if (sale) {
         setLastReceipt(sale);
         setCart([]);
+        setAmountReceived('');
       }
     } finally {
       setBusy(false);
@@ -5238,8 +5281,29 @@ function POSView({ items, onCompleteSale }) {
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(total)}</span></div>
         </div>
 
-        <button className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 12, opacity: cart.length && !busy ? 1 : 0.45 }}
-          disabled={!cart.length || busy} onClick={() => setConfirming(true)}>
+        {cart.length > 0 && (
+          <div style={{ marginTop: 10 }}>
+            <Field label="Bill (Amount Received)">
+              <input
+                className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
+                placeholder="0.00" value={amountReceived}
+                onChange={(e) => setAmountReceived(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+              />
+            </Field>
+            {receivedNum != null && (
+              <div style={{
+                ...styles.cartTotalsRow, fontWeight: 700,
+                color: billValid ? 'var(--green)' : 'var(--red)',
+              }}>
+                <span>{billValid ? 'Change' : 'Insufficient — short by'}</span>
+                <span>{currency(Math.abs(change))}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        <button className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 12, opacity: cart.length && billValid && !busy ? 1 : 0.45 }}
+          disabled={!cart.length || !billValid || busy} onClick={() => setConfirming(true)}>
           <Receipt size={16} /> Confirm Sale
         </button>
       </div>
@@ -5247,7 +5311,7 @@ function POSView({ items, onCompleteSale }) {
       {confirming && (
         <ConfirmModal
           title="CONFIRM SALE"
-          message={<>Are you sure you want to complete this sale for <strong>{currency(total)}</strong>? This will deduct the sold quantities from stock.</>}
+          message={<>Are you sure you want to complete this sale for <strong>{currency(total)}</strong>? Bill: <strong>{currency(receivedNum)}</strong>, Change: <strong>{currency(change)}</strong>. This will deduct the sold quantities from stock.</>}
           onCancel={() => setConfirming(false)}
           onConfirm={checkout}
           confirmLabel={busy ? 'Processing…' : 'Confirm Sale'}
@@ -5344,6 +5408,32 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
           />
         </div>
         <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
+        {[
+          { label: 'Today', days: 0 },
+          { label: 'This Week', days: 7 },
+          { label: 'This Month', days: 30 },
+          { label: 'This Year', days: 365 },
+          { label: 'All Time', days: null },
+        ].map((preset) => (
+          <button
+            key={preset.label}
+            className="depot-btn"
+            style={{ ...styles.ghostBtn, padding: '6px 12px', fontSize: 12 }}
+            onClick={() => {
+              if (preset.days === null) { setDateFrom(''); setDateTo(''); return; }
+              const to = new Date();
+              const from = new Date();
+              if (preset.days === 0) { from.setHours(0, 0, 0, 0); } else { from.setDate(from.getDate() - preset.days); }
+              setDateFrom(timestampToDateInputValue(from.getTime()));
+              setDateTo(timestampToDateInputValue(to.getTime()));
+            }}
+          >
+            {preset.label}
+          </button>
+        ))}
       </div>
 
       <div style={styles.statGrid} className="depot-stat-grid">
@@ -6429,7 +6519,9 @@ function IconBtn({ children, onClick, title, danger, className }) {
   );
 }
 
-function ItemModal({ draft, suppliers, categories, locations, onClose, onSave }) {
+function ItemModal({ draft, suppliers, categories, locations, items, onClose, onSave }) {
+  const isNew = !draft;
+  const [skuTouched, setSkuTouched] = useState(!isNew); // existing items keep their SKU as-is until edited
   const [form, setForm] = useState(() => {
     if (!draft) {
       return {
@@ -6443,7 +6535,19 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
       sellingPrice: draft.sellingPrice ?? draft.unitCost ?? 0,
     };
   });
-  const valid = form.sku.trim() && form.name.trim();
+
+  // Live SKU assignment: as the item name is typed, the SKU suggestion
+  // updates to match it (MOT-000001 style) - only for new items, and only
+  // until the person edits the SKU field themselves, at which point we
+  // assume they want to keep whatever they typed there.
+  useEffect(() => {
+    if (!isNew || skuTouched) return;
+    setForm((f) => ({ ...f, sku: generateSkuFromName(f.name, items) }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.name, isNew, skuTouched]);
+
+  const duplicateSku = isDuplicateSku(form.sku, items, draft?.id);
+  const valid = form.sku.trim() && form.name.trim() && !duplicateSku;
   const markup = computeMarkupFromPrices(form.unitCost, form.sellingPrice);
   const toggleSupplier = (sid) => {
     setForm({
@@ -6461,9 +6565,18 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
           <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
         </div>
         <div style={styles.modalBody}>
+          <Field label="Item Name">
+            <input className="depot-input" style={styles.modalInput} value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Steel Sheet 4x8" autoFocus />
+          </Field>
           <Field label="SKU">
-            <input className="depot-input" style={styles.modalInput} value={form.sku}
-              onChange={(e) => setForm({ ...form, sku: e.target.value.toUpperCase() })} placeholder="RM-1000" />
+            <input className="depot-input" style={{ ...styles.modalInput, borderColor: duplicateSku ? 'var(--red)' : undefined }} value={form.sku}
+              onChange={(e) => { setSkuTouched(true); setForm({ ...form, sku: e.target.value.toUpperCase() }); }} placeholder="RM-1000" />
+            {duplicateSku ? (
+              <div style={{ fontSize: 11, color: 'var(--red)', marginTop: 4 }}>This SKU is already used by another item — choose a different one.</div>
+            ) : isNew && !skuTouched ? (
+              <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Auto-filled from the item name — edit it directly to set your own.</div>
+            ) : null}
           </Field>
           <Field label="Barcode">
             <div style={{
@@ -6472,10 +6585,6 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
             }}>
               {form.barcode || draft?.barcode || 'Generated automatically when you save'}
             </div>
-          </Field>
-          <Field label="Item Name">
-            <input className="depot-input" style={styles.modalInput} value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Steel Sheet 4x8" />
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Category" grow>
@@ -6961,6 +7070,12 @@ function SaleReceiptModal({ sale, onClose }) {
 
           <div style={styles.cartTotalsRow}><span>Subtotal</span><span>{currency(sale.subtotal)}</span></div>
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(sale.total)}</span></div>
+          {sale.amountReceived != null && (
+            <>
+              <div style={styles.cartTotalsRow}><span>Bill</span><span>{currency(sale.amountReceived)}</span></div>
+              <div style={{ ...styles.cartTotalsRow, fontWeight: 700, color: 'var(--green)' }}><span>Change</span><span>{currency(sale.change)}</span></div>
+            </>
+          )}
           <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.55)', marginTop: 10 }}>
             {sale.paymentMethod ? `Paid via ${sale.paymentMethod}. ` : ''}Stock quantities have been updated.
           </div>
