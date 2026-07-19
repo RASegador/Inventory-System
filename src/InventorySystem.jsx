@@ -19,7 +19,7 @@ import {
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
   Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2, PackagePlus,
   Wrench, Hammer, Ruler, PaintBucket, SprayCan, Droplet, Sparkles, FlaskConical, ShoppingBag, Shirt, Gem, Footprints,
-  Barcode, ScanLine, Bluetooth, CheckSquare, Square
+  Barcode, ScanLine, Bluetooth, CheckSquare, Square, Store,
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -93,7 +93,7 @@ const RESPONSIVE_CSS = `
     .depot-filterbar { flex-direction: column !important; align-items: stretch !important; }
     .depot-filterbar > * { width: 100% !important; }
     .depot-export-bar { flex-wrap: wrap !important; justify-content: flex-start !important; }
-    .depot-modal { width: 94vw !important; max-width: 94vw !important; max-height: 88vh !important; overflow-y: auto !important; }
+    .depot-modal { width: 94vw !important; max-width: 94vw !important; max-height: 90vh !important; }
     .depot-modal-body-row { flex-direction: column !important; }
     .depot-pos-grid { grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)) !important; max-height: 340px !important; }
     .depot-table th, .depot-table td { padding: 8px 8px !important; font-size: 12px !important; }
@@ -213,7 +213,7 @@ const seedItems = () => [];
 const seedMovements = (items) => ([]);
 
 function currency(n) {
-  return n.toLocaleString('en-PH', { style: 'currency', currency: 'PHP' });
+  return (Number(n) || 0).toLocaleString('en-PH', { style: 'currency', currency: 'PHP' });
 }
 
 function timeAgo(ts) {
@@ -468,9 +468,17 @@ const UNIT_PRESETS = ['Piece', 'Pack', 'Box/Case'];
 
 // Every sellable unit for an item, base unit first (factor 1, using the
 // item's own sellingPrice) followed by whatever extra units were defined.
+// Each unit carries its OWN cost (not just base cost x factor) - a Pack
+// may genuinely cost less per piece than buying loose, so cost is set
+// independently per unit rather than always derived. Items that predate
+// this fall back to base cost x factor, same number they'd have gotten
+// before this existed.
 function getItemUnits(item) {
-  const base = { name: item.baseUnitName || 'Piece', factor: 1, price: item.sellingPrice ?? item.unitCost ?? 0, isBase: true };
-  const extra = (item.units || []).map((u) => ({ ...u, isBase: false }));
+  const base = { name: item.baseUnitName || 'Piece', factor: 1, cost: item.unitCost ?? 0, price: item.sellingPrice ?? item.unitCost ?? 0, isBase: true };
+  const extra = (item.units || []).map((u) => ({
+    ...u, isBase: false,
+    cost: u.cost ?? (item.unitCost ?? 0) * (u.factor || 1),
+  }));
   return [base, ...extra];
 }
 
@@ -853,6 +861,7 @@ const VIEW_PERMISSIONS = {
   locations: 'manageLocations',
   orders: 'manageOrders',
   restock: 'stockReceive',
+  shops: 'manageOrders',
   delivery: 'viewReports',
   sales: 'viewSalesReports',
   mysales: 'viewOwnSales',
@@ -1135,6 +1144,8 @@ export default function InventorySystem() {
   const [sales, setSales] = useState([]);
   const [orders, setOrders] = useState([]);
   const [restocks, setRestocks] = useState([]);
+  const [shops, setShops] = useState([]);
+  const [activeShopId, setActiveShopId] = useState(null);
   const [loginLogs, setLoginLogs] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState('overview');
@@ -1651,18 +1662,38 @@ export default function InventorySystem() {
             const moves = seedMovements(seed).map((m) => ({ ...m, id: 'm' + Math.random().toString(36).slice(2, 9) }));
             await Promise.all(moves.map((m) => setDoc(doc(db, 'movements', m.id), { ...m, ownerId })));
           }
-          const suppliersSnap = await getDocs(query(collection(db, 'suppliers'), where('ownerId', '==', ownerId)));
-          if (suppliersSnap.empty) {
-            const seedSup = seedSuppliers().map((s) => ({ ...s, id: 's' + Math.random().toString(36).slice(2, 9) }));
-            await Promise.all(seedSup.map((s) => setDoc(doc(db, 'suppliers', s.id), { ...s, ownerId })));
-          }
-          const catDoc = await getDoc(doc(db, 'config', categoriesDocId));
-          if (!catDoc.exists()) {
-            await setDoc(doc(db, 'config', categoriesDocId), { list: DEFAULT_CATEGORIES, ownerId });
-          }
-          const locDoc = await getDoc(doc(db, 'config', locationsDocId));
-          if (!locDoc.exists()) {
-            await setDoc(doc(db, 'config', locationsDocId), { list: DEFAULT_LOCATIONS, ownerId });
+          // No default suppliers, categories, or locations are seeded for
+          // new tenants any more - everything starts genuinely empty, and
+          // a Client Admin builds their own list from scratch.
+
+          // Multi-shop migration: runs once per tenant, the first time this
+          // feature is live for them. Every tenant needs at least one shop
+          // to function, and every item/sale/movement/order/restock/
+          // deliveryStatus doc that predates this feature needs a shopId
+          // so it isn't orphaned. Gated on a flag stored on the owner's own
+          // profile so it's skipped entirely (no extra reads) once done.
+          try {
+            const ownerProfileSnap = await getDoc(doc(db, 'users', ownerId));
+            const alreadyMigrated = ownerProfileSnap.exists() && ownerProfileSnap.data().multiShopMigrated;
+            if (!alreadyMigrated) {
+              const shopsSnap = await getDocs(query(collection(db, 'shops'), where('ownerId', '==', ownerId)));
+              let defaultShopId;
+              if (shopsSnap.empty) {
+                defaultShopId = 'shop' + Math.random().toString(36).slice(2, 9);
+                await setDoc(doc(db, 'shops', defaultShopId), { id: defaultShopId, name: 'My Shop', ownerId, createdAt: Date.now() });
+              } else {
+                defaultShopId = shopsSnap.docs[0].id;
+              }
+              const shopScopedCollections = ['items', 'sales', 'movements', 'orders', 'restocks', 'deliveryStatus'];
+              for (const collName of shopScopedCollections) {
+                const snap = await getDocs(query(collection(db, collName), where('ownerId', '==', ownerId)));
+                const toMigrate = snap.docs.filter((d) => !d.data().shopId);
+                await Promise.all(toMigrate.map((d) => setDoc(doc(db, collName, d.id), { shopId: defaultShopId }, { merge: true })));
+              }
+              await setDoc(doc(db, 'users', ownerId), { multiShopMigrated: true }, { merge: true });
+            }
+          } catch (e) {
+            console.error('Multi-shop migration error:', e);
           }
         }
       } catch (e) {
@@ -1685,10 +1716,10 @@ export default function InventorySystem() {
         setSuppliers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       }, logSnapErr('suppliers')));
       unsubs.push(onSnapshot(doc(db, 'config', categoriesDocId), (d) => {
-        setCategories(d.exists() ? (d.data().list || []) : DEFAULT_CATEGORIES.slice());
+        setCategories(d.exists() ? (d.data().list || []) : []);
       }, logSnapErr('categories')));
       unsubs.push(onSnapshot(doc(db, 'config', locationsDocId), (d) => {
-        setLocations(d.exists() ? (d.data().list || []) : DEFAULT_LOCATIONS.slice());
+        setLocations(d.exists() ? (d.data().list || []) : []);
       }, logSnapErr('locations')));
 
       // Report-like data: only managers (Client + Super Admin) can read these under
@@ -1717,6 +1748,20 @@ export default function InventorySystem() {
         unsubs.push(onSnapshot(query(collection(db, 'restocks'), where('ownerId', '==', ownerId)), (snap) => {
           setRestocks(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.receivedAt - a.receivedAt));
         }, logSnapErr('restocks')));
+        unsubs.push(onSnapshot(query(collection(db, 'shops'), where('ownerId', '==', ownerId)), (snap) => {
+          const list = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+          setShops(list);
+          // Pick an active shop the first time shops load: the user's own
+          // last-selected shop if it still exists, otherwise just the
+          // first one. Only sets it once (never overrides an active
+          // selection the user already made this session).
+          setActiveShopId((prev) => {
+            if (prev && list.some((s) => s.id === prev)) return prev;
+            const preferred = myProfile?.activeShopId;
+            if (preferred && list.some((s) => s.id === preferred)) return preferred;
+            return list[0]?.id || null;
+          });
+        }, logSnapErr('shops')));
         // Super Admin monitors login activity platform-wide; a Client only
         // sees activity for their own tenant (themselves + their staff).
         const logsQuery = myRole === 'superadmin'
@@ -1731,6 +1776,8 @@ export default function InventorySystem() {
         setLoginLogs([]);
         setOrders([]);
         setRestocks([]);
+        setShops([]);
+        setActiveShopId(null);
         // Staff only ever see their own sales - the query itself (not just the
         // rule) scopes this, so there's no risk of over-fetching then hiding.
         unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
@@ -1773,9 +1820,23 @@ export default function InventorySystem() {
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
     const baseUnitName = (draft.baseUnitName || 'Piece').trim() || 'Piece';
+    // Base Cost is genuinely optional - stored as null (not 0) when left
+    // blank, so it's clearly distinguished from "cost is actually zero"
+    // and so Markup correctly has nothing to calculate rather than
+    // showing a misleading "full price = markup" number anywhere else
+    // that reads this later.
+    const unitCost = draft.unitCost === '' || draft.unitCost == null ? null : Math.max(0, Number(draft.unitCost) || 0);
+    // Selling Price is required and typed directly; Markup is only ever a
+    // derived readout (Selling Price - Base Cost), never stored as its
+    // own field.
+    const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
     const units = (draft.units || [])
       .filter((u) => u.name && u.name.trim() && Number(u.factor) > 0)
-      .map((u) => ({ name: u.name.trim(), factor: Number(u.factor), price: Number(u.price) || 0 }));
+      .map((u) => ({
+        name: u.name.trim(), factor: Number(u.factor),
+        cost: u.cost === '' || u.cost == null ? null : Math.max(0, Number(u.cost) || 0),
+        price: Math.max(0, Number(u.price) || 0),
+      }));
     // The physical, discrete stock count at every unit level (e.g. 9 Packs
     // + 19 loose Pieces) is what actually gets stored and what POS
     // deduction cascades against - `quantity` below is just the derived
@@ -1787,17 +1848,20 @@ export default function InventorySystem() {
       const factor = name === baseUnitName ? 1 : (units.find((u) => u.name === name)?.factor || 1);
       return sum + count * factor;
     }, 0);
+    const defaultSellingUnit = draft.defaultSellingUnit && (draft.defaultSellingUnit === baseUnitName || units.some((u) => u.name === draft.defaultSellingUnit))
+      ? draft.defaultSellingUnit : baseUnitName;
     const reorderPoint = Math.max(0, Number(draft.reorderPoint) || 0);
-    const unitCost = Math.max(0, Number(draft.unitCost) || 0);
-    const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
-    const { percent: markupValue } = computeMarkupFromPrices(unitCost, sellingPrice);
+    const { percent: markupValue } = computeMarkupFromPrices(unitCost || 0, sellingPrice);
     const markupType = 'percent';
     const previous = isNew ? null : items.find((i) => i.id === id);
     // Auto-assign a barcode the first time an item is created; preserved
     // as-is on every later edit (never regenerated for an existing item).
     const barcode = isNew ? (draft.barcode || generateBarcodeValue()) : (draft.barcode || previous?.barcode || generateBarcodeValue());
+    // New items belong to whichever shop is currently active; editing an
+    // existing item never changes which shop it belongs to.
+    const shopId = isNew ? (draft.shopId || activeShopId) : (previous?.shopId ?? draft.shopId ?? activeShopId);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock, shopId, defaultSellingUnit });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -1885,18 +1949,19 @@ export default function InventorySystem() {
             quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
             location: source.location, supplierIds: getSupplierIds(source),
             markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
+            shopId: source.shopId || null,
           });
         }
 
         const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvOut), {
           id: mvOut, itemId: source.id, type: 'out', qty,
-          reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId,
+          reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId, shopId: source.shopId || activeShopId || null,
         });
         const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvIn), {
           id: mvIn, itemId: staffItemId, type: 'in', qty,
-          reason: 'Received from Client Admin', timestamp: now, ownerId,
+          reason: 'Received from Client Admin', timestamp: now, ownerId, shopId: source.shopId || activeShopId || null,
         });
 
         logActivity('inventory_assigned', { itemSku: source.sku, itemName: source.name, qty, targetEmail: staff.email });
@@ -1990,13 +2055,13 @@ export default function InventorySystem() {
       const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
       await setDoc(doc(db, 'movements', mvOut), {
         id: mvOut, itemId: staffItem.id, type: 'out', qty,
-        reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+        reason: `Returned by ${staffLabel}`, timestamp: now, ownerId, shopId: staffItem.shopId || activeShopId || null,
       });
       if (adminItem) {
         const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvIn), {
           id: mvIn, itemId: adminItem.id, type: 'in', qty,
-          reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+          reason: `Returned by ${staffLabel}`, timestamp: now, ownerId, shopId: adminItem.shopId || activeShopId || null,
         });
       }
 
@@ -2074,9 +2139,11 @@ export default function InventorySystem() {
 
   const updateDeliveryStatus = async (itemId, status, note, orderDate) => {
     if (!can(myRole, 'viewReports')) { showToast("You don't have permission to update delivery status"); return; }
+    const relatedItem = items.find((i) => i.id === itemId);
     try {
       await setDoc(doc(db, 'deliveryStatus', itemId), {
         status, note: note || '', orderDate: orderDate || null, updatedAt: Date.now(), ownerId,
+        shopId: relatedItem?.shopId || activeShopId || null,
       });
       showToast(`Delivery status set to "${status}"`);
     } catch (e) {
@@ -2158,7 +2225,7 @@ export default function InventorySystem() {
       await setDoc(doc(db, 'movements', mvId), {
         id: mvId, itemId, type, qty,
         reason: reason || (type === 'in' ? 'Stock received' : 'Stock issued'),
-        timestamp: Date.now(), ownerId,
+        timestamp: Date.now(), ownerId, shopId: item.shopId || activeShopId || null,
       });
       showToast(`${type === 'in' ? 'Received' : 'Issued'} ${qty} × ${item.sku}`);
     } catch (e) {
@@ -2185,7 +2252,7 @@ export default function InventorySystem() {
     const counts = getUnitCounts(item);
     const newStock = { ...counts, [unit.name]: (counts[unit.name] || 0) + qty };
     const newQuantity = totalBaseUnits(newStock, units);
-    const cost = Math.max(0, Number(unitCost) || 0) || item.unitCost;
+    const cost = Math.max(0, Number(unitCost) || 0) || (item.unitCost ?? 0);
     const supplier = supplierId ? suppliers.find((s) => s.id === supplierId) : null;
     const now = Date.now();
     const restockId = 'rs' + Math.random().toString(36).slice(2, 9);
@@ -2198,12 +2265,13 @@ export default function InventorySystem() {
         supplierId: supplier?.id || null, supplierName: supplier?.name || null,
         receivedAt: now, receivedBy: user.uid, receivedByEmail: user.email || '',
         receivedByUsername: myProfile?.username || '', notes: notes || '', ownerId,
+        shopId: item.shopId || activeShopId || null,
       });
       const mvId = 'm' + Math.random().toString(36).slice(2, 9);
       await setDoc(doc(db, 'movements', mvId), {
         id: mvId, itemId, type: 'in', qty: qty * unit.factor,
         reason: `Restock${supplier ? ` from ${supplier.name}` : ''}${unit.name !== (item.baseUnitName || 'Piece') ? ` (${qty} ${unit.name})` : ''}`,
-        timestamp: now, ownerId,
+        timestamp: now, ownerId, shopId: item.shopId || activeShopId || null,
       });
       logActivity('restock_received', { itemSku: item.sku, itemName: item.name, quantity: qty, unitName: unit.name, supplierName: supplier?.name || 'none' });
       showToast(`Received ${qty} ${unit.name}${qty === 1 ? '' : 's'} of ${item.sku}`);
@@ -2244,13 +2312,13 @@ export default function InventorySystem() {
       const item = items.find((i) => i.id === line.itemId);
       const factor = line.factor ?? 1;
       // unitPrice/unitCost here are already per SOLD unit (e.g. per Box/Case,
-      // not per Piece) - line.unitPrice comes straight from whichever unit
-      // was selected in POS; the base per-piece cost is multiplied by the
-      // conversion factor so profit is correct regardless of what unit it
-      // sold in.
+      // not per Piece) - both come from whichever unit was selected in POS,
+      // since each unit now has its own independently-set cost (a Pack can
+      // genuinely cost less per piece than buying loose) rather than always
+      // being derived from the base cost.
+      const soldUnit = getItemUnits(item).find((u) => u.name === (line.unitName || item.baseUnitName));
       const price = line.unitPrice ?? (item.sellingPrice ?? item.unitCost);
-      const baseCost = item.unitCost;
-      const lineCost = baseCost * factor;
+      const lineCost = (soldUnit?.cost ?? item.unitCost) * (soldUnit ? 1 : factor); // fallback path still scales by factor if the unit lookup somehow fails
       return {
         itemId: item.id, sku: item.sku, name: item.name,
         qty: line.qty, unitName: line.unitName || item.baseUnitName || 'Piece', factor,
@@ -2272,6 +2340,7 @@ export default function InventorySystem() {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
       subtotal, total, totalCost, totalProfit, amountReceived: received, change,
       cashierId: user.uid, cashierEmail: user.email || '', cashierUsername: myProfile?.username || '', ownerId,
+      shopId: activeShopId || null,
     };
 
     try {
@@ -2290,6 +2359,7 @@ export default function InventorySystem() {
         return setDoc(doc(db, 'movements', mvId), {
           id: mvId, itemId: line.itemId, type: 'out', qty: baseQty,
           reason: `Sale ${receiptNo}${line.unitName && line.unitName !== 'Piece' ? ` (${line.qty} ${line.unitName})` : ''}`, timestamp: now, ownerId,
+          shopId: activeShopId || null,
         });
       }));
       await setDoc(doc(db, 'sales', sale.id), sale);
@@ -2366,6 +2436,7 @@ export default function InventorySystem() {
       receivedDate: null,
       notes: (draft.notes || '').trim(),
       createdBy: user.uid, createdByEmail: user.email || '',
+      shopId: item.shopId || activeShopId || null,
     };
     try {
       await setDoc(doc(db, 'orders', id), order);
@@ -2389,6 +2460,7 @@ export default function InventorySystem() {
         await setDoc(doc(db, 'movements', mvId), {
           id: mvId, itemId: item.id, type: 'in', qty: order.quantity,
           reason: `Order received from ${order.supplierName}`, timestamp: now, ownerId,
+          shopId: item.shopId || activeShopId || null,
         });
       }
       await setDoc(doc(db, 'orders', order.id), { status: 'received', receivedDate: now }, { merge: true });
@@ -2420,9 +2492,83 @@ export default function InventorySystem() {
   // hold, i.e. haven't assigned out. Legacy items from before this feature
   // (no holderId yet) default to counting as the admin's own.
   const myOwnItems = useMemo(() => {
-    if (myRole === 'staff') return items;
-    return items.filter((it) => !it.holderId || it.holderId === ownerId);
-  }, [items, myRole, ownerId]);
+    if (myRole === 'staff') return items; // staff aren't shop-scoped - they only ever see their own assigned items
+    const ownItems = items.filter((it) => !it.holderId || it.holderId === ownerId);
+    if (!activeShopId) return ownItems;
+    // Items that predate this feature (no shopId yet) fall back to
+    // matching the active shop too, so nothing silently disappears in the
+    // brief window before the one-time migration finishes tagging them.
+    return ownItems.filter((it) => !it.shopId || it.shopId === activeShopId);
+  }, [items, myRole, ownerId, activeShopId]);
+
+  // Shop-scoped views of sales/movements/orders/restocks, same reasoning
+  // as myOwnItems above - a manager switching shops should only see that
+  // shop's own sales history, reports, profit, restock records, etc.
+  // Staff aren't shop-scoped, so this doesn't affect their own sales view.
+  const shopSales = useMemo(() => {
+    if (!activeShopId) return sales;
+    return sales.filter((s) => !s.shopId || s.shopId === activeShopId);
+  }, [sales, activeShopId]);
+  const shopMovements = useMemo(() => {
+    if (!activeShopId) return movements;
+    return movements.filter((m) => !m.shopId || m.shopId === activeShopId);
+  }, [movements, activeShopId]);
+  const shopOrders = useMemo(() => {
+    if (!activeShopId) return orders;
+    return orders.filter((o) => !o.shopId || o.shopId === activeShopId);
+  }, [orders, activeShopId]);
+  const shopRestocks = useMemo(() => {
+    if (!activeShopId) return restocks;
+    return restocks.filter((r) => !r.shopId || r.shopId === activeShopId);
+  }, [restocks, activeShopId]);
+
+  const switchShop = async (shopId) => {
+    setActiveShopId(shopId);
+    try {
+      await setDoc(doc(db, 'users', user.uid), { activeShopId: shopId }, { merge: true });
+    } catch (e) { /* non-critical preference save - the in-session switch above already applied */ }
+  };
+
+  const createShop = async (name) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage shops"); return; }
+    const trimmed = (name || '').trim();
+    if (!trimmed) return;
+    const shopId = 'shop' + Math.random().toString(36).slice(2, 9);
+    try {
+      await setDoc(doc(db, 'shops', shopId), { id: shopId, name: trimmed, ownerId, createdAt: Date.now() });
+      switchShop(shopId);
+      showToast(`Created "${trimmed}"`);
+    } catch (e) {
+      showToast('Could not create shop — check your connection');
+    }
+  };
+
+  const renameShop = async (shopId, name) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage shops"); return; }
+    const trimmed = (name || '').trim();
+    if (!trimmed) return;
+    try {
+      await setDoc(doc(db, 'shops', shopId), { name: trimmed }, { merge: true });
+      showToast('Shop renamed');
+    } catch (e) {
+      showToast('Could not rename shop — check your connection');
+    }
+  };
+
+  const deleteShop = async (shopId) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage shops"); return; }
+    if (shops.length <= 1) { showToast('You need at least one shop'); return; }
+    try {
+      await deleteDoc(doc(db, 'shops', shopId));
+      if (activeShopId === shopId) {
+        const remaining = shops.find((s) => s.id !== shopId);
+        if (remaining) switchShop(remaining.id);
+      }
+      showToast('Shop deleted. Its existing items/sales/records are kept, just no longer tagged to an active shop, and will need reassigning if you want them under a different one.');
+    } catch (e) {
+      showToast('Could not delete shop — check your connection');
+    }
+  };
 
   // Total value of stock currently OUT with staff (assigned, not sitting in
   // the admin's own inventory), broken down per staff member - managers
@@ -2484,7 +2630,7 @@ export default function InventorySystem() {
   // already carry a cost/profit snapshot per line from the moment they were
   // rung up - so re-pricing an item later never rewrites history here.
   const profitStats = useMemo(() => {
-    const completed = sales.filter((s) => !s.cancelled);
+    const completed = shopSales.filter((s) => !s.cancelled);
     const totalRevenue = completed.reduce((s, sale) => s + (sale.total ?? 0), 0);
     const totalCost = completed.reduce((s, sale) => s + (sale.totalCost ?? 0), 0);
     const totalProfit = completed.reduce((s, sale) => s + (sale.totalProfit ?? (sale.total ?? 0) - (sale.totalCost ?? 0)), 0);
@@ -2509,10 +2655,10 @@ export default function InventorySystem() {
       }));
 
     return { totalRevenue, totalCost, totalProfit, margin, profitByItem, perSale };
-  }, [sales]);
+  }, [shopSales]);
 
   const filteredMovements = useMemo(() => {
-    return movements.filter((m) => {
+    return shopMovements.filter((m) => {
       const item = items.find((i) => i.id === m.itemId);
       const matchesSearch =
         !histSearch ||
@@ -2530,7 +2676,7 @@ export default function InventorySystem() {
       getSupplierIds(it).forEach((sid) => {
         const supplier = suppliers.find((s) => s.id === sid);
         if (!supplier) return;
-        const inbound = movements
+        const inbound = shopMovements
           .filter((m) => m.itemId === it.id && m.type === 'in')
           .sort((a, b) => b.timestamp - a.timestamp);
         const lastDelivery = inbound.length ? inbound[0].timestamp : null;
@@ -2550,7 +2696,7 @@ export default function InventorySystem() {
       });
     });
     return rows;
-  }, [myOwnItems, suppliers, movements, deliveryStatuses]);
+  }, [myOwnItems, suppliers, shopMovements, deliveryStatuses]);
 
   const supplierMap = useMemo(() => Object.fromEntries(suppliers.map((s) => [s.id, s])), [suppliers]);
 
@@ -2653,7 +2799,7 @@ export default function InventorySystem() {
 
       <BackgroundDecor animationTheme={effectiveBranding.animationTheme} />
 
-      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} onSignOut={handleSignOut} />
+      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} onSignOut={handleSignOut} shops={shops} activeShopId={activeShopId} onSwitchShop={switchShop} />
 
       <main style={styles.main} className="depot-scroll depot-main">
         <TopBar
@@ -2737,14 +2883,18 @@ export default function InventorySystem() {
 
         {view === 'orders' && (
           <OrdersView
-            orders={orders}
+            orders={shopOrders}
             onReceive={receiveOrder}
             onCancel={(o) => setConfirmModal({ kind: 'order', target: o })}
           />
         )}
 
         {view === 'restock' && (
-          <RestockView restocks={restocks} />
+          <RestockView restocks={shopRestocks} />
+        )}
+
+        {view === 'shops' && (
+          <ShopsView shops={shops} activeShopId={activeShopId} onSwitch={switchShop} onCreate={createShop} onRename={renameShop} onDelete={(s) => setConfirmModal({ kind: 'shop', target: s })} />
         )}
 
         {view === 'categories' && (
@@ -2779,11 +2929,11 @@ export default function InventorySystem() {
         )}
 
         {view === 'pos' && (
-          <POSView items={myOwnItems} onCompleteSale={completeSale} />
+          <POSView items={myOwnItems} onCompleteSale={completeSale} shops={shops} activeShopId={activeShopId} onSwitchShop={switchShop} />
         )}
 
         {view === 'sales' && (
-          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onDeleteSale={(sale) => setConfirmModal({ kind: 'sale-delete', target: sale })} onLogActivity={logActivity} />
+          <SalesHistoryView sales={myRole === 'staff' ? sales : shopSales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onDeleteSale={(sale) => setConfirmModal({ kind: 'sale-delete', target: sale })} onLogActivity={logActivity} />
         )}
 
         {view === 'mysales' && (
@@ -2962,6 +3112,16 @@ export default function InventorySystem() {
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelOrder(confirmModal.target)}
           confirmLabel="Cancel Order"
+        />
+      )}
+
+      {confirmModal && confirmModal.kind === 'shop' && (
+        <ConfirmModal
+          title="DELETE SHOP"
+          message={<>Delete <strong>{confirmModal.target.name}</strong>? Its existing items, sales, and records are kept as-is (never deleted) — they'll just no longer be tagged to an active shop unless you reassign them.</>}
+          onCancel={() => setConfirmModal(null)}
+          onConfirm={() => { deleteShop(confirmModal.target.id); setConfirmModal(null); }}
+          confirmLabel="Delete Shop"
         />
       )}
 
@@ -3619,7 +3779,7 @@ function SubscriptionPausedScreen({ role, animationTheme, onSignOut }) {
   );
 }
 
-function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
+function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut, shops, activeShopId, onSwitchShop }) {
   const structure = [
     { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
     { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
@@ -3630,6 +3790,7 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
       { key: 'orders', label: 'Orders', icon: ClipboardList },
       { key: 'restock', label: 'Restock', icon: PackagePlus },
+      { key: 'shops', label: 'Shops', icon: Store },
       { key: 'categories', label: 'Categories', icon: Tag },
       { key: 'locations', label: 'Zonal Locations', icon: MapPin },
     ] },
@@ -3677,6 +3838,27 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
           <img src={logo} alt="Company logo" style={styles.logoImg} />
         </div>
       </div>
+      {shops && shops.length > 0 && (
+        <div style={{ padding: '0 4px', marginTop: 14 }}>
+          <div style={{ fontSize: 9.5, fontWeight: 700, color: 'rgba(245,243,236,0.4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>
+            Active Shop
+          </div>
+          <div style={{ position: 'relative' }}>
+            <select
+              value={activeShopId || ''}
+              onChange={(e) => onSwitchShop(e.target.value)}
+              style={{
+                width: '100%', appearance: 'none', background: 'rgba(255,255,255,0.07)', color: '#fff',
+                border: '1px solid rgba(255,255,255,0.15)', borderRadius: 7, padding: '7px 24px 7px 10px',
+                fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              }}
+            >
+              {shops.map((s) => <option key={s.id} value={s.id} style={{ color: '#111' }}>{s.name}</option>)}
+            </select>
+            <ChevronDown size={13} color="rgba(255,255,255,0.5)" style={{ position: 'absolute', right: 7, top: 8, pointerEvents: 'none' }} />
+          </div>
+        </div>
+      )}
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 28 }} className="depot-sidebar-nav">
         {resolved.map((entry) => {
           if (entry.type === 'item') {
@@ -3775,6 +3957,7 @@ function TopBar({ view, role, onAdd }) {
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     orders: ['Orders', 'Purchase orders placed with your suppliers'],
     restock: ['Restock', 'Receive inventory, with or without a supplier'],
+    shops: ['Shops', 'Create and switch between shops within your business'],
     categories: ['Categories', 'Organize items into your own groups'],
     locations: ['Zonal Locations', 'Manage where stock is stored'],
     delivery: ['Restock Records', 'Lead times and expected restocks'],
@@ -4324,9 +4507,9 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
       const markup = itemMarkup(it);
       return [
         it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
-        it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2),
+        it.quantity, (Number(it.unitCost) || 0).toFixed(2), (Number(it.sellingPrice ?? it.unitCost) || 0).toFixed(2),
         `${currency(markup.amount)} (${markup.percent.toFixed(1)}%)`,
-        (it.quantity * it.unitCost).toFixed(2), (it.quantity * (it.sellingPrice ?? it.unitCost)).toFixed(2),
+        (it.quantity * (Number(it.unitCost) || 0)).toFixed(2), (it.quantity * (Number(it.sellingPrice ?? it.unitCost) || 0)).toFixed(2),
         itemEstProfit(it).toFixed(2),
       ];
     }),
@@ -4390,8 +4573,8 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                   <td style={{ ...styles.td, fontSize: 12.5, color: names.length ? 'var(--ink)' : 'rgba(59,42,31,0.4)' }}>
                     {names.length ? names.join(', ') : '— none —'}
                   </td>
-                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12, color: 'rgba(59,42,31,0.6)' }}>
-                    <MapPin size={11} style={{ marginRight: 3, verticalAlign: -1 }} />{it.location}
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12, color: it.location ? 'rgba(59,42,31,0.6)' : 'rgba(59,42,31,0.4)' }}>
+                    <MapPin size={11} style={{ marginRight: 3, verticalAlign: -1 }} />{it.location || '— none —'}
                   </td>
                   <td style={styles.td}>
                     <span style={{ color: low ? 'var(--red)' : 'var(--ink)', fontWeight: low ? 700 : 500 }}>{it.quantity}</span>
@@ -5349,7 +5532,7 @@ function DeliveryTimesView({ rows, onUpdateStatus, onViewHistory }) {
   );
 }
 
-function POSView({ items, onCompleteSale }) {
+function POSView({ items, onCompleteSale, shops, activeShopId, onSwitchShop }) {
   const [search, setSearch] = useState('');
   const [cart, setCart] = useState([]); // [{itemId, qty}]
   const [lastReceipt, setLastReceipt] = useState(null);
@@ -5448,6 +5631,22 @@ function POSView({ items, onCompleteSale }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease', display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 16, alignItems: 'start' }} className="depot-pos-layout">
       <div>
+        {shops && shops.length > 0 && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, padding: '9px 12px',
+            background: '#fff', border: '1px solid rgba(59,42,31,0.15)', borderRadius: 6,
+          }}>
+            <Store size={15} color="var(--amber)" />
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: 'rgba(59,42,31,0.6)' }}>Selling from:</span>
+            <select
+              className="depot-select" value={activeShopId || ''} onChange={(e) => onSwitchShop(e.target.value)}
+              style={{ ...styles.modalInput, width: 220, padding: '6px 10px' }}
+            >
+              {shops.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            <span style={{ fontSize: 11, color: 'rgba(59,42,31,0.45)' }}>All sales and stock deductions apply to this shop.</span>
+          </div>
+        )}
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
           <input
@@ -5477,7 +5676,8 @@ function POSView({ items, onCompleteSale }) {
           )}
           {filtered.map((it) => {
             const units = getItemUnits(it);
-            const choiceIdx = Math.min(unitChoice[it.id] ?? 0, units.length - 1);
+            const defaultIdx = Math.max(0, units.findIndex((u) => u.name === it.defaultSellingUnit));
+            const choiceIdx = Math.min(unitChoice[it.id] ?? defaultIdx, units.length - 1);
             const unit = units[choiceIdx];
             const stockInUnit = unit.factor > 0 ? Math.floor((it.quantity || 0) / unit.factor) : 0;
             return (
@@ -6792,8 +6992,8 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
     if (!draft) {
       return {
         sku: '', name: '', category: categories[0] || '', baseUnitStock: '', reorderPoint: '', unitCost: '',
-        location: locations[0] || '', supplierIds: [], sellingPrice: '',
-        baseUnitName: 'Piece', units: [],
+        location: '', supplierIds: [], sellingPrice: '',
+        baseUnitName: 'Piece', units: [], defaultSellingUnit: 'Piece',
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
@@ -6801,21 +7001,46 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
     const baseUnitName = draft.baseUnitName || 'Piece';
     return {
       ...rest, supplierIds: getSupplierIds(draft),
-      sellingPrice: draft.sellingPrice ?? draft.unitCost ?? 0,
+      // Base Cost stays genuinely blank (not coerced to 0) when the item
+      // has none on record, so Markup can correctly show as blank too
+      // rather than a misleading "full price = markup" number.
+      unitCost: draft.unitCost ?? '',
+      sellingPrice: draft.sellingPrice ?? '',
       baseUnitName,
       baseUnitStock: counts[baseUnitName] ?? draft.quantity ?? 0,
-      units: (draft.units && draft.units.length ? draft.units : []).map((u) => ({ ...u, stock: counts[u.name] ?? 0 })),
+      units: (draft.units && draft.units.length ? draft.units : []).map((u) => ({ ...u, stock: counts[u.name] ?? 0, cost: u.cost ?? '' })),
+      defaultSellingUnit: draft.defaultSellingUnit || baseUnitName,
     };
   });
 
   const addUnitRow = (name = '') => {
-    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', price: '', stock: 0 }] }));
+    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', cost: '', price: '', stock: 0 }] }));
   };
   const updateUnitRow = (i, patch) => {
     setForm((f) => ({ ...f, units: f.units.map((u, idx) => idx === i ? { ...u, ...patch } : u) }));
   };
   const removeUnitRow = (i) => {
-    setForm((f) => ({ ...f, units: f.units.filter((_, idx) => idx !== i) }));
+    setForm((f) => ({
+      ...f,
+      units: f.units.filter((_, idx) => idx !== i),
+      defaultSellingUnit: f.defaultSellingUnit === f.units[i]?.name ? f.baseUnitName : f.defaultSellingUnit,
+    }));
+  };
+
+  // Most items only ever sell one way, so the whole "multiple units" idea
+  // stays hidden until someone actually needs it - starts open only if
+  // this item already has units set up.
+  const [multiUnit, setMultiUnit] = useState(form.units.length > 0);
+  const enableMultiUnit = () => {
+    setMultiUnit(true);
+    if (form.units.length === 0) addUnitRow('Pack');
+  };
+  const disableMultiUnit = () => {
+    setMultiUnit(false);
+    setForm((f) => {
+      const foldedIn = f.units.reduce((sum, u) => sum + (Number(u.stock) || 0) * (Number(u.factor) || 0), 0);
+      return { ...f, units: [], baseUnitStock: (Number(f.baseUnitStock) || 0) + foldedIn };
+    });
   };
 
   // Total stock across every unit, converted to base-unit terms - this is
@@ -6836,8 +7061,14 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
   }, [form.name, isNew, skuTouched]);
 
   const duplicateSku = isDuplicateSku(form.sku, items, draft?.id);
-  const valid = form.sku.trim() && form.name.trim() && !duplicateSku;
-  const markup = computeMarkupFromPrices(form.unitCost, form.sellingPrice);
+  const valid = form.sku.trim() && form.name.trim() && form.sellingPrice !== '' && !duplicateSku;
+  // Markup is purely a readout now: Selling Price - Base Cost. Stays
+  // blank (not 0, not a misleading full-price number) whenever Base Cost
+  // hasn't been entered, since there's nothing to calculate a margin
+  // against.
+  const hasBaseCost = form.unitCost !== '' && form.unitCost != null;
+  const baseMarkupAmount = hasBaseCost ? (Number(form.sellingPrice) || 0) - Number(form.unitCost) : null;
+  const baseMarkupPercent = hasBaseCost && Number(form.unitCost) > 0 ? (baseMarkupAmount / Number(form.unitCost)) * 100 : null;
   const toggleSupplier = (sid) => {
     setForm({
       ...form,
@@ -6882,9 +7113,10 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
                 {categories.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
             </Field>
-            <Field label="Location" grow>
+            <Field label="Zonal Location (optional)" grow>
               <select className="depot-select" style={styles.modalInput} value={form.location}
                 onChange={(e) => setForm({ ...form, location: e.target.value })}>
+                <option value="">— No Location —</option>
                 {locations.map((l) => <option key={l} value={l}>{l}</option>)}
               </select>
             </Field>
@@ -6910,7 +7142,7 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
             )}
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label={`Stock (${form.baseUnitName || 'Piece'})`} grow>
+            <Field label={multiUnit ? `Loose ${form.baseUnitName || 'Piece'}s (not in a Pack/Box)` : 'Quantity'} grow>
               <input className="depot-input" type="number" style={styles.modalInput} value={form.baseUnitStock}
                 onChange={(e) => setForm({ ...form, baseUnitStock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
@@ -6918,85 +7150,137 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
               <input className="depot-input" type="number" style={styles.modalInput} value={form.reorderPoint}
                 onChange={(e) => setForm({ ...form, reorderPoint: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label="Base Cost (₱)" grow>
-              <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={form.unitCost}
+            <Field label="Base Price (₱) — optional" grow>
+              <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={form.unitCost} placeholder="Leave blank if unknown"
                 onChange={(e) => setForm({ ...form, unitCost: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Selling Price (₱)" grow>
+            <Field label={multiUnit ? `Selling Price (₱) — per ${form.baseUnitName || 'Piece'}` : 'Selling Price (₱)'} grow>
               <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.sellingPrice}
                 onChange={(e) => setForm({ ...form, sellingPrice: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label="Markup" grow>
+            <Field label="Markup — auto-calculated">
               <div style={{
                 ...styles.modalInput, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                background: markup.amount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
-                fontWeight: 700, color: markup.amount >= 0 ? 'var(--green)' : 'var(--red)',
+                background: !hasBaseCost ? 'rgba(59,42,31,0.04)' : baseMarkupAmount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                fontWeight: 700, color: !hasBaseCost ? 'rgba(59,42,31,0.4)' : baseMarkupAmount >= 0 ? 'var(--green)' : 'var(--red)',
               }}>
-                <span>{currency(markup.amount)}</span>
-                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markup.percent.toFixed(1)}%</span>
+                {!hasBaseCost ? (
+                  <span style={{ fontWeight: 500, fontSize: 12.5 }}>Add a Base Price to see markup</span>
+                ) : (
+                  <>
+                    <span>{currency(baseMarkupAmount)}</span>
+                    <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{baseMarkupPercent.toFixed(1)}%</span>
+                  </>
+                )}
               </div>
             </Field>
           </div>
 
-          <Field label="Base Unit">
-            <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 200 }} value={form.baseUnitName}
-              onChange={(e) => setForm({ ...form, baseUnitName: e.target.value })} placeholder="Piece" />
-            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>What the Stock field above counts in. Every other selling unit converts to this.</div>
-          </Field>
+          {!multiUnit ? (
+            <button className="depot-btn" style={{ ...styles.ghostBtn, fontSize: 12.5 }} onClick={enableMultiUnit}>
+              + This item also sells by the Pack or Box
+            </button>
+          ) : (
+            <div style={{ border: '1px solid rgba(59,42,31,0.15)', borderRadius: 8, padding: 14, marginTop: 4 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>Selling by more than one unit</div>
+                <button className="depot-btn" style={{ ...styles.ghostBtn, padding: '4px 10px', fontSize: 11.5 }} onClick={disableMultiUnit}>
+                  Turn off
+                </button>
+              </div>
 
-          <Field label="Selling Units (optional)">
-            {form.units.length === 0 && (
-              <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginBottom: 8 }}>
-                None yet — add Pack or Box/Case below if this item sells in more than one unit.
+              <Field label="What do you call one single item?">
+                <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 180 }} value={form.baseUnitName}
+                  onChange={(e) => setForm({ ...form, baseUnitName: e.target.value })} placeholder="Piece" />
+              </Field>
+
+              <Field label="Default selling unit in POS">
+                <select className="depot-select" style={{ ...styles.modalInput, maxWidth: 220 }}
+                  value={form.defaultSellingUnit} onChange={(e) => setForm({ ...form, defaultSellingUnit: e.target.value })}>
+                  <option value={form.baseUnitName || 'Piece'}>{form.baseUnitName || 'Piece'}</option>
+                  {form.units.filter((u) => u.name).map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+                </select>
+                <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Which price shows first when this item comes up in POS. Every unit stays available to sell regardless.</div>
+              </Field>
+
+              {form.units.map((u, i) => {
+                const uHasCost = u.cost !== '' && u.cost != null;
+                const uCost = Number(u.cost) || 0;
+                const uPrice = Number(u.price) || 0;
+                const uMarkupAmount = uHasCost ? uPrice - uCost : null;
+                const uMarkupPercent = uHasCost && uCost > 0 ? (uMarkupAmount / uCost) * 100 : null;
+                return (
+                  <div key={i} style={{
+                    background: 'rgba(59,42,31,0.03)', borderRadius: 8, padding: 12, marginBottom: 10,
+                    display: 'flex', flexDirection: 'column', gap: 8,
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
+                      <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 160, fontWeight: 700 }} placeholder="e.g. Pack" value={u.name}
+                        onChange={(e) => updateUnitRow(i, { name: e.target.value })} />
+                      <button className="depot-btn" style={{ ...styles.ghostBtn, padding: 6 }} onClick={() => removeUnitRow(i)}><X size={13} /></button>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>1 {u.name || 'unit'} =</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.factor}
+                        onChange={(e) => updateUnitRow(i, { factor: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                      <span>{form.baseUnitName || 'Piece'}s</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>Base Price ₱</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.cost} placeholder="optional"
+                        onChange={(e) => updateUnitRow(i, { cost: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                      <span style={{ color: 'rgba(59,42,31,0.5)', fontSize: 11.5 }}>per {u.name || 'unit'} — optional, set independently of {form.baseUnitName || 'Piece'} cost</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>Selling Price ₱</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.price}
+                        onChange={(e) => updateUnitRow(i, { price: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                      <span style={{ color: 'rgba(59,42,31,0.5)', fontSize: 11.5 }}>per {u.name || 'unit'}, required</span>
+                    </div>
+                    <div style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderRadius: 6, padding: '8px 10px',
+                      background: !uHasCost ? 'rgba(59,42,31,0.04)' : uMarkupAmount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                    }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: 'rgba(59,42,31,0.55)', textTransform: 'uppercase', letterSpacing: '0.03em' }}>Markup (auto-calculated)</span>
+                      {!uHasCost ? (
+                        <span style={{ fontWeight: 500, fontSize: 12.5, color: 'rgba(59,42,31,0.4)' }}>Add a Base Price to see markup</span>
+                      ) : (
+                        <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <span style={{ fontWeight: 700, color: uMarkupAmount >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(uMarkupAmount)}</span>
+                          <span style={{ fontSize: 12, fontWeight: 500, color: uMarkupAmount >= 0 ? 'var(--green)' : 'var(--red)', opacity: 0.8 }}>{uMarkupPercent.toFixed(1)}%</span>
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>Sealed {u.name || 'units'} on the shelf right now:</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.stock}
+                        onChange={(e) => updateUnitRow(i, { stock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                    </div>
+                  </div>
+                );
+              })}
+
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {UNIT_PRESETS.filter((p) => p !== form.baseUnitName && !form.units.some((u) => u.name === p)).map((p) => (
+                  <button key={p} className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow(p)}>+ {p}</button>
+                ))}
+                <button className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow('')}>+ Another unit</button>
               </div>
-            )}
-            {form.units.length > 0 && (
-              <div style={{ display: 'flex', gap: 6, fontSize: 10.5, color: 'rgba(59,42,31,0.45)', marginBottom: 3, paddingLeft: 2 }}>
-                <span style={{ flex: 2 }}>Unit</span>
-                <span style={{ flex: 1 }}>= {form.baseUnitName || 'Piece'}s</span>
-                <span style={{ flex: 1 }}>Price</span>
-                <span style={{ flex: 1 }}>Stock on hand</span>
-                <span style={{ width: 30 }} />
-              </div>
-            )}
-            {form.units.map((u, i) => (
-              <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
-                <input className="depot-input" style={{ ...styles.modalInput, flex: 2 }} placeholder="Unit name" value={u.name}
-                  onChange={(e) => updateUnitRow(i, { name: e.target.value })} />
-                <input type="number" className="depot-input" style={{ ...styles.modalInput, flex: 1 }} placeholder={`${form.baseUnitName || 'Piece'}s`} value={u.factor}
-                  onChange={(e) => updateUnitRow(i, { factor: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })}
-                  title={`How many ${form.baseUnitName || 'Piece'}(s) make up 1 of this unit`} />
-                <input type="number" className="depot-input" style={{ ...styles.modalInput, flex: 1 }} placeholder="Price (₱)" value={u.price}
-                  onChange={(e) => updateUnitRow(i, { price: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
-                <input type="number" className="depot-input" style={{ ...styles.modalInput, flex: 1 }} placeholder="0" value={u.stock}
-                  onChange={(e) => updateUnitRow(i, { stock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })}
-                  title={`How many sealed ${u.name || 'units'} are physically on the shelf right now`} />
-                <button className="depot-btn" style={styles.ghostBtn} onClick={() => removeUnitRow(i)}><X size={13} /></button>
-              </div>
-            ))}
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
-              {UNIT_PRESETS.filter((p) => p !== form.baseUnitName && !form.units.some((u) => u.name === p)).map((p) => (
-                <button key={p} className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow(p)}>+ {p}</button>
-              ))}
-              <button className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow('')}>+ Custom Unit</button>
-            </div>
-            {form.units.length > 0 && (
+
               <div style={{
-                marginTop: 10, padding: '8px 10px', borderRadius: 6, background: 'rgba(79,138,99,0.08)',
+                marginTop: 12, padding: '8px 10px', borderRadius: 6, background: 'rgba(79,138,99,0.08)',
                 fontSize: 12.5, fontWeight: 700, color: 'var(--green)', display: 'flex', justifyContent: 'space-between',
               }}>
                 <span>Total stock (in {form.baseUnitName || 'Piece'}s)</span>
                 <span>{totalQuantity.toLocaleString()}</span>
               </div>
-            )}
-            {form.units.length > 0 && (
               <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 8 }}>
-                Selling automatically deducts from the smallest unit first, breaking open a larger sealed unit (e.g. 1 Pack → {form.units[0]?.factor || 'N'} {form.baseUnitName || 'Piece'}s) whenever it runs short — no manual adjustment needed.
+                When one unit runs out at checkout, Stock IT automatically opens the next size up — no manual adjustment needed.
               </div>
-            )}
-          </Field>
+            </div>
+          )}
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
@@ -7114,7 +7398,7 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
   const handleDraftItemChange = (id) => {
     setDraftItemId(id);
     const it = myOwnItems.find((i) => i.id === id);
-    if (it) setDraftCost(it.unitCost);
+    if (it) setDraftCost(it.unitCost ?? '');
   };
 
   const draftValid = draftItemId && Number(draftQty) > 0 && draftSource && Number(draftQty) <= draftSource.quantity;
@@ -7302,7 +7586,7 @@ function RestockModal({ items, suppliers, onClose, onSave }) {
     setItemId(id);
     const it = items.find((i) => i.id === id);
     if (it) {
-      setUnitCost(it.unitCost);
+      setUnitCost(it.unitCost ?? '');
       setUnitName(it.baseUnitName || 'Piece');
     }
   };
@@ -7439,6 +7723,68 @@ function RestockView({ restocks }) {
   );
 }
 
+function ShopsView({ shops, activeShopId, onSwitch, onCreate, onRename, onDelete }) {
+  const [newName, setNewName] = useState('');
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameValue, setRenameValue] = useState('');
+
+  const startRename = (shop) => { setRenamingId(shop.id); setRenameValue(shop.name); };
+  const submitRename = () => {
+    if (renameValue.trim()) onRename(renamingId, renameValue.trim());
+    setRenamingId(null);
+  };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 16, maxWidth: 560 }}>
+        Each shop has its own products, inventory, sales history, reports, and profit calculations — nothing is shared between shops except your suppliers, categories, and locations. Switch shops any time from here or the sidebar; POS also has its own shop selector.
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 20, maxWidth: 420 }}>
+        <input
+          className="depot-input" style={styles.modalInput} placeholder="New shop name"
+          value={newName} onChange={(e) => setNewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && newName.trim()) { onCreate(newName.trim()); setNewName(''); } }}
+        />
+        <button className="depot-btn" style={styles.primaryBtn} onClick={() => { if (newName.trim()) { onCreate(newName.trim()); setNewName(''); } }}>
+          <Plus size={15} /> New Shop
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 520 }}>
+        {shops.map((s) => (
+          <div key={s.id} style={{
+            ...styles.panel, display: 'flex', alignItems: 'center', gap: 12, padding: 14,
+            border: s.id === activeShopId ? '1px solid var(--amber)' : styles.panel.border,
+          }}>
+            <Store size={18} color={s.id === activeShopId ? 'var(--amber)' : 'rgba(59,42,31,0.4)'} />
+            <div style={{ flex: 1 }}>
+              {renamingId === s.id ? (
+                <input
+                  className="depot-input" style={{ ...styles.modalInput, padding: '5px 8px' }}
+                  value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') submitRename(); }}
+                  onBlur={submitRename} autoFocus
+                />
+              ) : (
+                <>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{s.name}</div>
+                  {s.id === activeShopId && <div style={{ fontSize: 10.5, color: 'var(--amber)', fontWeight: 700 }}>ACTIVE SHOP</div>}
+                </>
+              )}
+            </div>
+            {s.id !== activeShopId && (
+              <button className="depot-btn" style={styles.ghostBtn} onClick={() => onSwitch(s.id)}>Switch to this shop</button>
+            )}
+            <IconBtn onClick={() => startRename(s)} title="Rename"><Pencil size={14} /></IconBtn>
+            {shops.length > 1 && <IconBtn onClick={() => onDelete(s)} title="Delete" danger><Trash2 size={14} /></IconBtn>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function OrderModal({ draft, items, suppliers, onClose, onSave }) {
   const [itemId, setItemId] = useState(draft?.itemId || '');
   const [supplierId, setSupplierId] = useState(draft?.supplierId || '');
@@ -7458,7 +7804,7 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
     // Reset the supplier choice if it doesn't belong to the newly picked
     // item, and default the cost to the item's current catalog unit cost.
     setSupplierId((prev) => (supplierIds.includes(prev) ? prev : (supplierIds[0] || '')));
-    if (it) setUnitCost(it.unitCost);
+    if (it) setUnitCost(it.unitCost ?? '');
   };
 
   const valid = itemId && supplierId && Number(quantity) > 0;
@@ -7879,19 +8225,21 @@ const styles = {
   overlay: {
     position: 'fixed', inset: 0, background: 'rgba(10,20,35,0.55)', display: 'flex',
     alignItems: 'center', justifyContent: 'center', zIndex: 50, animation: 'fadeIn 0.15s ease',
+    padding: 16, overflowY: 'auto',
   },
   modal: {
     background: 'var(--paper)', borderRadius: 10, width: '90%', maxWidth: 460,
     boxShadow: '0 20px 60px rgba(0,0,0,0.3)', animation: 'slideUp 0.2s ease', overflow: 'hidden',
+    display: 'flex', flexDirection: 'column', maxHeight: '90vh',
   },
   modalHeader: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px 18px',
     background: 'var(--blueprint)', color: '#fff', fontFamily: "'Quicksand', sans-serif",
-    fontSize: 12, letterSpacing: '0.08em', fontWeight: 600,
+    fontSize: 12, letterSpacing: '0.08em', fontWeight: 600, flexShrink: 0,
   },
   closeBtn: { background: 'transparent', color: '#fff', width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center' },
-  modalBody: { padding: 18 },
-  modalFooter: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '14px 18px', borderTop: '1px solid rgba(59,42,31,0.08)' },
+  modalBody: { padding: 18, overflowY: 'auto', flex: '1 1 auto', WebkitOverflowScrolling: 'touch' },
+  modalFooter: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '14px 18px', borderTop: '1px solid rgba(59,42,31,0.08)', flexShrink: 0 },
   fieldLabel: { display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5, letterSpacing: '0.03em' },
   modalInput: {
     width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)',
