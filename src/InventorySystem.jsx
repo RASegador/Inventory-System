@@ -2419,8 +2419,11 @@ export default function InventorySystem() {
   const saveOrder = async (draft) => {
     if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
     const item = items.find((i) => i.id === draft.itemId);
-    const supplier = suppliers.find((s) => s.id === draft.supplierId);
-    if (!item || !supplier) { showToast('Pick an item and one of its suppliers'); return; }
+    if (!item) { showToast('Pick an item first'); return; }
+    // Supplier is optional - an order can be placed without one and a
+    // supplier assigned or changed later, same as everywhere else
+    // Suppliers are used in the app now.
+    const supplier = draft.supplierId ? suppliers.find((s) => s.id === draft.supplierId) : null;
     const quantity = Math.max(1, Number(draft.quantity) || 0);
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
     const now = Date.now();
@@ -2428,11 +2431,13 @@ export default function InventorySystem() {
     const order = {
       id, ownerId,
       itemId: item.id, itemSku: item.sku, itemName: item.name,
-      supplierId: supplier.id, supplierName: supplier.name,
+      supplierId: supplier?.id || null, supplierName: supplier?.name || null,
       quantity, unitCost, totalCost: quantity * unitCost,
       status: 'pending',
       orderDate: now,
-      expectedDate: now + (supplier.leadTimeDays || 0) * DAY_MS,
+      // No supplier means no known lead time to go on - expectedDate is
+      // just left as the order date itself rather than guessing.
+      expectedDate: now + (supplier?.leadTimeDays || 0) * DAY_MS,
       receivedDate: null,
       notes: (draft.notes || '').trim(),
       createdBy: user.uid, createdByEmail: user.email || '',
@@ -2441,7 +2446,7 @@ export default function InventorySystem() {
     try {
       await setDoc(doc(db, 'orders', id), order);
       playAddSound();
-      showToast(`Order placed with ${supplier.name}`);
+      showToast(supplier ? `Order placed with ${supplier.name}` : 'Order placed');
     } catch (e) {
       showToast('Could not place order — check your connection');
     }
@@ -2459,7 +2464,7 @@ export default function InventorySystem() {
         const mvId = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvId), {
           id: mvId, itemId: item.id, type: 'in', qty: order.quantity,
-          reason: `Order received from ${order.supplierName}`, timestamp: now, ownerId,
+          reason: `Order received${order.supplierName ? ` from ${order.supplierName}` : ''}`, timestamp: now, ownerId,
           shopId: item.shopId || activeShopId || null,
         });
       }
@@ -3108,7 +3113,7 @@ export default function InventorySystem() {
       {confirmModal && confirmModal.kind === 'order' && (
         <ConfirmModal
           title="CANCEL ORDER"
-          message={<>Cancel the order for <strong>{confirmModal.target.quantity} × {confirmModal.target.itemSku}</strong> from <strong>{confirmModal.target.supplierName}</strong>? This won't affect stock.</>}
+          message={<>Cancel the order for <strong>{confirmModal.target.quantity} × {confirmModal.target.itemSku}</strong>{confirmModal.target.supplierName ? <> from <strong>{confirmModal.target.supplierName}</strong></> : ''}? This won't affect stock.</>}
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelOrder(confirmModal.target)}
           confirmLabel="Cancel Order"
@@ -5172,7 +5177,7 @@ function OrdersView({ orders, onReceive, onCancel }) {
       const matchesStatus = statusFilter === 'All' || o.status === statusFilter.toLowerCase();
       const q = search.toLowerCase();
       const matchesSearch = !q || o.itemSku.toLowerCase().includes(q) || o.itemName.toLowerCase().includes(q)
-        || o.supplierName.toLowerCase().includes(q);
+        || (o.supplierName || '').toLowerCase().includes(q);
       return matchesStatus && matchesSearch;
     });
   }, [orders, search, statusFilter]);
@@ -5185,7 +5190,7 @@ function OrdersView({ orders, onReceive, onCancel }) {
 
   const exportHeaders = ['Order Date', 'Item', 'Supplier', 'Quantity', 'Unit Cost', 'Total', 'Expected By', 'Status', 'Notes'];
   const exportRows = () => filtered.map((o) => [
-    formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName, o.quantity,
+    formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName || '—', o.quantity,
     o.unitCost.toFixed(2), o.totalCost.toFixed(2), formatDate(o.expectedDate), o.status, o.notes || '',
   ]);
   const handleDownload = () => downloadCSV('orders.csv', exportHeaders, exportRows());
@@ -5234,7 +5239,7 @@ function OrdersView({ orders, onReceive, onCancel }) {
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif" }}>
                     {o.itemSku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {o.itemName}</span>
                   </td>
-                  <td style={styles.td}>{o.supplierName}</td>
+                  <td style={styles.td}>{o.supplierName || <span style={{ color: 'rgba(59,42,31,0.4)' }}>— No Supplier —</span>}</td>
                   <td style={styles.td}>{o.quantity}</td>
                   <td style={styles.td}>{currency(o.unitCost)}</td>
                   <td style={styles.td}>{currency(o.totalCost)}</td>
@@ -7793,21 +7798,23 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
   const [notes, setNotes] = useState(draft?.notes || '');
 
   const selectedItem = items.find((it) => it.id === itemId);
-  const availableSuppliers = selectedItem
-    ? getSupplierIds(selectedItem).map((sid) => suppliers.find((s) => s.id === sid)).filter(Boolean)
-    : [];
+  // The item's own linked suppliers are offered first (for convenience,
+  // since that's most often who you're re-ordering from), but the full
+  // supplier list is always available too - a supplier isn't required at
+  // all, matching how Suppliers work everywhere else in the app now.
+  const linkedSupplierIds = selectedItem ? getSupplierIds(selectedItem) : [];
 
   const handleItemChange = (id) => {
     setItemId(id);
     const it = items.find((i) => i.id === id);
     const supplierIds = it ? getSupplierIds(it) : [];
-    // Reset the supplier choice if it doesn't belong to the newly picked
-    // item, and default the cost to the item's current catalog unit cost.
-    setSupplierId((prev) => (supplierIds.includes(prev) ? prev : (supplierIds[0] || '')));
+    // Default to the item's own supplier if it has exactly one linked;
+    // otherwise leave it unset rather than guessing.
+    setSupplierId(supplierIds.length === 1 ? supplierIds[0] : '');
     if (it) setUnitCost(it.unitCost ?? '');
   };
 
-  const valid = itemId && supplierId && Number(quantity) > 0;
+  const valid = itemId && Number(quantity) > 0;
 
   return (
     <div style={styles.overlay}>
@@ -7825,18 +7832,26 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
             </select>
           </Field>
 
-          {itemId && availableSuppliers.length === 0 && (
-            <div style={{ fontSize: 12, color: 'var(--red)', padding: '2px 2px 4px' }}>
-              This item has no suppliers assigned yet — edit it from Inventory to assign one first.
-            </div>
-          )}
-
-          <Field label="Supplier">
-            <select className="depot-select" style={styles.modalInput} value={supplierId} disabled={!itemId || availableSuppliers.length === 0}
+          <Field label="Supplier (optional)">
+            <select className="depot-select" style={styles.modalInput} value={supplierId} disabled={!itemId}
               onChange={(e) => setSupplierId(e.target.value)}>
-              <option value="">— Select a supplier —</option>
-              {availableSuppliers.map((s) => <option key={s.id} value={s.id}>{s.name} ({s.leadTimeDays}d lead time)</option>)}
+              <option value="">— No Supplier —</option>
+              {linkedSupplierIds.length > 0 && (
+                <optgroup label="Linked to this item">
+                  {linkedSupplierIds.map((sid) => suppliers.find((s) => s.id === sid)).filter(Boolean).map((s) => (
+                    <option key={s.id} value={s.id}>{s.name} ({s.leadTimeDays}d lead time)</option>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label="All suppliers">
+                {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name} ({s.leadTimeDays}d lead time)</option>)}
+              </optgroup>
             </select>
+            {itemId && suppliers.length === 0 && (
+              <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>
+                You haven't added any suppliers yet — that's fine, you can place this order without one and add suppliers later.
+              </div>
+            )}
           </Field>
 
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
