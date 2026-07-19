@@ -468,9 +468,17 @@ const UNIT_PRESETS = ['Piece', 'Pack', 'Box/Case'];
 
 // Every sellable unit for an item, base unit first (factor 1, using the
 // item's own sellingPrice) followed by whatever extra units were defined.
+// Each unit carries its OWN cost (not just base cost x factor) - a Pack
+// may genuinely cost less per piece than buying loose, so cost is set
+// independently per unit rather than always derived. Items that predate
+// this fall back to base cost x factor, same number they'd have gotten
+// before this existed.
 function getItemUnits(item) {
-  const base = { name: item.baseUnitName || 'Piece', factor: 1, price: item.sellingPrice ?? item.unitCost ?? 0, isBase: true };
-  const extra = (item.units || []).map((u) => ({ ...u, isBase: false }));
+  const base = { name: item.baseUnitName || 'Piece', factor: 1, cost: item.unitCost ?? 0, price: item.sellingPrice ?? item.unitCost ?? 0, isBase: true };
+  const extra = (item.units || []).map((u) => ({
+    ...u, isBase: false,
+    cost: u.cost ?? (item.unitCost ?? 0) * (u.factor || 1),
+  }));
   return [base, ...extra];
 }
 
@@ -1822,9 +1830,20 @@ export default function InventorySystem() {
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
     const baseUnitName = (draft.baseUnitName || 'Piece').trim() || 'Piece';
+    const unitCost = Math.max(0, Number(draft.unitCost) || 0);
+    // Selling Price = Base Cost + Markup, for the base unit and every
+    // additional unit independently - markup is what the person actually
+    // types now; price is always the computed result, never typed directly.
+    const baseMarkup = Math.max(0, Number(draft.markup) || 0);
+    const sellingPrice = draft.markup != null ? unitCost + baseMarkup : Math.max(0, Number(draft.sellingPrice) || 0);
     const units = (draft.units || [])
       .filter((u) => u.name && u.name.trim() && Number(u.factor) > 0)
-      .map((u) => ({ name: u.name.trim(), factor: Number(u.factor), price: Number(u.price) || 0 }));
+      .map((u) => {
+        const cost = Math.max(0, Number(u.cost) || 0);
+        const unitMarkup = Math.max(0, Number(u.markup) || 0);
+        const price = u.markup != null ? cost + unitMarkup : (Number(u.price) || 0);
+        return { name: u.name.trim(), factor: Number(u.factor), cost, price };
+      });
     // The physical, discrete stock count at every unit level (e.g. 9 Packs
     // + 19 loose Pieces) is what actually gets stored and what POS
     // deduction cascades against - `quantity` below is just the derived
@@ -1836,9 +1855,9 @@ export default function InventorySystem() {
       const factor = name === baseUnitName ? 1 : (units.find((u) => u.name === name)?.factor || 1);
       return sum + count * factor;
     }, 0);
+    const defaultSellingUnit = draft.defaultSellingUnit && (draft.defaultSellingUnit === baseUnitName || units.some((u) => u.name === draft.defaultSellingUnit))
+      ? draft.defaultSellingUnit : baseUnitName;
     const reorderPoint = Math.max(0, Number(draft.reorderPoint) || 0);
-    const unitCost = Math.max(0, Number(draft.unitCost) || 0);
-    const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
     const { percent: markupValue } = computeMarkupFromPrices(unitCost, sellingPrice);
     const markupType = 'percent';
     const previous = isNew ? null : items.find((i) => i.id === id);
@@ -1849,7 +1868,7 @@ export default function InventorySystem() {
     // existing item never changes which shop it belongs to.
     const shopId = isNew ? (draft.shopId || activeShopId) : (previous?.shopId ?? draft.shopId ?? activeShopId);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock, shopId });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock, shopId, defaultSellingUnit });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -2300,13 +2319,13 @@ export default function InventorySystem() {
       const item = items.find((i) => i.id === line.itemId);
       const factor = line.factor ?? 1;
       // unitPrice/unitCost here are already per SOLD unit (e.g. per Box/Case,
-      // not per Piece) - line.unitPrice comes straight from whichever unit
-      // was selected in POS; the base per-piece cost is multiplied by the
-      // conversion factor so profit is correct regardless of what unit it
-      // sold in.
+      // not per Piece) - both come from whichever unit was selected in POS,
+      // since each unit now has its own independently-set cost (a Pack can
+      // genuinely cost less per piece than buying loose) rather than always
+      // being derived from the base cost.
+      const soldUnit = getItemUnits(item).find((u) => u.name === (line.unitName || item.baseUnitName));
       const price = line.unitPrice ?? (item.sellingPrice ?? item.unitCost);
-      const baseCost = item.unitCost;
-      const lineCost = baseCost * factor;
+      const lineCost = (soldUnit?.cost ?? item.unitCost) * (soldUnit ? 1 : factor); // fallback path still scales by factor if the unit lookup somehow fails
       return {
         itemId: item.id, sku: item.sku, name: item.name,
         qty: line.qty, unitName: line.unitName || item.baseUnitName || 'Piece', factor,
@@ -5664,7 +5683,8 @@ function POSView({ items, onCompleteSale, shops, activeShopId, onSwitchShop }) {
           )}
           {filtered.map((it) => {
             const units = getItemUnits(it);
-            const choiceIdx = Math.min(unitChoice[it.id] ?? 0, units.length - 1);
+            const defaultIdx = Math.max(0, units.findIndex((u) => u.name === it.defaultSellingUnit));
+            const choiceIdx = Math.min(unitChoice[it.id] ?? defaultIdx, units.length - 1);
             const unit = units[choiceIdx];
             const stockInUnit = unit.factor > 0 ? Math.floor((it.quantity || 0) / unit.factor) : 0;
             return (
@@ -6979,30 +6999,42 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
     if (!draft) {
       return {
         sku: '', name: '', category: categories[0] || '', baseUnitStock: '', reorderPoint: '', unitCost: '',
-        location: locations[0] || '', supplierIds: [], sellingPrice: '',
-        baseUnitName: 'Piece', units: [],
+        location: locations[0] || '', supplierIds: [], sellingPrice: '', markup: '',
+        baseUnitName: 'Piece', units: [], defaultSellingUnit: 'Piece',
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
     const counts = getUnitCounts(draft);
     const baseUnitName = draft.baseUnitName || 'Piece';
+    const baseCost = draft.unitCost ?? 0;
+    const baseSelling = draft.sellingPrice ?? baseCost;
     return {
       ...rest, supplierIds: getSupplierIds(draft),
-      sellingPrice: draft.sellingPrice ?? draft.unitCost ?? 0,
+      sellingPrice: baseSelling,
+      markup: Math.round((baseSelling - baseCost) * 100) / 100,
       baseUnitName,
       baseUnitStock: counts[baseUnitName] ?? draft.quantity ?? 0,
-      units: (draft.units && draft.units.length ? draft.units : []).map((u) => ({ ...u, stock: counts[u.name] ?? 0 })),
+      units: (draft.units && draft.units.length ? draft.units : []).map((u) => {
+        const cost = u.cost ?? baseCost * (u.factor || 1);
+        const price = u.price ?? cost;
+        return { ...u, stock: counts[u.name] ?? 0, cost, markup: Math.round((price - cost) * 100) / 100 };
+      }),
+      defaultSellingUnit: draft.defaultSellingUnit || baseUnitName,
     };
   });
 
   const addUnitRow = (name = '') => {
-    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', price: '', stock: 0 }] }));
+    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', cost: '', markup: '', stock: 0 }] }));
   };
   const updateUnitRow = (i, patch) => {
     setForm((f) => ({ ...f, units: f.units.map((u, idx) => idx === i ? { ...u, ...patch } : u) }));
   };
   const removeUnitRow = (i) => {
-    setForm((f) => ({ ...f, units: f.units.filter((_, idx) => idx !== i) }));
+    setForm((f) => ({
+      ...f,
+      units: f.units.filter((_, idx) => idx !== i),
+      defaultSellingUnit: f.defaultSellingUnit === f.units[i]?.name ? f.baseUnitName : f.defaultSellingUnit,
+    }));
   };
 
   // Most items only ever sell one way, so the whole "multiple units" idea
@@ -7040,7 +7072,10 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
 
   const duplicateSku = isDuplicateSku(form.sku, items, draft?.id);
   const valid = form.sku.trim() && form.name.trim() && !duplicateSku;
-  const markup = computeMarkupFromPrices(form.unitCost, form.sellingPrice);
+  // Selling Price = Base Cost + Markup - markup is the input now, price is
+  // the computed readout (used to be the other way around).
+  const computedSellingPrice = (Number(form.unitCost) || 0) + (Number(form.markup) || 0);
+  const markupPercent = (Number(form.unitCost) || 0) > 0 ? ((Number(form.markup) || 0) / Number(form.unitCost)) * 100 : 0;
   const toggleSupplier = (sid) => {
     setForm({
       ...form,
@@ -7127,18 +7162,18 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label={multiUnit ? `Selling Price (₱) — per ${form.baseUnitName || 'Piece'}` : 'Selling Price (₱)'} grow>
-              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.sellingPrice}
-                onChange={(e) => setForm({ ...form, sellingPrice: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+            <Field label={multiUnit ? `Markup (₱) — per ${form.baseUnitName || 'Piece'}` : 'Markup (₱)'} grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.markup}
+                onChange={(e) => setForm({ ...form, markup: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label="Markup" grow>
+            <Field label="Selling Price">
               <div style={{
                 ...styles.modalInput, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                background: markup.amount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
-                fontWeight: 700, color: markup.amount >= 0 ? 'var(--green)' : 'var(--red)',
+                background: computedSellingPrice >= (Number(form.unitCost) || 0) ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                fontWeight: 700, color: computedSellingPrice >= (Number(form.unitCost) || 0) ? 'var(--green)' : 'var(--red)',
               }}>
-                <span>{currency(markup.amount)}</span>
-                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markup.percent.toFixed(1)}%</span>
+                <span>{currency(computedSellingPrice)}</span>
+                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markupPercent.toFixed(1)}%</span>
               </div>
             </Field>
           </div>
@@ -7161,35 +7196,58 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
                   onChange={(e) => setForm({ ...form, baseUnitName: e.target.value })} placeholder="Piece" />
               </Field>
 
-              {form.units.map((u, i) => (
-                <div key={i} style={{
-                  background: 'rgba(59,42,31,0.03)', borderRadius: 8, padding: 12, marginBottom: 10,
-                  display: 'flex', flexDirection: 'column', gap: 8,
-                }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
-                    <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 160, fontWeight: 700 }} placeholder="e.g. Pack" value={u.name}
-                      onChange={(e) => updateUnitRow(i, { name: e.target.value })} />
-                    <button className="depot-btn" style={{ ...styles.ghostBtn, padding: 6 }} onClick={() => removeUnitRow(i)}><X size={13} /></button>
+              <Field label="Default selling unit in POS">
+                <select className="depot-select" style={{ ...styles.modalInput, maxWidth: 220 }}
+                  value={form.defaultSellingUnit} onChange={(e) => setForm({ ...form, defaultSellingUnit: e.target.value })}>
+                  <option value={form.baseUnitName || 'Piece'}>{form.baseUnitName || 'Piece'}</option>
+                  {form.units.filter((u) => u.name).map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+                </select>
+                <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Which price shows first when this item comes up in POS. Every unit stays available to sell regardless.</div>
+              </Field>
+
+              {form.units.map((u, i) => {
+                const uCost = Number(u.cost) || 0;
+                const uMarkup = Number(u.markup) || 0;
+                const uPrice = uCost + uMarkup;
+                const uMarkupPercent = uCost > 0 ? (uMarkup / uCost) * 100 : 0;
+                return (
+                  <div key={i} style={{
+                    background: 'rgba(59,42,31,0.03)', borderRadius: 8, padding: 12, marginBottom: 10,
+                    display: 'flex', flexDirection: 'column', gap: 8,
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
+                      <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 160, fontWeight: 700 }} placeholder="e.g. Pack" value={u.name}
+                        onChange={(e) => updateUnitRow(i, { name: e.target.value })} />
+                      <button className="depot-btn" style={{ ...styles.ghostBtn, padding: 6 }} onClick={() => removeUnitRow(i)}><X size={13} /></button>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>1 {u.name || 'unit'} =</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.factor}
+                        onChange={(e) => updateUnitRow(i, { factor: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                      <span>{form.baseUnitName || 'Piece'}s</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>Base cost ₱</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.cost}
+                        onChange={(e) => updateUnitRow(i, { cost: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                      <span>per {u.name || 'unit'} (set independently — doesn't have to match {form.baseUnitName || 'Piece'} cost × the number above)</span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>Markup ₱</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.markup}
+                        onChange={(e) => updateUnitRow(i, { markup: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                      <span style={{ fontWeight: 700, color: uPrice >= uCost ? 'var(--green)' : 'var(--red)' }}>
+                        → sells for {currency(uPrice)} ({uMarkupPercent.toFixed(1)}%)
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                      <span>Sealed {u.name || 'units'} on the shelf right now:</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.stock}
+                        onChange={(e) => updateUnitRow(i, { stock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                    </div>
                   </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
-                    <span>1 {u.name || 'unit'} =</span>
-                    <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.factor}
-                      onChange={(e) => updateUnitRow(i, { factor: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
-                    <span>{form.baseUnitName || 'Piece'}s</span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
-                    <span>Sells for ₱</span>
-                    <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.price}
-                      onChange={(e) => updateUnitRow(i, { price: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
-                    <span>per {u.name || 'unit'}</span>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
-                    <span>Sealed {u.name || 'units'} on the shelf right now:</span>
-                    <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.stock}
-                      onChange={(e) => updateUnitRow(i, { stock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
-                  </div>
-                </div>
-              ))}
+                );
+              })}
 
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 {UNIT_PRESETS.filter((p) => p !== form.baseUnitName && !form.units.some((u) => u.name === p)).map((p) => (
