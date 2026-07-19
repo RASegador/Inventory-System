@@ -510,6 +510,18 @@ function totalBaseUnits(stock, units) {
   return units.reduce((sum, u) => sum + (stock[u.name] || 0) * u.factor, 0);
 }
 
+// The reorder point can be expressed in any of the item's units now (e.g.
+// "reorder when down to 3 Packs" rather than always thinking in loose
+// Pieces) - this converts it to base-unit terms so it can be compared
+// directly against `item.quantity` everywhere low-stock is checked.
+// Items that predate this default to the base unit, same number they'd
+// have gotten before this existed.
+function reorderThresholdInBase(item) {
+  const units = getItemUnits(item);
+  const unit = units.find((u) => u.name === item.reorderUnit) || units[0];
+  return (Number(item.reorderPoint) || 0) * (unit?.factor || 1);
+}
+
 // Breaks open ONE unit from the next level up, converting it into the
 // current level's unit (e.g. 1 Pack -> 20 Pieces) - recursively breaking
 // open an even-higher level first if the immediate next one is also
@@ -1866,6 +1878,8 @@ export default function InventorySystem() {
     const defaultSellingUnit = draft.defaultSellingUnit && (draft.defaultSellingUnit === baseUnitName || units.some((u) => u.name === draft.defaultSellingUnit))
       ? draft.defaultSellingUnit : baseUnitName;
     const reorderPoint = Math.max(0, Number(draft.reorderPoint) || 0);
+    const reorderUnit = (draft.reorderUnit === baseUnitName || units.some((u) => u.name === draft.reorderUnit))
+      ? draft.reorderUnit : baseUnitName;
     const { percent: markupValue } = computeMarkupFromPrices(unitCost || 0, sellingPrice);
     const markupType = 'percent';
     const previous = isNew ? null : items.find((i) => i.id === id);
@@ -1876,7 +1890,7 @@ export default function InventorySystem() {
     // existing item never changes which shop it belongs to.
     const shopId = isNew ? (draft.shopId || activeShopId) : (previous?.shopId ?? draft.shopId ?? activeShopId);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock, shopId, defaultSellingUnit });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, reorderUnit, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock, shopId, defaultSellingUnit });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -1961,7 +1975,7 @@ export default function InventorySystem() {
           await setDoc(doc(db, 'items', staffItemId), {
             id: staffItemId, ownerId, holderId: staffUid, sourceItemId: source.id,
             sku: source.sku, name: source.name, category: source.category, barcode: source.barcode || generateBarcodeValue(),
-            quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
+            quantity: qty, reorderPoint: source.reorderPoint, reorderUnit: source.reorderUnit, unitCost: cost,
             location: source.location, supplierIds: getSupplierIds(source),
             markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
             shopId: source.shopId || null,
@@ -2637,7 +2651,7 @@ export default function InventorySystem() {
       if (sortKey === 'name') return a.name.localeCompare(b.name);
       if (sortKey === 'qty') return b.quantity - a.quantity;
       if (sortKey === 'value') return b.quantity * b.unitCost - a.quantity * a.unitCost;
-      if (sortKey === 'low') return (a.quantity - a.reorderPoint) - (b.quantity - b.reorderPoint);
+      if (sortKey === 'low') return (a.quantity - reorderThresholdInBase(a)) - (b.quantity - reorderThresholdInBase(b));
       return 0;
     });
     return list;
@@ -2646,7 +2660,7 @@ export default function InventorySystem() {
   const totals = useMemo(() => {
     const totalUnits = myOwnItems.reduce((s, i) => s + i.quantity, 0);
     const totalValue = myOwnItems.reduce((s, i) => s + i.quantity * i.unitCost, 0);
-    const lowStock = myOwnItems.filter((i) => i.quantity <= i.reorderPoint);
+    const lowStock = myOwnItems.filter((i) => i.quantity <= reorderThresholdInBase(i));
     return { totalSkus: myOwnItems.length, totalUnits, totalValue, lowStock };
   }, [items]);
 
@@ -2713,8 +2727,8 @@ export default function InventorySystem() {
         const lastDelivery = inbound.length ? inbound[0].timestamp : null;
         const lastDeliveryQty = inbound.length ? inbound[0].qty : null;
         const expectedNext = lastDelivery ? lastDelivery + supplier.leadTimeDays * DAY_MS : null;
-        const overdue = expectedNext && expectedNext < Date.now() && it.quantity <= it.reorderPoint;
-        const autoStatus = it.quantity <= it.reorderPoint ? (overdue ? 'Delivery Overdue' : 'Reorder Now') : 'On Track';
+        const overdue = expectedNext && expectedNext < Date.now() && it.quantity <= reorderThresholdInBase(it);
+        const autoStatus = it.quantity <= reorderThresholdInBase(it) ? (overdue ? 'Delivery Overdue' : 'Reorder Now') : 'On Track';
         // A manual status override is set per-item (not per-supplier) - if an
         // item has more than one supplier, both rows share the same override.
         const override = deliveryStatuses[it.id];
@@ -4136,7 +4150,7 @@ function Overview({ totals, categoryData, profitStats, staffInventoryStats, role
                     <div style={styles.watchName}>{it.name}</div>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <span style={styles.watchQty}>{it.quantity} / {it.reorderPoint}</span>
+                    <span style={styles.watchQty}>{it.quantity} {it.baseUnitName || 'Piece'} / reorder at {it.reorderPoint} {it.reorderUnit || it.baseUnitName || 'Piece'}</span>
                     <button className="depot-btn" style={styles.smallAmberBtn} onClick={() => onQuickMove(it)}>
                       Receive
                     </button>
@@ -4609,7 +4623,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
               <tr><td colSpan={13} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No items match your search.</td></tr>
             )}
             {filtered.map((it) => {
-              const low = it.quantity <= it.reorderPoint;
+              const low = it.quantity <= reorderThresholdInBase(it);
               const names = supplierNames(it);
               return (
                 <tr key={it.id} className="depot-row">
@@ -4716,7 +4730,7 @@ function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedSta
             </thead>
             <tbody>
               {staffItems.map((it) => {
-                const low = it.quantity <= it.reorderPoint;
+                const low = it.quantity <= reorderThresholdInBase(it);
                 const markupLabel = it.markupType === 'fixed' ? `${currency(it.markupValue || 0)} flat` : `${it.markupValue || 0}%`;
                 return (
                   <tr key={it.id} className="depot-row">
@@ -7037,7 +7051,7 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
   const [form, setForm] = useState(() => {
     if (!draft) {
       return {
-        sku: '', name: '', category: categories[0] || '', baseUnitStock: '', reorderPoint: '', unitCost: '',
+        sku: '', name: '', category: categories[0] || '', baseUnitStock: '', reorderPoint: '', reorderUnit: 'Piece', unitCost: '',
         location: '', supplierIds: [], sellingPrice: '',
         baseUnitName: 'Piece', units: [], defaultSellingUnit: 'Piece',
       };
@@ -7056,6 +7070,7 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
       baseUnitStock: counts[baseUnitName] ?? draft.quantity ?? 0,
       units: (draft.units && draft.units.length ? draft.units : []).map((u) => ({ ...u, stock: counts[u.name] ?? 0, cost: u.cost ?? '' })),
       defaultSellingUnit: draft.defaultSellingUnit || baseUnitName,
+      reorderUnit: draft.reorderUnit || baseUnitName,
     };
   });
 
@@ -7193,8 +7208,22 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
                 onChange={(e) => setForm({ ...form, baseUnitStock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
             <Field label="Reorder Point" grow>
-              <input className="depot-input" type="number" style={styles.modalInput} value={form.reorderPoint}
-                onChange={(e) => setForm({ ...form, reorderPoint: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input className="depot-input" type="number" style={{ ...styles.modalInput, flex: multiUnit ? 1 : undefined }} value={form.reorderPoint}
+                  onChange={(e) => setForm({ ...form, reorderPoint: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                {multiUnit && (
+                  <select className="depot-select" style={{ ...styles.modalInput, flex: 1, padding: '9px 8px' }}
+                    value={form.reorderUnit} onChange={(e) => setForm({ ...form, reorderUnit: e.target.value })}>
+                    <option value={form.baseUnitName || 'Piece'}>{form.baseUnitName || 'Piece'}</option>
+                    {form.units.filter((u) => u.name).map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+                  </select>
+                )}
+              </div>
+              {multiUnit && (
+                <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>
+                  e.g. "3 Pack" flags low stock once fewer than 3 Packs' worth remain, regardless of loose Pieces.
+                </div>
+              )}
             </Field>
             <Field label="Base Price (₱) — optional" grow>
               <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={form.unitCost} placeholder="Leave blank if unknown"
