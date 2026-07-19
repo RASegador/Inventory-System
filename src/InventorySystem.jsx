@@ -17,7 +17,7 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2,
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2, PackagePlus,
   Wrench, Hammer, Ruler, PaintBucket, SprayCan, Droplet, Sparkles, FlaskConical, ShoppingBag, Shirt, Gem, Footprints,
   Barcode, ScanLine, Bluetooth, CheckSquare, Square
 } from 'lucide-react';
@@ -457,6 +457,90 @@ function computeMarkupFromPrices(baseCost, sellingPrice) {
   return { amount, percent };
 }
 
+// ---------------------------------------------------------------------------
+// Units of measure. `item.quantity` always represents stock in the item's
+// BASE unit (e.g. "Piece") - every other unit (Pack, Box/Case, custom) is
+// just a conversion factor + its own price on top of that same underlying
+// stock number, so inventory tracking only ever has one source of truth
+// regardless of how something is actually sold.
+// ---------------------------------------------------------------------------
+const UNIT_PRESETS = ['Piece', 'Pack', 'Box/Case'];
+
+// Every sellable unit for an item, base unit first (factor 1, using the
+// item's own sellingPrice) followed by whatever extra units were defined.
+function getItemUnits(item) {
+  const base = { name: item.baseUnitName || 'Piece', factor: 1, price: item.sellingPrice ?? item.unitCost ?? 0, isBase: true };
+  const extra = (item.units || []).map((u) => ({ ...u, isBase: false }));
+  return [base, ...extra];
+}
+
+// The actual discrete count of each unit physically on hand (e.g. 9 Packs,
+// 19 Pieces) - NOT derived by dividing a single total, since a shelf can
+// genuinely hold a mix of sealed Packs and loose Pieces at once. Items
+// that predate this feature (or have never had their per-unit stock set)
+// default to holding everything as loose units of the base unit, which
+// preserves their existing `quantity` exactly.
+function getUnitCounts(item) {
+  const units = getItemUnits(item);
+  const counts = {};
+  units.forEach((u) => { counts[u.name] = 0; });
+  if (item.unitStock && typeof item.unitStock === 'object') {
+    units.forEach((u) => { counts[u.name] = Number(item.unitStock[u.name]) || 0; });
+  } else {
+    counts[units[0].name] = item.quantity || 0;
+  }
+  return counts;
+}
+
+// Sum of every unit's count converted to base-unit terms - this is what
+// `item.quantity` always represents, kept in sync as a derived total any
+// time `unitStock` changes, so every other part of the app (low-stock
+// alerts, Inventory Value, Delivery reports, etc.) keeps working exactly
+// as before without needing to know about per-unit breakdowns at all.
+function totalBaseUnits(stock, units) {
+  return units.reduce((sum, u) => sum + (stock[u.name] || 0) * u.factor, 0);
+}
+
+// Breaks open ONE unit from the next level up, converting it into the
+// current level's unit (e.g. 1 Pack -> 20 Pieces) - recursively breaking
+// open an even-higher level first if the immediate next one is also
+// empty (e.g. no Packs left, so break a Box into Packs first). Never
+// pulls stock downward from a smaller unit into a larger one.
+function breakOpenOneLevelUp(stock, units, levelIdx) {
+  if (levelIdx + 1 >= units.length) return false;
+  if ((stock[units[levelIdx + 1].name] || 0) <= 0) {
+    const gotHigher = breakOpenOneLevelUp(stock, units, levelIdx + 1);
+    if (!gotHigher) return false;
+  }
+  stock[units[levelIdx + 1].name] -= 1;
+  const conversion = units[levelIdx + 1].factor / units[levelIdx].factor;
+  stock[units[levelIdx].name] = (stock[units[levelIdx].name] || 0) + conversion;
+  return true;
+}
+
+// Deducts `qtyNeeded` of `sellUnitName` from `stock`, automatically
+// breaking open larger units as needed when the sold unit runs short -
+// e.g. selling Pieces when Pieces run out breaks open a Pack; selling
+// Packs when Packs run out breaks open a Box/Case. Returns the updated
+// stock plus any shortfall (>0 means genuinely not enough stock at any
+// level, in which case nothing is deducted below zero).
+function cascadeDeductUnit(stock, units, sellUnitName, qtyNeeded) {
+  const newStock = { ...stock };
+  const sellLevelIdx = units.findIndex((u) => u.name === sellUnitName);
+  if (sellLevelIdx === -1) return { newStock, shortfall: qtyNeeded };
+
+  while ((newStock[sellUnitName] || 0) < qtyNeeded) {
+    const opened = breakOpenOneLevelUp(newStock, units, sellLevelIdx);
+    if (!opened) break;
+  }
+
+  const available = newStock[sellUnitName] || 0;
+  const take = Math.min(available, qtyNeeded);
+  newStock[sellUnitName] = available - take;
+  const shortfall = qtyNeeded - take;
+  return { newStock, shortfall };
+}
+
 // --- Subscription helpers -------------------------------------------------
 // A Client Admin's subscription lives entirely on their own users/{uid}
 // doc as `subscription: { history: [...] }` - Super Admin writes it,
@@ -768,6 +852,7 @@ const VIEW_PERMISSIONS = {
   categories: 'manageCategories',
   locations: 'manageLocations',
   orders: 'manageOrders',
+  restock: 'stockReceive',
   delivery: 'viewReports',
   sales: 'viewSalesReports',
   mysales: 'viewOwnSales',
@@ -1049,6 +1134,7 @@ export default function InventorySystem() {
   const [deliveryStatuses, setDeliveryStatuses] = useState({});
   const [sales, setSales] = useState([]);
   const [orders, setOrders] = useState([]);
+  const [restocks, setRestocks] = useState([]);
   const [loginLogs, setLoginLogs] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState('overview');
@@ -1059,6 +1145,7 @@ export default function InventorySystem() {
   const [moveModal, setMoveModal] = useState(null);
   const [supplierModal, setSupplierModal] = useState(null);
   const [orderModal, setOrderModal] = useState(null);
+  const [restockModal, setRestockModal] = useState(false);
   const [assignModal, setAssignModal] = useState(null);
   const [markupModal, setMarkupModal] = useState(null);
   const [returnModal, setReturnModal] = useState(null);
@@ -1627,6 +1714,9 @@ export default function InventorySystem() {
         unsubs.push(onSnapshot(query(collection(db, 'orders'), where('ownerId', '==', ownerId)), (snap) => {
           setOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.orderDate - a.orderDate));
         }, logSnapErr('orders')));
+        unsubs.push(onSnapshot(query(collection(db, 'restocks'), where('ownerId', '==', ownerId)), (snap) => {
+          setRestocks(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.receivedAt - a.receivedAt));
+        }, logSnapErr('restocks')));
         // Super Admin monitors login activity platform-wide; a Client only
         // sees activity for their own tenant (themselves + their staff).
         const logsQuery = myRole === 'superadmin'
@@ -1640,6 +1730,7 @@ export default function InventorySystem() {
         setDeliveryStatuses({});
         setLoginLogs([]);
         setOrders([]);
+        setRestocks([]);
         // Staff only ever see their own sales - the query itself (not just the
         // rule) scopes this, so there's no risk of over-fetching then hiding.
         unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
@@ -1681,7 +1772,21 @@ export default function InventorySystem() {
     const isNew = !draft.id;
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
-    const quantity = Math.max(0, Number(draft.quantity) || 0);
+    const baseUnitName = (draft.baseUnitName || 'Piece').trim() || 'Piece';
+    const units = (draft.units || [])
+      .filter((u) => u.name && u.name.trim() && Number(u.factor) > 0)
+      .map((u) => ({ name: u.name.trim(), factor: Number(u.factor), price: Number(u.price) || 0 }));
+    // The physical, discrete stock count at every unit level (e.g. 9 Packs
+    // + 19 loose Pieces) is what actually gets stored and what POS
+    // deduction cascades against - `quantity` below is just the derived
+    // total in base-unit terms, kept for every other part of the app that
+    // reads a single number.
+    const unitStock = { [baseUnitName]: Math.max(0, Number(draft.baseUnitStock) || 0) };
+    units.forEach((u) => { unitStock[u.name] = Math.max(0, Number((draft.units.find((x) => x.name === u.name) || {}).stock) || 0); });
+    const quantity = Object.entries(unitStock).reduce((sum, [name, count]) => {
+      const factor = name === baseUnitName ? 1 : (units.find((u) => u.name === name)?.factor || 1);
+      return sum + count * factor;
+    }, 0);
     const reorderPoint = Math.max(0, Number(draft.reorderPoint) || 0);
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
     const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
@@ -1692,7 +1797,7 @@ export default function InventorySystem() {
     // as-is on every later edit (never regenerated for an existing item).
     const barcode = isNew ? (draft.barcode || generateBarcodeValue()) : (draft.barcode || previous?.barcode || generateBarcodeValue());
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -1752,9 +1857,16 @@ export default function InventorySystem() {
       }
       const cost = Math.max(0, Number(line.unitCost) || 0) || source.unitCost;
       const existing = items.find((i) => i.holderId === staffUid && i.sourceItemId === source.id);
+      // Assigning to staff deducts from the source item's base unit, same
+      // as manual Issue - reuses the same break-open cascade so the
+      // discrete per-unit breakdown (Packs/Boxes/etc.) stays accurate
+      // instead of silently drifting from the new total.
+      const sourceBaseUnitName = source.baseUnitName || 'Piece';
+      const sourceUnits = getItemUnits(source);
+      const { newStock: sourceNewStock } = cascadeDeductUnit(getUnitCounts(source), sourceUnits, sourceBaseUnitName, qty);
 
       try {
-        await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty });
+        await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty, unitStock: sourceNewStock });
 
         let staffItemId;
         if (existing) {
@@ -1859,10 +1971,20 @@ export default function InventorySystem() {
       // rules) - just reduce to 0. The admin can clean up a zero-quantity
       // item manually if they want to.
       const remaining = Math.max(0, staffItem.quantity - qty);
-      await setDoc(doc(db, 'items', staffItem.id), { ...staffItem, quantity: remaining });
+      // Reducing the staff item's stock reuses the break-open cascade
+      // (same as any other "issue" of stock), and crediting it back to the
+      // admin's own item simply adds loose stock at its base unit level -
+      // same pattern as manual Receive/Issue and staff assignment above.
+      const staffBaseUnitName = staffItem.baseUnitName || 'Piece';
+      const staffUnits = getItemUnits(staffItem);
+      const { newStock: staffNewStock } = cascadeDeductUnit(getUnitCounts(staffItem), staffUnits, staffBaseUnitName, qty);
+      await setDoc(doc(db, 'items', staffItem.id), { ...staffItem, quantity: remaining, unitStock: staffNewStock });
 
       if (adminItem) {
-        await setDoc(doc(db, 'items', adminItem.id), { ...adminItem, quantity: adminItem.quantity + qty });
+        const adminBaseUnitName = adminItem.baseUnitName || 'Piece';
+        const adminCounts = getUnitCounts(adminItem);
+        const adminNewStock = { ...adminCounts, [adminBaseUnitName]: (adminCounts[adminBaseUnitName] || 0) + qty };
+        await setDoc(doc(db, 'items', adminItem.id), { ...adminItem, quantity: adminItem.quantity + qty, unitStock: adminNewStock });
       }
 
       const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
@@ -2015,9 +2137,24 @@ export default function InventorySystem() {
     if (!item) return;
     const delta = type === 'in' ? qty : -qty;
     const newQty = Math.max(0, item.quantity + delta);
+    // Manual receive/issue always happens in the item's base unit (there's
+    // no unit picker on this flow). Receiving simply adds loose stock at
+    // the base level. Issuing more than what's currently loose reuses the
+    // same break-open cascade as POS, so the discrete per-unit breakdown
+    // never drifts out of sync with the new total.
+    const baseUnitName = item.baseUnitName || 'Piece';
+    const units = getItemUnits(item);
+    const counts = getUnitCounts(item);
+    let unitStock;
+    if (type === 'in') {
+      unitStock = { ...counts, [baseUnitName]: (counts[baseUnitName] || 0) + qty };
+    } else {
+      const result = cascadeDeductUnit(counts, units, baseUnitName, qty);
+      unitStock = result.newStock; // shortfall (if any) is already reflected in newQty via Math.max(0, ...) above
+    }
     const mvId = 'm' + Math.random().toString(36).slice(2, 9);
     try {
-      await setDoc(doc(db, 'items', itemId), { ...item, quantity: newQty });
+      await setDoc(doc(db, 'items', itemId), { ...item, quantity: newQty, unitStock });
       await setDoc(doc(db, 'movements', mvId), {
         id: mvId, itemId, type, qty,
         reason: reason || (type === 'in' ? 'Stock received' : 'Stock issued'),
@@ -2030,27 +2167,95 @@ export default function InventorySystem() {
     setMoveModal(null);
   };
 
+  // Order / Restock module: unlike a formal Purchase Order (Stock
+  // Management -> Orders, which has a Pending/Received/Cancelled
+  // lifecycle and a required supplier), every restock record here
+  // represents inventory that has ALREADY been received - there's no
+  // status to track, and a supplier is entirely optional. Submitting one
+  // both logs a dedicated, searchable restock record AND updates the
+  // item's stock immediately, same permission gate as a manual Receive.
+  const createRestock = async ({ itemId, quantity, unitName, unitCost, supplierId, notes }) => {
+    if (!can(myRole, 'stockReceive')) { showToast("You don't have permission to receive stock"); return; }
+    const item = items.find((i) => i.id === itemId);
+    const qty = Math.max(0, Number(quantity) || 0);
+    if (!item || qty <= 0) { showToast('Pick an item and a quantity greater than zero'); return; }
+
+    const units = getItemUnits(item);
+    const unit = units.find((u) => u.name === unitName) || units[0];
+    const counts = getUnitCounts(item);
+    const newStock = { ...counts, [unit.name]: (counts[unit.name] || 0) + qty };
+    const newQuantity = totalBaseUnits(newStock, units);
+    const cost = Math.max(0, Number(unitCost) || 0) || item.unitCost;
+    const supplier = supplierId ? suppliers.find((s) => s.id === supplierId) : null;
+    const now = Date.now();
+    const restockId = 'rs' + Math.random().toString(36).slice(2, 9);
+
+    try {
+      await setDoc(doc(db, 'items', itemId), { ...item, quantity: newQuantity, unitStock: newStock });
+      await setDoc(doc(db, 'restocks', restockId), {
+        id: restockId, itemId, itemSku: item.sku, itemName: item.name,
+        quantity: qty, unitName: unit.name, unitCost: cost,
+        supplierId: supplier?.id || null, supplierName: supplier?.name || null,
+        receivedAt: now, receivedBy: user.uid, receivedByEmail: user.email || '',
+        receivedByUsername: myProfile?.username || '', notes: notes || '', ownerId,
+      });
+      const mvId = 'm' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'movements', mvId), {
+        id: mvId, itemId, type: 'in', qty: qty * unit.factor,
+        reason: `Restock${supplier ? ` from ${supplier.name}` : ''}${unit.name !== (item.baseUnitName || 'Piece') ? ` (${qty} ${unit.name})` : ''}`,
+        timestamp: now, ownerId,
+      });
+      logActivity('restock_received', { itemSku: item.sku, itemName: item.name, quantity: qty, unitName: unit.name, supplierName: supplier?.name || 'none' });
+      showToast(`Received ${qty} ${unit.name}${qty === 1 ? '' : 's'} of ${item.sku}`);
+      setRestockModal(false);
+    } catch (e) {
+      showToast('Could not record restock — check your connection');
+    }
+  };
+
   const completeSale = async (cartLines, amountReceived) => {
     if (cartLines.length === 0) return;
+
+    // Simulate the cascading break-open deduction for every affected item
+    // BEFORE writing anything, so a sale either fully succeeds or fully
+    // fails - never partially deducts some lines and not others. Cart
+    // lines are grouped by item since the same item can appear multiple
+    // times in one sale in different units (e.g. 2 Pieces AND 1 Pack of
+    // the same product), and each line has to see the effect of the ones
+    // before it.
+    const finalStockByItem = {}; // itemId -> { units, newStock, newQuantity }
     for (const line of cartLines) {
       const item = items.find((i) => i.id === line.itemId);
-      if (!item || line.qty > item.quantity) {
-        showToast(`Not enough stock for ${item ? item.sku : 'item'}`);
+      if (!item) { showToast('An item in this sale no longer exists'); return; }
+      const units = getItemUnits(item);
+      const current = finalStockByItem[item.id]?.newStock || getUnitCounts(item);
+      const sellUnitName = line.unitName || item.baseUnitName || 'Piece';
+      const { newStock, shortfall } = cascadeDeductUnit(current, units, sellUnitName, line.qty);
+      if (shortfall > 0) {
+        showToast(`Not enough stock for ${item.sku} (short ${shortfall} ${sellUnitName}${shortfall === 1 ? '' : 's'} even after opening larger units)`);
         return;
       }
+      finalStockByItem[item.id] = { units, newStock, newQuantity: totalBaseUnits(newStock, units) };
     }
+
     const receiptNo = 'R' + Date.now().toString(36).toUpperCase();
     const now = Date.now();
     const saleLines = cartLines.map((line) => {
       const item = items.find((i) => i.id === line.itemId);
-      // Fall back to unitCost for items saved before markup/pricing existed
-      // (they've never had a sellingPrice computed and stored yet).
-      const price = item.sellingPrice ?? item.unitCost;
-      const cost = item.unitCost;
+      const factor = line.factor ?? 1;
+      // unitPrice/unitCost here are already per SOLD unit (e.g. per Box/Case,
+      // not per Piece) - line.unitPrice comes straight from whichever unit
+      // was selected in POS; the base per-piece cost is multiplied by the
+      // conversion factor so profit is correct regardless of what unit it
+      // sold in.
+      const price = line.unitPrice ?? (item.sellingPrice ?? item.unitCost);
+      const baseCost = item.unitCost;
+      const lineCost = baseCost * factor;
       return {
         itemId: item.id, sku: item.sku, name: item.name,
-        qty: line.qty, unitPrice: price, unitCost: cost,
-        lineTotal: price * line.qty, lineProfit: (price - cost) * line.qty,
+        qty: line.qty, unitName: line.unitName || item.baseUnitName || 'Piece', factor,
+        unitPrice: price, unitCost: lineCost,
+        lineTotal: price * line.qty, lineProfit: (price - lineCost) * line.qty,
       };
     });
     const subtotal = saleLines.reduce((s, l) => s + l.lineTotal, 0);
@@ -2070,15 +2275,21 @@ export default function InventorySystem() {
     };
 
     try {
-      await Promise.all(cartLines.map((line) => {
-        const item = items.find((i) => i.id === line.itemId);
-        return setDoc(doc(db, 'items', line.itemId), { ...item, quantity: item.quantity - line.qty });
+      // One write per affected item (not per cart line), carrying the
+      // final post-cascade stock breakdown plus the recomputed total.
+      await Promise.all(Object.entries(finalStockByItem).map(([itemId, { newStock, newQuantity }]) => {
+        const item = items.find((i) => i.id === itemId);
+        return setDoc(doc(db, 'items', itemId), { ...item, quantity: newQuantity, unitStock: newStock });
       }));
       await Promise.all(cartLines.map((line) => {
         const mvId = 'm' + Math.random().toString(36).slice(2, 9);
+        const baseQty = line.qty * (line.factor ?? 1);
+        // Movements are always recorded in the item's base unit, same as
+        // every other stock-in/stock-out path in the app, regardless of
+        // which unit was actually sold at the register.
         return setDoc(doc(db, 'movements', mvId), {
-          id: mvId, itemId: line.itemId, type: 'out', qty: line.qty,
-          reason: `Sale ${receiptNo}`, timestamp: now, ownerId,
+          id: mvId, itemId: line.itemId, type: 'out', qty: baseQty,
+          reason: `Sale ${receiptNo}${line.unitName && line.unitName !== 'Piece' ? ` (${line.qty} ${line.unitName})` : ''}`, timestamp: now, ownerId,
         });
       }));
       await setDoc(doc(db, 'sales', sale.id), sale);
@@ -2452,6 +2663,7 @@ export default function InventorySystem() {
             if (view === 'inventory') setItemModal('new');
             if (view === 'suppliers') setSupplierModal('new');
             if (view === 'orders') setOrderModal('new');
+            if (view === 'restock') setRestockModal(true);
           }}
         />
 
@@ -2529,6 +2741,10 @@ export default function InventorySystem() {
             onReceive={receiveOrder}
             onCancel={(o) => setConfirmModal({ kind: 'order', target: o })}
           />
+        )}
+
+        {view === 'restock' && (
+          <RestockView restocks={restocks} />
         )}
 
         {view === 'categories' && (
@@ -2661,6 +2877,15 @@ export default function InventorySystem() {
           suppliers={suppliers}
           onClose={() => setOrderModal(null)}
           onSave={saveOrder}
+        />
+      )}
+
+      {restockModal && (
+        <RestockModal
+          items={myOwnItems}
+          suppliers={suppliers}
+          onClose={() => setRestockModal(false)}
+          onSave={createRestock}
         />
       )}
 
@@ -3404,12 +3629,13 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
       { key: 'staffInventory', label: 'Staff Inventory', icon: User },
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
       { key: 'orders', label: 'Orders', icon: ClipboardList },
+      { key: 'restock', label: 'Restock', icon: PackagePlus },
       { key: 'categories', label: 'Categories', icon: Tag },
       { key: 'locations', label: 'Zonal Locations', icon: MapPin },
     ] },
     { type: 'item', key: 'mysales', label: 'My Sales', icon: Receipt },
     { type: 'group', label: 'Reports', icon: ScrollText, children: [
-      { key: 'delivery', label: 'Delivery Times', icon: Timer },
+      { key: 'delivery', label: 'Restock Records', icon: Timer },
       { key: 'sales', label: 'Sales History', icon: Receipt },
       { key: 'history', label: 'Transaction History', icon: ScrollText },
       { key: 'activity', label: 'Activity Log', icon: Clock },
@@ -3548,9 +3774,10 @@ function TopBar({ view, role, onAdd }) {
     clientAccounts: ['Client Accounts', 'Manage subscriptions for every business on the platform'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     orders: ['Orders', 'Purchase orders placed with your suppliers'],
+    restock: ['Restock', 'Receive inventory, with or without a supplier'],
     categories: ['Categories', 'Organize items into your own groups'],
     locations: ['Zonal Locations', 'Manage where stock is stored'],
-    delivery: ['Delivery Times', 'Lead times and expected restocks'],
+    delivery: ['Restock Records', 'Lead times and expected restocks'],
     sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
     approvals: ['Team', 'Manage your team roster, roles, and approvals'],
@@ -3560,7 +3787,7 @@ function TopBar({ view, role, onAdd }) {
   };
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'))
-    || (view === 'orders' && can(role, 'manageOrders'));
+    || (view === 'orders' && can(role, 'manageOrders')) || (view === 'restock' && can(role, 'stockReceive'));
   const showManualLink = view === 'overview';
   return (
     <div style={styles.topbar} className="depot-topbar">
@@ -3570,7 +3797,7 @@ function TopBar({ view, role, onAdd }) {
       </div>
       {showAdd && (
         <button className="depot-btn depot-no-print depot-topbar-btn" style={styles.primaryBtn} onClick={onAdd}>
-          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : 'New Item'}
+          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : view === 'restock' ? 'New Restock' : 'New Item'}
         </button>
       )}
       {showManualLink && (
@@ -4169,6 +4396,15 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                   <td style={styles.td}>
                     <span style={{ color: low ? 'var(--red)' : 'var(--ink)', fontWeight: low ? 700 : 500 }}>{it.quantity}</span>
                     {low && <AlertTriangle size={12} color="var(--red)" style={{ marginLeft: 5, verticalAlign: -1 }} />}
+                    {it.units && it.units.length > 0 && (() => {
+                      const counts = getUnitCounts(it);
+                      const units = getItemUnits(it);
+                      return (
+                        <div style={{ fontSize: 10.5, color: 'rgba(59,42,31,0.5)', marginTop: 2 }}>
+                          {units.map((u) => `${counts[u.name]} ${u.name}${counts[u.name] === 1 ? '' : 's'}`).join(' • ')}
+                        </div>
+                      );
+                    })()}
                   </td>
                   <td style={styles.td}>{currency(it.unitCost)}</td>
                   <td style={styles.td}>{currency(it.sellingPrice ?? it.unitCost)}</td>
@@ -5127,32 +5363,42 @@ function POSView({ items, onCompleteSale }) {
   }, [sellable, search]);
 
   const itemMap = useMemo(() => Object.fromEntries(items.map((i) => [i.id, i])), [items]);
-  const priceOf = (item) => item.sellingPrice ?? item.unitCost;
+  // Which unit is currently selected on each item's card, keyed by item id
+  // (index into that item's getItemUnits() list; 0 = base unit).
+  const [unitChoice, setUnitChoice] = useState({});
 
-  const addToCart = (item) => {
+  // Base-unit stock already committed to the cart for a given item, across
+  // every unit it might be present as - needed so mixing e.g. a Box/Case
+  // and some loose Pieces of the same item in one sale can't oversell it.
+  const cartBaseUsage = (prev, itemId, excludeKey) =>
+    prev.filter((l) => l.itemId === itemId && l.key !== excludeKey).reduce((s, l) => s + l.factor * l.qty, 0);
+
+  const addToCart = (item, unit) => {
     setLastReceipt(null);
+    const key = `${item.id}:${unit.name}`;
     setCart((prev) => {
-      const existing = prev.find((l) => l.itemId === item.id);
-      if (existing) {
-        if (existing.qty >= item.quantity) return prev;
-        return prev.map((l) => (l.itemId === item.id ? { ...l, qty: l.qty + 1 } : l));
-      }
-      return [...prev, { itemId: item.id, qty: 1 }];
+      const used = cartBaseUsage(prev, item.id, null);
+      const remaining = item.quantity - used;
+      if (remaining < unit.factor) return prev;
+      const existing = prev.find((l) => l.key === key);
+      if (existing) return prev.map((l) => l.key === key ? { ...l, qty: l.qty + 1 } : l);
+      return [...prev, {
+        key, itemId: item.id, sku: item.sku, name: item.name,
+        unitName: unit.name, factor: unit.factor, unitPrice: unit.price, unitCost: item.unitCost, qty: 1,
+      }];
     });
   };
 
-  const changeQty = (itemId, delta) => {
-    setCart((prev) => prev
-      .map((l) => {
-        if (l.itemId !== itemId) return l;
-        const max = itemMap[itemId]?.quantity ?? l.qty;
-        const nextQty = Math.min(max, Math.max(1, l.qty + delta));
-        return { ...l, qty: nextQty };
-      })
-    );
+  const changeQty = (key, itemId, factor, delta) => {
+    setCart((prev) => {
+      const item = itemMap[itemId];
+      const used = cartBaseUsage(prev, itemId, key);
+      const maxUnits = item ? Math.max(1, Math.floor((item.quantity - used) / factor)) : Infinity;
+      return prev.map((l) => l.key === key ? { ...l, qty: Math.min(maxUnits, Math.max(1, l.qty + delta)) } : l);
+    });
   };
 
-  const removeLine = (itemId) => setCart((prev) => prev.filter((l) => l.itemId !== itemId));
+  const removeLine = (key) => setCart((prev) => prev.filter((l) => l.key !== key));
 
   // Bluetooth/USB scanner support: a scan is treated exactly like tapping
   // the matching item card. Works regardless of what's focused on screen,
@@ -5168,7 +5414,7 @@ function POSView({ items, onCompleteSale }) {
   const handleScan = (code) => {
     const found = findItemByScan(sellable, code);
     if (found) {
-      addToCart(found);
+      addToCart(found, getItemUnits(found)[0]);
       setScanMsg({ ok: true, text: `Scanned: ${found.name}` });
     } else {
       setScanMsg({ ok: false, text: `No item matches barcode ${code}` });
@@ -5176,7 +5422,7 @@ function POSView({ items, onCompleteSale }) {
   };
   useBarcodeScanner(handleScan, true);
 
-  const subtotal = cart.reduce((s, l) => s + priceOf(itemMap[l.itemId] || {}) * l.qty, 0);
+  const subtotal = cart.reduce((s, l) => s + l.unitPrice * l.qty, 0);
   const total = subtotal;
   const receivedNum = amountReceived === '' ? null : Number(amountReceived);
   const change = receivedNum != null ? receivedNum - total : null;
@@ -5229,16 +5475,39 @@ function POSView({ items, onCompleteSale }) {
           {filtered.length === 0 && (
             <div style={styles.emptyState}>No sellable items match your search.</div>
           )}
-          {filtered.map((it) => (
-            <button key={it.id} className="depot-btn" style={styles.posItemCard} onClick={() => addToCart(it)}>
-              <div style={styles.posItemSku}>{it.sku}</div>
-              <div style={styles.posItemName}>{it.name}</div>
-              <div style={styles.posItemFooter}>
-                <span>{currency(priceOf(it))}</span>
-                <span style={{ color: 'rgba(59,42,31,0.5)' }}>{it.quantity} in stock</span>
+          {filtered.map((it) => {
+            const units = getItemUnits(it);
+            const choiceIdx = Math.min(unitChoice[it.id] ?? 0, units.length - 1);
+            const unit = units[choiceIdx];
+            const stockInUnit = unit.factor > 0 ? Math.floor((it.quantity || 0) / unit.factor) : 0;
+            return (
+              <div key={it.id} className="depot-btn" style={{ ...styles.posItemCard, cursor: 'default' }}>
+                <div style={styles.posItemSku}>{it.sku}</div>
+                <div style={styles.posItemName}>{it.name}</div>
+                {units.length > 1 && (
+                  <select
+                    className="depot-select" style={{ ...styles.modalInput, fontSize: 11.5, padding: '4px 8px', marginTop: 4, marginBottom: 4 }}
+                    value={choiceIdx} onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setUnitChoice((prev) => ({ ...prev, [it.id]: Number(e.target.value) }))}
+                  >
+                    {units.map((u, i) => <option key={u.name} value={i}>{u.name}</option>)}
+                  </select>
+                )}
+                <div style={styles.posItemFooter}>
+                  <span>{currency(unit.price)}</span>
+                  <span style={{ color: stockInUnit > 0 ? 'rgba(59,42,31,0.5)' : 'var(--red)' }}>
+                    {stockInUnit} {unit.name}{stockInUnit === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <button
+                  className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 6, padding: '6px 10px', fontSize: 12, opacity: stockInUnit > 0 ? 1 : 0.4 }}
+                  disabled={stockInUnit <= 0} onClick={() => addToCart(it, unit)}
+                >
+                  <Plus size={13} /> Add
+                </button>
               </div>
-            </button>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -5252,27 +5521,24 @@ function POSView({ items, onCompleteSale }) {
           <div style={styles.emptyState}>Tap an item to add it to the sale.</div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
-            {cart.map((line) => {
-              const item = itemMap[line.itemId];
-              if (!item) return null;
-              return (
-                <div key={line.itemId} style={styles.cartLine}>
-                  <div style={{ flex: 1 }}>
-                    <div style={styles.watchSku}>{item.sku}</div>
-                    <div style={styles.watchName}>{item.name}</div>
-                  </div>
-                  <div style={styles.qtyStepper}>
-                    <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.itemId, -1)}><Minus size={12} /></button>
-                    <span style={styles.qtyValue}>{line.qty}</span>
-                    <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.itemId, 1)}><Plus size={12} /></button>
-                  </div>
-                  <div style={{ width: 72, textAlign: 'right', fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
-                    {currency(priceOf(item) * line.qty)}
-                  </div>
-                  <IconBtn onClick={() => removeLine(line.itemId)} title="Remove" danger><X size={13} /></IconBtn>
+            {cart.map((line) => (
+              <div key={line.key} style={styles.cartLine}>
+                <div style={{ flex: 1 }}>
+                  <div style={styles.watchSku}>{line.sku}</div>
+                  <div style={styles.watchName}>{line.name}</div>
+                  <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)' }}>{currency(line.unitPrice)} / {line.unitName}</div>
                 </div>
-              );
-            })}
+                <div style={styles.qtyStepper}>
+                  <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.key, line.itemId, line.factor, -1)}><Minus size={12} /></button>
+                  <span style={styles.qtyValue}>{line.qty}</span>
+                  <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.key, line.itemId, line.factor, 1)}><Plus size={12} /></button>
+                </div>
+                <div style={{ width: 72, textAlign: 'right', fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
+                  {currency(line.unitPrice * line.qty)}
+                </div>
+                <IconBtn onClick={() => removeLine(line.key)} title="Remove" danger><X size={13} /></IconBtn>
+              </div>
+            ))}
           </div>
         )}
 
@@ -5384,7 +5650,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
     sale.receiptNo,
     new Date(sale.timestamp).toLocaleString('en-PH'),
     cashierLabel(sale),
-    sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
+    sale.items.map((l) => `${l.qty}${l.unitName ? ' ' + l.unitName : ''}x ${l.sku}`).join('; '),
     totalQtyFor(sale),
     sale.subtotal.toFixed(2),
     sale.total.toFixed(2),
@@ -5608,7 +5874,7 @@ function MySalesView({ sales }) {
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
-                  <td style={styles.td}>{sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}</td>
+                  <td style={styles.td}>{sale.items.map((l) => `${l.qty}${l.unitName ? ' ' + l.unitName : ''}× ${l.sku}`).join(', ')}</td>
                   <td style={{ ...styles.td, fontWeight: 600 }}>{sale.items.reduce((sum, l) => sum + l.qty, 0)}</td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
                   <td style={styles.td}>
@@ -6525,16 +6791,39 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
   const [form, setForm] = useState(() => {
     if (!draft) {
       return {
-        sku: '', name: '', category: categories[0] || '', quantity: '', reorderPoint: '', unitCost: '',
+        sku: '', name: '', category: categories[0] || '', baseUnitStock: '', reorderPoint: '', unitCost: '',
         location: locations[0] || '', supplierIds: [], sellingPrice: '',
+        baseUnitName: 'Piece', units: [],
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
+    const counts = getUnitCounts(draft);
+    const baseUnitName = draft.baseUnitName || 'Piece';
     return {
       ...rest, supplierIds: getSupplierIds(draft),
       sellingPrice: draft.sellingPrice ?? draft.unitCost ?? 0,
+      baseUnitName,
+      baseUnitStock: counts[baseUnitName] ?? draft.quantity ?? 0,
+      units: (draft.units && draft.units.length ? draft.units : []).map((u) => ({ ...u, stock: counts[u.name] ?? 0 })),
     };
   });
+
+  const addUnitRow = (name = '') => {
+    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', price: '', stock: 0 }] }));
+  };
+  const updateUnitRow = (i, patch) => {
+    setForm((f) => ({ ...f, units: f.units.map((u, idx) => idx === i ? { ...u, ...patch } : u) }));
+  };
+  const removeUnitRow = (i) => {
+    setForm((f) => ({ ...f, units: f.units.filter((_, idx) => idx !== i) }));
+  };
+
+  // Total stock across every unit, converted to base-unit terms - this is
+  // what actually gets stored as `quantity` (kept for every other part of
+  // the app that reads a single total), derived live as the per-unit
+  // counts are edited.
+  const totalQuantity = (Number(form.baseUnitStock) || 0)
+    + form.units.reduce((sum, u) => sum + (Number(u.stock) || 0) * (Number(u.factor) || 0), 0);
 
   // Live SKU assignment: as the item name is typed, the SKU suggestion
   // updates to match it (MOT-000001 style) - only for new items, and only
@@ -6621,9 +6910,9 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
             )}
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Quantity" grow>
-              <input className="depot-input" type="number" style={styles.modalInput} value={form.quantity}
-                onChange={(e) => setForm({ ...form, quantity: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+            <Field label={`Stock (${form.baseUnitName || 'Piece'})`} grow>
+              <input className="depot-input" type="number" style={styles.modalInput} value={form.baseUnitStock}
+                onChange={(e) => setForm({ ...form, baseUnitStock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
             <Field label="Reorder Point" grow>
               <input className="depot-input" type="number" style={styles.modalInput} value={form.reorderPoint}
@@ -6650,6 +6939,64 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
               </div>
             </Field>
           </div>
+
+          <Field label="Base Unit">
+            <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 200 }} value={form.baseUnitName}
+              onChange={(e) => setForm({ ...form, baseUnitName: e.target.value })} placeholder="Piece" />
+            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>What the Stock field above counts in. Every other selling unit converts to this.</div>
+          </Field>
+
+          <Field label="Selling Units (optional)">
+            {form.units.length === 0 && (
+              <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.5)', marginBottom: 8 }}>
+                None yet — add Pack or Box/Case below if this item sells in more than one unit.
+              </div>
+            )}
+            {form.units.length > 0 && (
+              <div style={{ display: 'flex', gap: 6, fontSize: 10.5, color: 'rgba(59,42,31,0.45)', marginBottom: 3, paddingLeft: 2 }}>
+                <span style={{ flex: 2 }}>Unit</span>
+                <span style={{ flex: 1 }}>= {form.baseUnitName || 'Piece'}s</span>
+                <span style={{ flex: 1 }}>Price</span>
+                <span style={{ flex: 1 }}>Stock on hand</span>
+                <span style={{ width: 30 }} />
+              </div>
+            )}
+            {form.units.map((u, i) => (
+              <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+                <input className="depot-input" style={{ ...styles.modalInput, flex: 2 }} placeholder="Unit name" value={u.name}
+                  onChange={(e) => updateUnitRow(i, { name: e.target.value })} />
+                <input type="number" className="depot-input" style={{ ...styles.modalInput, flex: 1 }} placeholder={`${form.baseUnitName || 'Piece'}s`} value={u.factor}
+                  onChange={(e) => updateUnitRow(i, { factor: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })}
+                  title={`How many ${form.baseUnitName || 'Piece'}(s) make up 1 of this unit`} />
+                <input type="number" className="depot-input" style={{ ...styles.modalInput, flex: 1 }} placeholder="Price (₱)" value={u.price}
+                  onChange={(e) => updateUnitRow(i, { price: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                <input type="number" className="depot-input" style={{ ...styles.modalInput, flex: 1 }} placeholder="0" value={u.stock}
+                  onChange={(e) => updateUnitRow(i, { stock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })}
+                  title={`How many sealed ${u.name || 'units'} are physically on the shelf right now`} />
+                <button className="depot-btn" style={styles.ghostBtn} onClick={() => removeUnitRow(i)}><X size={13} /></button>
+              </div>
+            ))}
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+              {UNIT_PRESETS.filter((p) => p !== form.baseUnitName && !form.units.some((u) => u.name === p)).map((p) => (
+                <button key={p} className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow(p)}>+ {p}</button>
+              ))}
+              <button className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow('')}>+ Custom Unit</button>
+            </div>
+            {form.units.length > 0 && (
+              <div style={{
+                marginTop: 10, padding: '8px 10px', borderRadius: 6, background: 'rgba(79,138,99,0.08)',
+                fontSize: 12.5, fontWeight: 700, color: 'var(--green)', display: 'flex', justifyContent: 'space-between',
+              }}>
+                <span>Total stock (in {form.baseUnitName || 'Piece'}s)</span>
+                <span>{totalQuantity.toLocaleString()}</span>
+              </div>
+            )}
+            {form.units.length > 0 && (
+              <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 8 }}>
+                Selling automatically deducts from the smallest unit first, breaking open a larger sealed unit (e.g. 1 Pack → {form.units[0]?.factor || 'N'} {form.baseUnitName || 'Piece'}s) whenever it runs short — no manual adjustment needed.
+              </div>
+            )}
+          </Field>
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
@@ -6940,6 +7287,158 @@ function MarkupModal({ item, onClose, onSave }) {
   );
 }
 
+function RestockModal({ items, suppliers, onClose, onSave }) {
+  const [itemId, setItemId] = useState('');
+  const [unitName, setUnitName] = useState('');
+  const [quantity, setQuantity] = useState('');
+  const [unitCost, setUnitCost] = useState('');
+  const [supplierId, setSupplierId] = useState('');
+  const [notes, setNotes] = useState('');
+
+  const selectedItem = items.find((it) => it.id === itemId);
+  const units = selectedItem ? getItemUnits(selectedItem) : [];
+
+  const handleItemChange = (id) => {
+    setItemId(id);
+    const it = items.find((i) => i.id === id);
+    if (it) {
+      setUnitCost(it.unitCost);
+      setUnitName(it.baseUnitName || 'Piece');
+    }
+  };
+
+  const valid = itemId && Number(quantity) > 0;
+
+  return (
+    <div style={styles.overlay}>
+      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>NEW RESTOCK</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
+            Every restock is treated as already received — inventory updates the moment you save. A supplier is optional.
+          </div>
+          <Field label="Item">
+            <select className="depot-select" style={styles.modalInput} value={itemId} onChange={(e) => handleItemChange(e.target.value)}>
+              <option value="">— Select an item —</option>
+              {items.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name}</option>)}
+            </select>
+          </Field>
+          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+            <Field label="Quantity Received" grow>
+              <input className="depot-input" type="number" style={styles.modalInput} value={quantity}
+                onChange={(e) => setQuantity(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
+            </Field>
+            <Field label="Unit" grow>
+              <select className="depot-select" style={styles.modalInput} value={unitName} onChange={(e) => setUnitName(e.target.value)} disabled={!selectedItem}>
+                {units.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+              </select>
+            </Field>
+          </div>
+          <Field label="Unit Cost (₱)">
+            <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={unitCost}
+              onChange={(e) => setUnitCost(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
+            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Defaults to the item's current base cost — edit if this batch cost differently.</div>
+          </Field>
+          <Field label="Supplier (optional)">
+            <select className="depot-select" style={styles.modalInput} value={supplierId} onChange={(e) => setSupplierId(e.target.value)}>
+              <option value="">— No Supplier —</option>
+              {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </Field>
+          <Field label="Notes (optional)">
+            <input className="depot-input" style={styles.modalInput} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="e.g. batch reference, condition on arrival" />
+          </Field>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
+            disabled={!valid} onClick={() => onSave({ itemId, quantity, unitName, unitCost, supplierId, notes })}>
+            <PackagePlus size={15} /> Receive Stock
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RestockView({ restocks }) {
+  const [search, setSearch] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return restocks.filter((r) => {
+      const matchesSearch = !q || r.itemSku.toLowerCase().includes(q) || r.itemName.toLowerCase().includes(q)
+        || (r.supplierName || '').toLowerCase().includes(q);
+      const matchesDate = inDateRange(r.receivedAt, dateFrom, dateTo);
+      return matchesSearch && matchesDate;
+    });
+  }, [restocks, search, dateFrom, dateTo]);
+
+  const receivedByLabel = (r) => r.receivedByUsername || r.receivedByEmail || 'Unknown';
+
+  const exportHeaders = ['Date Received', 'Item', 'Quantity', 'Unit', 'Unit Cost', 'Total Cost', 'Supplier', 'Received By', 'Notes'];
+  const exportRows = () => filtered.map((r) => [
+    formatDate(r.receivedAt), `${r.itemSku} — ${r.itemName}`, r.quantity, r.unitName,
+    r.unitCost.toFixed(2), (r.quantity * r.unitCost).toFixed(2), r.supplierName || '—', receivedByLabel(r), r.notes || '',
+  ]);
+  const handleDownload = () => downloadCSV('restock-records.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('restock-records.pdf', 'Restock Records', exportHeaders, exportRows());
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
+      <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+        <div style={styles.searchBox}>
+          <Search size={15} color="rgba(59,42,31,0.5)" />
+          <input
+            className="depot-input"
+            placeholder="Search by item or supplier…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={styles.searchInput}
+          />
+        </div>
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
+
+      <div style={styles.tableWrap} className="depot-scroll">
+        <table style={styles.table} className="depot-table">
+          <thead>
+            <tr>
+              {['Date Received', 'Item', 'Qty', 'Unit Cost', 'Total', 'Supplier', 'Received By'].map((h) => (
+                <th key={h} style={styles.th}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 && (
+              <tr><td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No restock records match your filters.</td></tr>
+            )}
+            {filtered.map((r) => (
+              <tr key={r.id} className="depot-row">
+                <td style={styles.td}>{formatDate(r.receivedAt)}</td>
+                <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif" }}>
+                  {r.itemSku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {r.itemName}</span>
+                </td>
+                <td style={styles.td}>{r.quantity} {r.unitName}{r.quantity === 1 ? '' : 's'}</td>
+                <td style={styles.td}>{currency(r.unitCost)}</td>
+                <td style={{ ...styles.td, fontWeight: 600 }}>{currency(r.quantity * r.unitCost)}</td>
+                <td style={styles.td}>{r.supplierName || <span style={{ color: 'rgba(59,42,31,0.4)' }}>— No Supplier —</span>}</td>
+                <td style={styles.td}>{receivedByLabel(r)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function OrderModal({ draft, items, suppliers, onClose, onSave }) {
   const [itemId, setItemId] = useState(draft?.itemId || '');
   const [supplierId, setSupplierId] = useState(draft?.supplierId || '');
@@ -7062,7 +7561,7 @@ function SaleReceiptModal({ sale, onClose }) {
           <div style={{ borderTop: '1px dashed rgba(59,42,31,0.18)', borderBottom: '1px dashed rgba(59,42,31,0.18)', padding: '10px 0', marginBottom: 12 }}>
             {sale.items.map((line) => (
               <div key={line.itemId} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, padding: '3px 0' }}>
-                <span>{line.qty}× {line.sku}</span>
+                <span>{line.qty} {line.unitName || ''}× {line.sku}</span>
                 <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{currency(line.lineTotal)}</span>
               </div>
             ))}
