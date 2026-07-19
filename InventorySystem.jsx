@@ -93,7 +93,7 @@ const RESPONSIVE_CSS = `
     .depot-filterbar { flex-direction: column !important; align-items: stretch !important; }
     .depot-filterbar > * { width: 100% !important; }
     .depot-export-bar { flex-wrap: wrap !important; justify-content: flex-start !important; }
-    .depot-modal { width: 94vw !important; max-width: 94vw !important; max-height: 88vh !important; overflow-y: auto !important; }
+    .depot-modal { width: 94vw !important; max-width: 94vw !important; max-height: 90vh !important; }
     .depot-modal-body-row { flex-direction: column !important; }
     .depot-pos-grid { grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)) !important; max-height: 340px !important; }
     .depot-table th, .depot-table td { padding: 8px 8px !important; font-size: 12px !important; }
@@ -213,7 +213,7 @@ const seedItems = () => [];
 const seedMovements = (items) => ([]);
 
 function currency(n) {
-  return n.toLocaleString('en-PH', { style: 'currency', currency: 'PHP' });
+  return (Number(n) || 0).toLocaleString('en-PH', { style: 'currency', currency: 'PHP' });
 }
 
 function timeAgo(ts) {
@@ -1662,19 +1662,9 @@ export default function InventorySystem() {
             const moves = seedMovements(seed).map((m) => ({ ...m, id: 'm' + Math.random().toString(36).slice(2, 9) }));
             await Promise.all(moves.map((m) => setDoc(doc(db, 'movements', m.id), { ...m, ownerId })));
           }
-          const suppliersSnap = await getDocs(query(collection(db, 'suppliers'), where('ownerId', '==', ownerId)));
-          if (suppliersSnap.empty) {
-            const seedSup = seedSuppliers().map((s) => ({ ...s, id: 's' + Math.random().toString(36).slice(2, 9) }));
-            await Promise.all(seedSup.map((s) => setDoc(doc(db, 'suppliers', s.id), { ...s, ownerId })));
-          }
-          const catDoc = await getDoc(doc(db, 'config', categoriesDocId));
-          if (!catDoc.exists()) {
-            await setDoc(doc(db, 'config', categoriesDocId), { list: DEFAULT_CATEGORIES, ownerId });
-          }
-          const locDoc = await getDoc(doc(db, 'config', locationsDocId));
-          if (!locDoc.exists()) {
-            await setDoc(doc(db, 'config', locationsDocId), { list: DEFAULT_LOCATIONS, ownerId });
-          }
+          // No default suppliers, categories, or locations are seeded for
+          // new tenants any more - everything starts genuinely empty, and
+          // a Client Admin builds their own list from scratch.
 
           // Multi-shop migration: runs once per tenant, the first time this
           // feature is live for them. Every tenant needs at least one shop
@@ -1726,10 +1716,10 @@ export default function InventorySystem() {
         setSuppliers(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
       }, logSnapErr('suppliers')));
       unsubs.push(onSnapshot(doc(db, 'config', categoriesDocId), (d) => {
-        setCategories(d.exists() ? (d.data().list || []) : DEFAULT_CATEGORIES.slice());
+        setCategories(d.exists() ? (d.data().list || []) : []);
       }, logSnapErr('categories')));
       unsubs.push(onSnapshot(doc(db, 'config', locationsDocId), (d) => {
-        setLocations(d.exists() ? (d.data().list || []) : DEFAULT_LOCATIONS.slice());
+        setLocations(d.exists() ? (d.data().list || []) : []);
       }, logSnapErr('locations')));
 
       // Report-like data: only managers (Client + Super Admin) can read these under
@@ -1830,20 +1820,23 @@ export default function InventorySystem() {
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
     const baseUnitName = (draft.baseUnitName || 'Piece').trim() || 'Piece';
-    const unitCost = Math.max(0, Number(draft.unitCost) || 0);
-    // Selling Price = Base Cost + Markup, for the base unit and every
-    // additional unit independently - markup is what the person actually
-    // types now; price is always the computed result, never typed directly.
-    const baseMarkup = Math.max(0, Number(draft.markup) || 0);
-    const sellingPrice = draft.markup != null ? unitCost + baseMarkup : Math.max(0, Number(draft.sellingPrice) || 0);
+    // Base Cost is genuinely optional - stored as null (not 0) when left
+    // blank, so it's clearly distinguished from "cost is actually zero"
+    // and so Markup correctly has nothing to calculate rather than
+    // showing a misleading "full price = markup" number anywhere else
+    // that reads this later.
+    const unitCost = draft.unitCost === '' || draft.unitCost == null ? null : Math.max(0, Number(draft.unitCost) || 0);
+    // Selling Price is required and typed directly; Markup is only ever a
+    // derived readout (Selling Price - Base Cost), never stored as its
+    // own field.
+    const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
     const units = (draft.units || [])
       .filter((u) => u.name && u.name.trim() && Number(u.factor) > 0)
-      .map((u) => {
-        const cost = Math.max(0, Number(u.cost) || 0);
-        const unitMarkup = Math.max(0, Number(u.markup) || 0);
-        const price = u.markup != null ? cost + unitMarkup : (Number(u.price) || 0);
-        return { name: u.name.trim(), factor: Number(u.factor), cost, price };
-      });
+      .map((u) => ({
+        name: u.name.trim(), factor: Number(u.factor),
+        cost: u.cost === '' || u.cost == null ? null : Math.max(0, Number(u.cost) || 0),
+        price: Math.max(0, Number(u.price) || 0),
+      }));
     // The physical, discrete stock count at every unit level (e.g. 9 Packs
     // + 19 loose Pieces) is what actually gets stored and what POS
     // deduction cascades against - `quantity` below is just the derived
@@ -1858,7 +1851,7 @@ export default function InventorySystem() {
     const defaultSellingUnit = draft.defaultSellingUnit && (draft.defaultSellingUnit === baseUnitName || units.some((u) => u.name === draft.defaultSellingUnit))
       ? draft.defaultSellingUnit : baseUnitName;
     const reorderPoint = Math.max(0, Number(draft.reorderPoint) || 0);
-    const { percent: markupValue } = computeMarkupFromPrices(unitCost, sellingPrice);
+    const { percent: markupValue } = computeMarkupFromPrices(unitCost || 0, sellingPrice);
     const markupType = 'percent';
     const previous = isNew ? null : items.find((i) => i.id === id);
     // Auto-assign a barcode the first time an item is created; preserved
@@ -2259,7 +2252,7 @@ export default function InventorySystem() {
     const counts = getUnitCounts(item);
     const newStock = { ...counts, [unit.name]: (counts[unit.name] || 0) + qty };
     const newQuantity = totalBaseUnits(newStock, units);
-    const cost = Math.max(0, Number(unitCost) || 0) || item.unitCost;
+    const cost = Math.max(0, Number(unitCost) || 0) || (item.unitCost ?? 0);
     const supplier = supplierId ? suppliers.find((s) => s.id === supplierId) : null;
     const now = Date.now();
     const restockId = 'rs' + Math.random().toString(36).slice(2, 9);
@@ -4514,9 +4507,9 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
       const markup = itemMarkup(it);
       return [
         it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
-        it.quantity, it.unitCost.toFixed(2), (it.sellingPrice ?? it.unitCost).toFixed(2),
+        it.quantity, (Number(it.unitCost) || 0).toFixed(2), (Number(it.sellingPrice ?? it.unitCost) || 0).toFixed(2),
         `${currency(markup.amount)} (${markup.percent.toFixed(1)}%)`,
-        (it.quantity * it.unitCost).toFixed(2), (it.quantity * (it.sellingPrice ?? it.unitCost)).toFixed(2),
+        (it.quantity * (Number(it.unitCost) || 0)).toFixed(2), (it.quantity * (Number(it.sellingPrice ?? it.unitCost) || 0)).toFixed(2),
         itemEstProfit(it).toFixed(2),
       ];
     }),
@@ -4580,8 +4573,8 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                   <td style={{ ...styles.td, fontSize: 12.5, color: names.length ? 'var(--ink)' : 'rgba(59,42,31,0.4)' }}>
                     {names.length ? names.join(', ') : '— none —'}
                   </td>
-                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12, color: 'rgba(59,42,31,0.6)' }}>
-                    <MapPin size={11} style={{ marginRight: 3, verticalAlign: -1 }} />{it.location}
+                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12, color: it.location ? 'rgba(59,42,31,0.6)' : 'rgba(59,42,31,0.4)' }}>
+                    <MapPin size={11} style={{ marginRight: 3, verticalAlign: -1 }} />{it.location || '— none —'}
                   </td>
                   <td style={styles.td}>
                     <span style={{ color: low ? 'var(--red)' : 'var(--ink)', fontWeight: low ? 700 : 500 }}>{it.quantity}</span>
@@ -6999,32 +6992,29 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
     if (!draft) {
       return {
         sku: '', name: '', category: categories[0] || '', baseUnitStock: '', reorderPoint: '', unitCost: '',
-        location: locations[0] || '', supplierIds: [], sellingPrice: '', markup: '',
+        location: '', supplierIds: [], sellingPrice: '',
         baseUnitName: 'Piece', units: [], defaultSellingUnit: 'Piece',
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
     const counts = getUnitCounts(draft);
     const baseUnitName = draft.baseUnitName || 'Piece';
-    const baseCost = draft.unitCost ?? 0;
-    const baseSelling = draft.sellingPrice ?? baseCost;
     return {
       ...rest, supplierIds: getSupplierIds(draft),
-      sellingPrice: baseSelling,
-      markup: Math.round((baseSelling - baseCost) * 100) / 100,
+      // Base Cost stays genuinely blank (not coerced to 0) when the item
+      // has none on record, so Markup can correctly show as blank too
+      // rather than a misleading "full price = markup" number.
+      unitCost: draft.unitCost ?? '',
+      sellingPrice: draft.sellingPrice ?? '',
       baseUnitName,
       baseUnitStock: counts[baseUnitName] ?? draft.quantity ?? 0,
-      units: (draft.units && draft.units.length ? draft.units : []).map((u) => {
-        const cost = u.cost ?? baseCost * (u.factor || 1);
-        const price = u.price ?? cost;
-        return { ...u, stock: counts[u.name] ?? 0, cost, markup: Math.round((price - cost) * 100) / 100 };
-      }),
+      units: (draft.units && draft.units.length ? draft.units : []).map((u) => ({ ...u, stock: counts[u.name] ?? 0, cost: u.cost ?? '' })),
       defaultSellingUnit: draft.defaultSellingUnit || baseUnitName,
     };
   });
 
   const addUnitRow = (name = '') => {
-    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', cost: '', markup: '', stock: 0 }] }));
+    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', cost: '', price: '', stock: 0 }] }));
   };
   const updateUnitRow = (i, patch) => {
     setForm((f) => ({ ...f, units: f.units.map((u, idx) => idx === i ? { ...u, ...patch } : u) }));
@@ -7071,11 +7061,14 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
   }, [form.name, isNew, skuTouched]);
 
   const duplicateSku = isDuplicateSku(form.sku, items, draft?.id);
-  const valid = form.sku.trim() && form.name.trim() && !duplicateSku;
-  // Selling Price = Base Cost + Markup - markup is the input now, price is
-  // the computed readout (used to be the other way around).
-  const computedSellingPrice = (Number(form.unitCost) || 0) + (Number(form.markup) || 0);
-  const markupPercent = (Number(form.unitCost) || 0) > 0 ? ((Number(form.markup) || 0) / Number(form.unitCost)) * 100 : 0;
+  const valid = form.sku.trim() && form.name.trim() && form.sellingPrice !== '' && !duplicateSku;
+  // Markup is purely a readout now: Selling Price - Base Cost. Stays
+  // blank (not 0, not a misleading full-price number) whenever Base Cost
+  // hasn't been entered, since there's nothing to calculate a margin
+  // against.
+  const hasBaseCost = form.unitCost !== '' && form.unitCost != null;
+  const baseMarkupAmount = hasBaseCost ? (Number(form.sellingPrice) || 0) - Number(form.unitCost) : null;
+  const baseMarkupPercent = hasBaseCost && Number(form.unitCost) > 0 ? (baseMarkupAmount / Number(form.unitCost)) * 100 : null;
   const toggleSupplier = (sid) => {
     setForm({
       ...form,
@@ -7120,9 +7113,10 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
                 {categories.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
             </Field>
-            <Field label="Location" grow>
+            <Field label="Zonal Location (optional)" grow>
               <select className="depot-select" style={styles.modalInput} value={form.location}
                 onChange={(e) => setForm({ ...form, location: e.target.value })}>
+                <option value="">— No Location —</option>
                 {locations.map((l) => <option key={l} value={l}>{l}</option>)}
               </select>
             </Field>
@@ -7156,24 +7150,30 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
               <input className="depot-input" type="number" style={styles.modalInput} value={form.reorderPoint}
                 onChange={(e) => setForm({ ...form, reorderPoint: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label="Base Cost (₱)" grow>
-              <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={form.unitCost}
+            <Field label="Base Price (₱) — optional" grow>
+              <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={form.unitCost} placeholder="Leave blank if unknown"
                 onChange={(e) => setForm({ ...form, unitCost: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label={multiUnit ? `Markup (₱) — per ${form.baseUnitName || 'Piece'}` : 'Markup (₱)'} grow>
-              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.markup}
-                onChange={(e) => setForm({ ...form, markup: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+            <Field label={multiUnit ? `Selling Price (₱) — per ${form.baseUnitName || 'Piece'}` : 'Selling Price (₱)'} grow>
+              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.sellingPrice}
+                onChange={(e) => setForm({ ...form, sellingPrice: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
-            <Field label="Selling Price">
+            <Field label="Markup — auto-calculated">
               <div style={{
                 ...styles.modalInput, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                background: computedSellingPrice >= (Number(form.unitCost) || 0) ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
-                fontWeight: 700, color: computedSellingPrice >= (Number(form.unitCost) || 0) ? 'var(--green)' : 'var(--red)',
+                background: !hasBaseCost ? 'rgba(59,42,31,0.04)' : baseMarkupAmount >= 0 ? 'rgba(79,138,99,0.08)' : 'rgba(193,80,58,0.08)',
+                fontWeight: 700, color: !hasBaseCost ? 'rgba(59,42,31,0.4)' : baseMarkupAmount >= 0 ? 'var(--green)' : 'var(--red)',
               }}>
-                <span>{currency(computedSellingPrice)}</span>
-                <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{markupPercent.toFixed(1)}%</span>
+                {!hasBaseCost ? (
+                  <span style={{ fontWeight: 500, fontSize: 12.5 }}>Add a Base Price to see markup</span>
+                ) : (
+                  <>
+                    <span>{currency(baseMarkupAmount)}</span>
+                    <span style={{ fontSize: 12, fontWeight: 500, opacity: 0.8 }}>{baseMarkupPercent.toFixed(1)}%</span>
+                  </>
+                )}
               </div>
             </Field>
           </div>
@@ -7206,10 +7206,11 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
               </Field>
 
               {form.units.map((u, i) => {
+                const uHasCost = u.cost !== '' && u.cost != null;
                 const uCost = Number(u.cost) || 0;
-                const uMarkup = Number(u.markup) || 0;
-                const uPrice = uCost + uMarkup;
-                const uMarkupPercent = uCost > 0 ? (uMarkup / uCost) * 100 : 0;
+                const uPrice = Number(u.price) || 0;
+                const uMarkupAmount = uHasCost ? uPrice - uCost : null;
+                const uMarkupPercent = uHasCost && uCost > 0 ? (uMarkupAmount / uCost) * 100 : null;
                 return (
                   <div key={i} style={{
                     background: 'rgba(59,42,31,0.03)', borderRadius: 8, padding: 12, marginBottom: 10,
@@ -7227,17 +7228,17 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
                       <span>{form.baseUnitName || 'Piece'}s</span>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
-                      <span>Base cost ₱</span>
-                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.cost}
+                      <span>Base Price ₱</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.cost} placeholder="optional"
                         onChange={(e) => updateUnitRow(i, { cost: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
-                      <span>per {u.name || 'unit'} (set independently — doesn't have to match {form.baseUnitName || 'Piece'} cost × the number above)</span>
+                      <span style={{ color: 'rgba(59,42,31,0.5)' }}>per {u.name || 'unit'} — optional, set independently of {form.baseUnitName || 'Piece'} cost</span>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
-                      <span>Markup ₱</span>
-                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.markup}
-                        onChange={(e) => updateUnitRow(i, { markup: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
-                      <span style={{ fontWeight: 700, color: uPrice >= uCost ? 'var(--green)' : 'var(--red)' }}>
-                        → sells for {currency(uPrice)} ({uMarkupPercent.toFixed(1)}%)
+                      <span>Selling Price ₱</span>
+                      <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.price}
+                        onChange={(e) => updateUnitRow(i, { price: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                      <span style={{ fontSize: 12.5, color: !uHasCost ? 'rgba(59,42,31,0.4)' : uMarkupAmount >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                        {!uHasCost ? 'Markup: add a Base Price to see it' : `Markup: ${currency(uMarkupAmount)} (${uMarkupPercent.toFixed(1)}%, auto-calculated)`}
                       </span>
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
@@ -7385,7 +7386,7 @@ function AssignInventoryModal({ myOwnItems, staffList, onClose, onSave }) {
   const handleDraftItemChange = (id) => {
     setDraftItemId(id);
     const it = myOwnItems.find((i) => i.id === id);
-    if (it) setDraftCost(it.unitCost);
+    if (it) setDraftCost(it.unitCost ?? '');
   };
 
   const draftValid = draftItemId && Number(draftQty) > 0 && draftSource && Number(draftQty) <= draftSource.quantity;
@@ -7573,7 +7574,7 @@ function RestockModal({ items, suppliers, onClose, onSave }) {
     setItemId(id);
     const it = items.find((i) => i.id === id);
     if (it) {
-      setUnitCost(it.unitCost);
+      setUnitCost(it.unitCost ?? '');
       setUnitName(it.baseUnitName || 'Piece');
     }
   };
@@ -7791,7 +7792,7 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
     // Reset the supplier choice if it doesn't belong to the newly picked
     // item, and default the cost to the item's current catalog unit cost.
     setSupplierId((prev) => (supplierIds.includes(prev) ? prev : (supplierIds[0] || '')));
-    if (it) setUnitCost(it.unitCost);
+    if (it) setUnitCost(it.unitCost ?? '');
   };
 
   const valid = itemId && supplierId && Number(quantity) > 0;
@@ -8212,19 +8213,21 @@ const styles = {
   overlay: {
     position: 'fixed', inset: 0, background: 'rgba(10,20,35,0.55)', display: 'flex',
     alignItems: 'center', justifyContent: 'center', zIndex: 50, animation: 'fadeIn 0.15s ease',
+    padding: 16, overflowY: 'auto',
   },
   modal: {
     background: 'var(--paper)', borderRadius: 10, width: '90%', maxWidth: 460,
     boxShadow: '0 20px 60px rgba(0,0,0,0.3)', animation: 'slideUp 0.2s ease', overflow: 'hidden',
+    display: 'flex', flexDirection: 'column', maxHeight: '90vh',
   },
   modalHeader: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px 18px',
     background: 'var(--blueprint)', color: '#fff', fontFamily: "'Quicksand', sans-serif",
-    fontSize: 12, letterSpacing: '0.08em', fontWeight: 600,
+    fontSize: 12, letterSpacing: '0.08em', fontWeight: 600, flexShrink: 0,
   },
   closeBtn: { background: 'transparent', color: '#fff', width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center' },
-  modalBody: { padding: 18 },
-  modalFooter: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '14px 18px', borderTop: '1px solid rgba(59,42,31,0.08)' },
+  modalBody: { padding: 18, overflowY: 'auto', flex: '1 1 auto', WebkitOverflowScrolling: 'touch' },
+  modalFooter: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '14px 18px', borderTop: '1px solid rgba(59,42,31,0.08)', flexShrink: 0 },
   fieldLabel: { display: 'block', fontSize: 11, fontWeight: 600, color: 'rgba(59,42,31,0.55)', marginBottom: 5, letterSpacing: '0.03em' },
   modalInput: {
     width: '100%', padding: '9px 11px', borderRadius: 6, border: '1px solid rgba(59,42,31,0.18)',
