@@ -17,9 +17,9 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2,
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2, PackagePlus,
   Wrench, Hammer, Ruler, PaintBucket, SprayCan, Droplet, Sparkles, FlaskConical, ShoppingBag, Shirt, Gem, Footprints,
-  Barcode, ScanLine, Bluetooth, CheckSquare, Square
+  Barcode, ScanLine, Bluetooth, CheckSquare, Square, Store,
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
@@ -74,6 +74,9 @@ const RESPONSIVE_CSS = `
     .depot-card-grid { grid-template-columns: repeat(2, 1fr) !important; }
     .depot-pos-layout { grid-template-columns: 1fr !important; }
     .depot-pos-layout .depot-cart-panel { position: static !important; }
+    .depot-filterbar { flex-wrap: wrap !important; }
+    .depot-barcode-toolbar { align-items: stretch !important; }
+    .depot-barcode-toolbar .depot-btn { flex: 1 1 calc(50% - 5px) !important; min-width: 0 !important; justify-content: center !important; padding: 10px 8px !important; }
   }
 
   /* Phones */
@@ -454,6 +457,90 @@ function computeMarkupFromPrices(baseCost, sellingPrice) {
   return { amount, percent };
 }
 
+// ---------------------------------------------------------------------------
+// Units of measure. `item.quantity` always represents stock in the item's
+// BASE unit (e.g. "Piece") - every other unit (Pack, Box/Case, custom) is
+// just a conversion factor + its own price on top of that same underlying
+// stock number, so inventory tracking only ever has one source of truth
+// regardless of how something is actually sold.
+// ---------------------------------------------------------------------------
+const UNIT_PRESETS = ['Piece', 'Pack', 'Box/Case'];
+
+// Every sellable unit for an item, base unit first (factor 1, using the
+// item's own sellingPrice) followed by whatever extra units were defined.
+function getItemUnits(item) {
+  const base = { name: item.baseUnitName || 'Piece', factor: 1, price: item.sellingPrice ?? item.unitCost ?? 0, isBase: true };
+  const extra = (item.units || []).map((u) => ({ ...u, isBase: false }));
+  return [base, ...extra];
+}
+
+// The actual discrete count of each unit physically on hand (e.g. 9 Packs,
+// 19 Pieces) - NOT derived by dividing a single total, since a shelf can
+// genuinely hold a mix of sealed Packs and loose Pieces at once. Items
+// that predate this feature (or have never had their per-unit stock set)
+// default to holding everything as loose units of the base unit, which
+// preserves their existing `quantity` exactly.
+function getUnitCounts(item) {
+  const units = getItemUnits(item);
+  const counts = {};
+  units.forEach((u) => { counts[u.name] = 0; });
+  if (item.unitStock && typeof item.unitStock === 'object') {
+    units.forEach((u) => { counts[u.name] = Number(item.unitStock[u.name]) || 0; });
+  } else {
+    counts[units[0].name] = item.quantity || 0;
+  }
+  return counts;
+}
+
+// Sum of every unit's count converted to base-unit terms - this is what
+// `item.quantity` always represents, kept in sync as a derived total any
+// time `unitStock` changes, so every other part of the app (low-stock
+// alerts, Inventory Value, Delivery reports, etc.) keeps working exactly
+// as before without needing to know about per-unit breakdowns at all.
+function totalBaseUnits(stock, units) {
+  return units.reduce((sum, u) => sum + (stock[u.name] || 0) * u.factor, 0);
+}
+
+// Breaks open ONE unit from the next level up, converting it into the
+// current level's unit (e.g. 1 Pack -> 20 Pieces) - recursively breaking
+// open an even-higher level first if the immediate next one is also
+// empty (e.g. no Packs left, so break a Box into Packs first). Never
+// pulls stock downward from a smaller unit into a larger one.
+function breakOpenOneLevelUp(stock, units, levelIdx) {
+  if (levelIdx + 1 >= units.length) return false;
+  if ((stock[units[levelIdx + 1].name] || 0) <= 0) {
+    const gotHigher = breakOpenOneLevelUp(stock, units, levelIdx + 1);
+    if (!gotHigher) return false;
+  }
+  stock[units[levelIdx + 1].name] -= 1;
+  const conversion = units[levelIdx + 1].factor / units[levelIdx].factor;
+  stock[units[levelIdx].name] = (stock[units[levelIdx].name] || 0) + conversion;
+  return true;
+}
+
+// Deducts `qtyNeeded` of `sellUnitName` from `stock`, automatically
+// breaking open larger units as needed when the sold unit runs short -
+// e.g. selling Pieces when Pieces run out breaks open a Pack; selling
+// Packs when Packs run out breaks open a Box/Case. Returns the updated
+// stock plus any shortfall (>0 means genuinely not enough stock at any
+// level, in which case nothing is deducted below zero).
+function cascadeDeductUnit(stock, units, sellUnitName, qtyNeeded) {
+  const newStock = { ...stock };
+  const sellLevelIdx = units.findIndex((u) => u.name === sellUnitName);
+  if (sellLevelIdx === -1) return { newStock, shortfall: qtyNeeded };
+
+  while ((newStock[sellUnitName] || 0) < qtyNeeded) {
+    const opened = breakOpenOneLevelUp(newStock, units, sellLevelIdx);
+    if (!opened) break;
+  }
+
+  const available = newStock[sellUnitName] || 0;
+  const take = Math.min(available, qtyNeeded);
+  newStock[sellUnitName] = available - take;
+  const shortfall = qtyNeeded - take;
+  return { newStock, shortfall };
+}
+
 // --- Subscription helpers -------------------------------------------------
 // A Client Admin's subscription lives entirely on their own users/{uid}
 // doc as `subscription: { history: [...] }` - Super Admin writes it,
@@ -765,6 +852,8 @@ const VIEW_PERMISSIONS = {
   categories: 'manageCategories',
   locations: 'manageLocations',
   orders: 'manageOrders',
+  restock: 'stockReceive',
+  shops: 'manageOrders',
   delivery: 'viewReports',
   sales: 'viewSalesReports',
   mysales: 'viewOwnSales',
@@ -803,6 +892,33 @@ function generateUserIdNumber() {
 // collision-avoidance reasoning as generateUserIdNumber() above.
 function generateBarcodeValue() {
   return Date.now().toString() + Math.floor(100 + Math.random() * 900).toString();
+}
+
+// Auto-generated SKU: a 3-letter prefix from the item name (e.g. "Motor
+// Oil" -> "MOT") plus a 6-digit sequential number, formatted like
+// MOT-000001, BRK-000245, PIN-001023. The number is the highest existing
+// suffix for that same prefix (within this tenant's own items) plus one,
+// so SKUs read as a clean running sequence per product family rather than
+// a timestamp. Purely a starting suggestion - staff can always edit it.
+function generateSkuFromName(name, existingItems) {
+  const letters = (name || '').replace(/[^A-Za-z]/g, '').toUpperCase();
+  const prefix = (letters.slice(0, 3) || 'ITM').padEnd(3, 'X');
+  const usedNumbers = (existingItems || [])
+    .map((it) => (it.sku || '').split('-'))
+    .filter((parts) => parts.length === 2 && parts[0] === prefix)
+    .map((parts) => parseInt(parts[1], 10))
+    .filter((n) => !isNaN(n));
+  const next = (usedNumbers.length ? Math.max(...usedNumbers) : 0) + 1;
+  return `${prefix}-${String(next).padStart(6, '0')}`;
+}
+
+// True if another item in this tenant's own inventory already uses this
+// exact SKU (case-insensitive) - `excludeId` skips the item being edited
+// so re-saving it unchanged doesn't flag itself as a duplicate.
+function isDuplicateSku(sku, existingItems, excludeId) {
+  const normalized = (sku || '').trim().toUpperCase();
+  if (!normalized) return false;
+  return (existingItems || []).some((it) => it.id !== excludeId && (it.sku || '').trim().toUpperCase() === normalized);
 }
 
 // Bluetooth (and USB) barcode scanners almost universally pair as an
@@ -1019,6 +1135,9 @@ export default function InventorySystem() {
   const [deliveryStatuses, setDeliveryStatuses] = useState({});
   const [sales, setSales] = useState([]);
   const [orders, setOrders] = useState([]);
+  const [restocks, setRestocks] = useState([]);
+  const [shops, setShops] = useState([]);
+  const [activeShopId, setActiveShopId] = useState(null);
   const [loginLogs, setLoginLogs] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [view, setView] = useState('overview');
@@ -1029,6 +1148,7 @@ export default function InventorySystem() {
   const [moveModal, setMoveModal] = useState(null);
   const [supplierModal, setSupplierModal] = useState(null);
   const [orderModal, setOrderModal] = useState(null);
+  const [restockModal, setRestockModal] = useState(false);
   const [assignModal, setAssignModal] = useState(null);
   const [markupModal, setMarkupModal] = useState(null);
   const [returnModal, setReturnModal] = useState(null);
@@ -1547,6 +1667,36 @@ export default function InventorySystem() {
           if (!locDoc.exists()) {
             await setDoc(doc(db, 'config', locationsDocId), { list: DEFAULT_LOCATIONS, ownerId });
           }
+
+          // Multi-shop migration: runs once per tenant, the first time this
+          // feature is live for them. Every tenant needs at least one shop
+          // to function, and every item/sale/movement/order/restock/
+          // deliveryStatus doc that predates this feature needs a shopId
+          // so it isn't orphaned. Gated on a flag stored on the owner's own
+          // profile so it's skipped entirely (no extra reads) once done.
+          try {
+            const ownerProfileSnap = await getDoc(doc(db, 'users', ownerId));
+            const alreadyMigrated = ownerProfileSnap.exists() && ownerProfileSnap.data().multiShopMigrated;
+            if (!alreadyMigrated) {
+              const shopsSnap = await getDocs(query(collection(db, 'shops'), where('ownerId', '==', ownerId)));
+              let defaultShopId;
+              if (shopsSnap.empty) {
+                defaultShopId = 'shop' + Math.random().toString(36).slice(2, 9);
+                await setDoc(doc(db, 'shops', defaultShopId), { id: defaultShopId, name: 'My Shop', ownerId, createdAt: Date.now() });
+              } else {
+                defaultShopId = shopsSnap.docs[0].id;
+              }
+              const shopScopedCollections = ['items', 'sales', 'movements', 'orders', 'restocks', 'deliveryStatus'];
+              for (const collName of shopScopedCollections) {
+                const snap = await getDocs(query(collection(db, collName), where('ownerId', '==', ownerId)));
+                const toMigrate = snap.docs.filter((d) => !d.data().shopId);
+                await Promise.all(toMigrate.map((d) => setDoc(doc(db, collName, d.id), { shopId: defaultShopId }, { merge: true })));
+              }
+              await setDoc(doc(db, 'users', ownerId), { multiShopMigrated: true }, { merge: true });
+            }
+          } catch (e) {
+            console.error('Multi-shop migration error:', e);
+          }
         }
       } catch (e) {
         console.error('Seeding error:', e);
@@ -1597,6 +1747,23 @@ export default function InventorySystem() {
         unsubs.push(onSnapshot(query(collection(db, 'orders'), where('ownerId', '==', ownerId)), (snap) => {
           setOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.orderDate - a.orderDate));
         }, logSnapErr('orders')));
+        unsubs.push(onSnapshot(query(collection(db, 'restocks'), where('ownerId', '==', ownerId)), (snap) => {
+          setRestocks(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.receivedAt - a.receivedAt));
+        }, logSnapErr('restocks')));
+        unsubs.push(onSnapshot(query(collection(db, 'shops'), where('ownerId', '==', ownerId)), (snap) => {
+          const list = snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+          setShops(list);
+          // Pick an active shop the first time shops load: the user's own
+          // last-selected shop if it still exists, otherwise just the
+          // first one. Only sets it once (never overrides an active
+          // selection the user already made this session).
+          setActiveShopId((prev) => {
+            if (prev && list.some((s) => s.id === prev)) return prev;
+            const preferred = myProfile?.activeShopId;
+            if (preferred && list.some((s) => s.id === preferred)) return preferred;
+            return list[0]?.id || null;
+          });
+        }, logSnapErr('shops')));
         // Super Admin monitors login activity platform-wide; a Client only
         // sees activity for their own tenant (themselves + their staff).
         const logsQuery = myRole === 'superadmin'
@@ -1610,6 +1777,9 @@ export default function InventorySystem() {
         setDeliveryStatuses({});
         setLoginLogs([]);
         setOrders([]);
+        setRestocks([]);
+        setShops([]);
+        setActiveShopId(null);
         // Staff only ever see their own sales - the query itself (not just the
         // rule) scopes this, so there's no risk of over-fetching then hiding.
         unsubs.push(onSnapshot(query(collection(db, 'sales'), where('cashierId', '==', user.uid)), (snap) => {
@@ -1651,7 +1821,21 @@ export default function InventorySystem() {
     const isNew = !draft.id;
     const id = draft.id || ('i' + Math.random().toString(36).slice(2, 9));
     const holderId = draft.holderId || ownerId;
-    const quantity = Math.max(0, Number(draft.quantity) || 0);
+    const baseUnitName = (draft.baseUnitName || 'Piece').trim() || 'Piece';
+    const units = (draft.units || [])
+      .filter((u) => u.name && u.name.trim() && Number(u.factor) > 0)
+      .map((u) => ({ name: u.name.trim(), factor: Number(u.factor), price: Number(u.price) || 0 }));
+    // The physical, discrete stock count at every unit level (e.g. 9 Packs
+    // + 19 loose Pieces) is what actually gets stored and what POS
+    // deduction cascades against - `quantity` below is just the derived
+    // total in base-unit terms, kept for every other part of the app that
+    // reads a single number.
+    const unitStock = { [baseUnitName]: Math.max(0, Number(draft.baseUnitStock) || 0) };
+    units.forEach((u) => { unitStock[u.name] = Math.max(0, Number((draft.units.find((x) => x.name === u.name) || {}).stock) || 0); });
+    const quantity = Object.entries(unitStock).reduce((sum, [name, count]) => {
+      const factor = name === baseUnitName ? 1 : (units.find((u) => u.name === name)?.factor || 1);
+      return sum + count * factor;
+    }, 0);
     const reorderPoint = Math.max(0, Number(draft.reorderPoint) || 0);
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
     const sellingPrice = Math.max(0, Number(draft.sellingPrice) || 0);
@@ -1661,8 +1845,11 @@ export default function InventorySystem() {
     // Auto-assign a barcode the first time an item is created; preserved
     // as-is on every later edit (never regenerated for an existing item).
     const barcode = isNew ? (draft.barcode || generateBarcodeValue()) : (draft.barcode || previous?.barcode || generateBarcodeValue());
+    // New items belong to whichever shop is currently active; editing an
+    // existing item never changes which shop it belongs to.
+    const shopId = isNew ? (draft.shopId || activeShopId) : (previous?.shopId ?? draft.shopId ?? activeShopId);
     try {
-      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode });
+      await setDoc(doc(db, 'items', id), { ...draft, id, ownerId, holderId, quantity, reorderPoint, unitCost, sellingPrice, markupType, markupValue, barcode, baseUnitName, units, unitStock, shopId });
       if (isNew) {
         playAddSound();
         logActivity('inventory_added', { itemSku: draft.sku, itemName: draft.name });
@@ -1722,9 +1909,16 @@ export default function InventorySystem() {
       }
       const cost = Math.max(0, Number(line.unitCost) || 0) || source.unitCost;
       const existing = items.find((i) => i.holderId === staffUid && i.sourceItemId === source.id);
+      // Assigning to staff deducts from the source item's base unit, same
+      // as manual Issue - reuses the same break-open cascade so the
+      // discrete per-unit breakdown (Packs/Boxes/etc.) stays accurate
+      // instead of silently drifting from the new total.
+      const sourceBaseUnitName = source.baseUnitName || 'Piece';
+      const sourceUnits = getItemUnits(source);
+      const { newStock: sourceNewStock } = cascadeDeductUnit(getUnitCounts(source), sourceUnits, sourceBaseUnitName, qty);
 
       try {
-        await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty });
+        await setDoc(doc(db, 'items', source.id), { ...source, quantity: source.quantity - qty, unitStock: sourceNewStock });
 
         let staffItemId;
         if (existing) {
@@ -1743,18 +1937,19 @@ export default function InventorySystem() {
             quantity: qty, reorderPoint: source.reorderPoint, unitCost: cost,
             location: source.location, supplierIds: getSupplierIds(source),
             markupType, markupValue, sellingPrice: computeSellingPrice(cost, markupType, markupValue),
+            shopId: source.shopId || null,
           });
         }
 
         const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvOut), {
           id: mvOut, itemId: source.id, type: 'out', qty,
-          reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId,
+          reason: `Assigned to ${staff.fullName || staff.email}`, timestamp: now, ownerId, shopId: source.shopId || activeShopId || null,
         });
         const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvIn), {
           id: mvIn, itemId: staffItemId, type: 'in', qty,
-          reason: 'Received from Client Admin', timestamp: now, ownerId,
+          reason: 'Received from Client Admin', timestamp: now, ownerId, shopId: source.shopId || activeShopId || null,
         });
 
         logActivity('inventory_assigned', { itemSku: source.sku, itemName: source.name, qty, targetEmail: staff.email });
@@ -1829,22 +2024,32 @@ export default function InventorySystem() {
       // rules) - just reduce to 0. The admin can clean up a zero-quantity
       // item manually if they want to.
       const remaining = Math.max(0, staffItem.quantity - qty);
-      await setDoc(doc(db, 'items', staffItem.id), { ...staffItem, quantity: remaining });
+      // Reducing the staff item's stock reuses the break-open cascade
+      // (same as any other "issue" of stock), and crediting it back to the
+      // admin's own item simply adds loose stock at its base unit level -
+      // same pattern as manual Receive/Issue and staff assignment above.
+      const staffBaseUnitName = staffItem.baseUnitName || 'Piece';
+      const staffUnits = getItemUnits(staffItem);
+      const { newStock: staffNewStock } = cascadeDeductUnit(getUnitCounts(staffItem), staffUnits, staffBaseUnitName, qty);
+      await setDoc(doc(db, 'items', staffItem.id), { ...staffItem, quantity: remaining, unitStock: staffNewStock });
 
       if (adminItem) {
-        await setDoc(doc(db, 'items', adminItem.id), { ...adminItem, quantity: adminItem.quantity + qty });
+        const adminBaseUnitName = adminItem.baseUnitName || 'Piece';
+        const adminCounts = getUnitCounts(adminItem);
+        const adminNewStock = { ...adminCounts, [adminBaseUnitName]: (adminCounts[adminBaseUnitName] || 0) + qty };
+        await setDoc(doc(db, 'items', adminItem.id), { ...adminItem, quantity: adminItem.quantity + qty, unitStock: adminNewStock });
       }
 
       const mvOut = 'm' + Math.random().toString(36).slice(2, 9);
       await setDoc(doc(db, 'movements', mvOut), {
         id: mvOut, itemId: staffItem.id, type: 'out', qty,
-        reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+        reason: `Returned by ${staffLabel}`, timestamp: now, ownerId, shopId: staffItem.shopId || activeShopId || null,
       });
       if (adminItem) {
         const mvIn = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvIn), {
           id: mvIn, itemId: adminItem.id, type: 'in', qty,
-          reason: `Returned by ${staffLabel}`, timestamp: now, ownerId,
+          reason: `Returned by ${staffLabel}`, timestamp: now, ownerId, shopId: adminItem.shopId || activeShopId || null,
         });
       }
 
@@ -1922,9 +2127,11 @@ export default function InventorySystem() {
 
   const updateDeliveryStatus = async (itemId, status, note, orderDate) => {
     if (!can(myRole, 'viewReports')) { showToast("You don't have permission to update delivery status"); return; }
+    const relatedItem = items.find((i) => i.id === itemId);
     try {
       await setDoc(doc(db, 'deliveryStatus', itemId), {
         status, note: note || '', orderDate: orderDate || null, updatedAt: Date.now(), ownerId,
+        shopId: relatedItem?.shopId || activeShopId || null,
       });
       showToast(`Delivery status set to "${status}"`);
     } catch (e) {
@@ -1985,13 +2192,28 @@ export default function InventorySystem() {
     if (!item) return;
     const delta = type === 'in' ? qty : -qty;
     const newQty = Math.max(0, item.quantity + delta);
+    // Manual receive/issue always happens in the item's base unit (there's
+    // no unit picker on this flow). Receiving simply adds loose stock at
+    // the base level. Issuing more than what's currently loose reuses the
+    // same break-open cascade as POS, so the discrete per-unit breakdown
+    // never drifts out of sync with the new total.
+    const baseUnitName = item.baseUnitName || 'Piece';
+    const units = getItemUnits(item);
+    const counts = getUnitCounts(item);
+    let unitStock;
+    if (type === 'in') {
+      unitStock = { ...counts, [baseUnitName]: (counts[baseUnitName] || 0) + qty };
+    } else {
+      const result = cascadeDeductUnit(counts, units, baseUnitName, qty);
+      unitStock = result.newStock; // shortfall (if any) is already reflected in newQty via Math.max(0, ...) above
+    }
     const mvId = 'm' + Math.random().toString(36).slice(2, 9);
     try {
-      await setDoc(doc(db, 'items', itemId), { ...item, quantity: newQty });
+      await setDoc(doc(db, 'items', itemId), { ...item, quantity: newQty, unitStock });
       await setDoc(doc(db, 'movements', mvId), {
         id: mvId, itemId, type, qty,
         reason: reason || (type === 'in' ? 'Stock received' : 'Stock issued'),
-        timestamp: Date.now(), ownerId,
+        timestamp: Date.now(), ownerId, shopId: item.shopId || activeShopId || null,
       });
       showToast(`${type === 'in' ? 'Received' : 'Issued'} ${qty} × ${item.sku}`);
     } catch (e) {
@@ -2000,48 +2222,132 @@ export default function InventorySystem() {
     setMoveModal(null);
   };
 
-  const completeSale = async (cartLines) => {
+  // Order / Restock module: unlike a formal Purchase Order (Stock
+  // Management -> Orders, which has a Pending/Received/Cancelled
+  // lifecycle and a required supplier), every restock record here
+  // represents inventory that has ALREADY been received - there's no
+  // status to track, and a supplier is entirely optional. Submitting one
+  // both logs a dedicated, searchable restock record AND updates the
+  // item's stock immediately, same permission gate as a manual Receive.
+  const createRestock = async ({ itemId, quantity, unitName, unitCost, supplierId, notes }) => {
+    if (!can(myRole, 'stockReceive')) { showToast("You don't have permission to receive stock"); return; }
+    const item = items.find((i) => i.id === itemId);
+    const qty = Math.max(0, Number(quantity) || 0);
+    if (!item || qty <= 0) { showToast('Pick an item and a quantity greater than zero'); return; }
+
+    const units = getItemUnits(item);
+    const unit = units.find((u) => u.name === unitName) || units[0];
+    const counts = getUnitCounts(item);
+    const newStock = { ...counts, [unit.name]: (counts[unit.name] || 0) + qty };
+    const newQuantity = totalBaseUnits(newStock, units);
+    const cost = Math.max(0, Number(unitCost) || 0) || item.unitCost;
+    const supplier = supplierId ? suppliers.find((s) => s.id === supplierId) : null;
+    const now = Date.now();
+    const restockId = 'rs' + Math.random().toString(36).slice(2, 9);
+
+    try {
+      await setDoc(doc(db, 'items', itemId), { ...item, quantity: newQuantity, unitStock: newStock });
+      await setDoc(doc(db, 'restocks', restockId), {
+        id: restockId, itemId, itemSku: item.sku, itemName: item.name,
+        quantity: qty, unitName: unit.name, unitCost: cost,
+        supplierId: supplier?.id || null, supplierName: supplier?.name || null,
+        receivedAt: now, receivedBy: user.uid, receivedByEmail: user.email || '',
+        receivedByUsername: myProfile?.username || '', notes: notes || '', ownerId,
+        shopId: item.shopId || activeShopId || null,
+      });
+      const mvId = 'm' + Math.random().toString(36).slice(2, 9);
+      await setDoc(doc(db, 'movements', mvId), {
+        id: mvId, itemId, type: 'in', qty: qty * unit.factor,
+        reason: `Restock${supplier ? ` from ${supplier.name}` : ''}${unit.name !== (item.baseUnitName || 'Piece') ? ` (${qty} ${unit.name})` : ''}`,
+        timestamp: now, ownerId, shopId: item.shopId || activeShopId || null,
+      });
+      logActivity('restock_received', { itemSku: item.sku, itemName: item.name, quantity: qty, unitName: unit.name, supplierName: supplier?.name || 'none' });
+      showToast(`Received ${qty} ${unit.name}${qty === 1 ? '' : 's'} of ${item.sku}`);
+      setRestockModal(false);
+    } catch (e) {
+      showToast('Could not record restock — check your connection');
+    }
+  };
+
+  const completeSale = async (cartLines, amountReceived) => {
     if (cartLines.length === 0) return;
+
+    // Simulate the cascading break-open deduction for every affected item
+    // BEFORE writing anything, so a sale either fully succeeds or fully
+    // fails - never partially deducts some lines and not others. Cart
+    // lines are grouped by item since the same item can appear multiple
+    // times in one sale in different units (e.g. 2 Pieces AND 1 Pack of
+    // the same product), and each line has to see the effect of the ones
+    // before it.
+    const finalStockByItem = {}; // itemId -> { units, newStock, newQuantity }
     for (const line of cartLines) {
       const item = items.find((i) => i.id === line.itemId);
-      if (!item || line.qty > item.quantity) {
-        showToast(`Not enough stock for ${item ? item.sku : 'item'}`);
+      if (!item) { showToast('An item in this sale no longer exists'); return; }
+      const units = getItemUnits(item);
+      const current = finalStockByItem[item.id]?.newStock || getUnitCounts(item);
+      const sellUnitName = line.unitName || item.baseUnitName || 'Piece';
+      const { newStock, shortfall } = cascadeDeductUnit(current, units, sellUnitName, line.qty);
+      if (shortfall > 0) {
+        showToast(`Not enough stock for ${item.sku} (short ${shortfall} ${sellUnitName}${shortfall === 1 ? '' : 's'} even after opening larger units)`);
         return;
       }
+      finalStockByItem[item.id] = { units, newStock, newQuantity: totalBaseUnits(newStock, units) };
     }
+
     const receiptNo = 'R' + Date.now().toString(36).toUpperCase();
     const now = Date.now();
     const saleLines = cartLines.map((line) => {
       const item = items.find((i) => i.id === line.itemId);
-      // Fall back to unitCost for items saved before markup/pricing existed
-      // (they've never had a sellingPrice computed and stored yet).
-      const price = item.sellingPrice ?? item.unitCost;
-      const cost = item.unitCost;
+      const factor = line.factor ?? 1;
+      // unitPrice/unitCost here are already per SOLD unit (e.g. per Box/Case,
+      // not per Piece) - line.unitPrice comes straight from whichever unit
+      // was selected in POS; the base per-piece cost is multiplied by the
+      // conversion factor so profit is correct regardless of what unit it
+      // sold in.
+      const price = line.unitPrice ?? (item.sellingPrice ?? item.unitCost);
+      const baseCost = item.unitCost;
+      const lineCost = baseCost * factor;
       return {
         itemId: item.id, sku: item.sku, name: item.name,
-        qty: line.qty, unitPrice: price, unitCost: cost,
-        lineTotal: price * line.qty, lineProfit: (price - cost) * line.qty,
+        qty: line.qty, unitName: line.unitName || item.baseUnitName || 'Piece', factor,
+        unitPrice: price, unitCost: lineCost,
+        lineTotal: price * line.qty, lineProfit: (price - lineCost) * line.qty,
       };
     });
     const subtotal = saleLines.reduce((s, l) => s + l.lineTotal, 0);
     const totalCost = saleLines.reduce((s, l) => s + l.unitCost * l.qty, 0);
     const totalProfit = saleLines.reduce((s, l) => s + l.lineProfit, 0);
     const total = subtotal;
+    // Bill (amount received) is optional at the data layer, even though the
+    // POS UI requires it before allowing checkout - keeps this function
+    // safe to call from anywhere else in the future without a hard
+    // dependency on cash-handling fields.
+    const received = amountReceived != null && amountReceived !== '' ? Number(amountReceived) : null;
+    const change = received != null ? Math.max(0, received - total) : null;
     const sale = {
       id: 's' + Math.random().toString(36).slice(2, 9), receiptNo, timestamp: now, items: saleLines,
-      subtotal, total, totalCost, totalProfit, cashierId: user.uid, cashierEmail: user.email || '', cashierUsername: myProfile?.username || '', ownerId,
+      subtotal, total, totalCost, totalProfit, amountReceived: received, change,
+      cashierId: user.uid, cashierEmail: user.email || '', cashierUsername: myProfile?.username || '', ownerId,
+      shopId: activeShopId || null,
     };
 
     try {
-      await Promise.all(cartLines.map((line) => {
-        const item = items.find((i) => i.id === line.itemId);
-        return setDoc(doc(db, 'items', line.itemId), { ...item, quantity: item.quantity - line.qty });
+      // One write per affected item (not per cart line), carrying the
+      // final post-cascade stock breakdown plus the recomputed total.
+      await Promise.all(Object.entries(finalStockByItem).map(([itemId, { newStock, newQuantity }]) => {
+        const item = items.find((i) => i.id === itemId);
+        return setDoc(doc(db, 'items', itemId), { ...item, quantity: newQuantity, unitStock: newStock });
       }));
       await Promise.all(cartLines.map((line) => {
         const mvId = 'm' + Math.random().toString(36).slice(2, 9);
+        const baseQty = line.qty * (line.factor ?? 1);
+        // Movements are always recorded in the item's base unit, same as
+        // every other stock-in/stock-out path in the app, regardless of
+        // which unit was actually sold at the register.
         return setDoc(doc(db, 'movements', mvId), {
-          id: mvId, itemId: line.itemId, type: 'out', qty: line.qty,
-          reason: `Sale ${receiptNo}`, timestamp: now, ownerId,
+          id: mvId, itemId: line.itemId, type: 'out', qty: baseQty,
+          reason: `Sale ${receiptNo}${line.unitName && line.unitName !== 'Piece' ? ` (${line.qty} ${line.unitName})` : ''}`, timestamp: now, ownerId,
+          shopId: activeShopId || null,
         });
       }));
       await setDoc(doc(db, 'sales', sale.id), sale);
@@ -2118,6 +2424,7 @@ export default function InventorySystem() {
       receivedDate: null,
       notes: (draft.notes || '').trim(),
       createdBy: user.uid, createdByEmail: user.email || '',
+      shopId: item.shopId || activeShopId || null,
     };
     try {
       await setDoc(doc(db, 'orders', id), order);
@@ -2141,6 +2448,7 @@ export default function InventorySystem() {
         await setDoc(doc(db, 'movements', mvId), {
           id: mvId, itemId: item.id, type: 'in', qty: order.quantity,
           reason: `Order received from ${order.supplierName}`, timestamp: now, ownerId,
+          shopId: item.shopId || activeShopId || null,
         });
       }
       await setDoc(doc(db, 'orders', order.id), { status: 'received', receivedDate: now }, { merge: true });
@@ -2172,9 +2480,83 @@ export default function InventorySystem() {
   // hold, i.e. haven't assigned out. Legacy items from before this feature
   // (no holderId yet) default to counting as the admin's own.
   const myOwnItems = useMemo(() => {
-    if (myRole === 'staff') return items;
-    return items.filter((it) => !it.holderId || it.holderId === ownerId);
-  }, [items, myRole, ownerId]);
+    if (myRole === 'staff') return items; // staff aren't shop-scoped - they only ever see their own assigned items
+    const ownItems = items.filter((it) => !it.holderId || it.holderId === ownerId);
+    if (!activeShopId) return ownItems;
+    // Items that predate this feature (no shopId yet) fall back to
+    // matching the active shop too, so nothing silently disappears in the
+    // brief window before the one-time migration finishes tagging them.
+    return ownItems.filter((it) => !it.shopId || it.shopId === activeShopId);
+  }, [items, myRole, ownerId, activeShopId]);
+
+  // Shop-scoped views of sales/movements/orders/restocks, same reasoning
+  // as myOwnItems above - a manager switching shops should only see that
+  // shop's own sales history, reports, profit, restock records, etc.
+  // Staff aren't shop-scoped, so this doesn't affect their own sales view.
+  const shopSales = useMemo(() => {
+    if (!activeShopId) return sales;
+    return sales.filter((s) => !s.shopId || s.shopId === activeShopId);
+  }, [sales, activeShopId]);
+  const shopMovements = useMemo(() => {
+    if (!activeShopId) return movements;
+    return movements.filter((m) => !m.shopId || m.shopId === activeShopId);
+  }, [movements, activeShopId]);
+  const shopOrders = useMemo(() => {
+    if (!activeShopId) return orders;
+    return orders.filter((o) => !o.shopId || o.shopId === activeShopId);
+  }, [orders, activeShopId]);
+  const shopRestocks = useMemo(() => {
+    if (!activeShopId) return restocks;
+    return restocks.filter((r) => !r.shopId || r.shopId === activeShopId);
+  }, [restocks, activeShopId]);
+
+  const switchShop = async (shopId) => {
+    setActiveShopId(shopId);
+    try {
+      await setDoc(doc(db, 'users', user.uid), { activeShopId: shopId }, { merge: true });
+    } catch (e) { /* non-critical preference save - the in-session switch above already applied */ }
+  };
+
+  const createShop = async (name) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage shops"); return; }
+    const trimmed = (name || '').trim();
+    if (!trimmed) return;
+    const shopId = 'shop' + Math.random().toString(36).slice(2, 9);
+    try {
+      await setDoc(doc(db, 'shops', shopId), { id: shopId, name: trimmed, ownerId, createdAt: Date.now() });
+      switchShop(shopId);
+      showToast(`Created "${trimmed}"`);
+    } catch (e) {
+      showToast('Could not create shop — check your connection');
+    }
+  };
+
+  const renameShop = async (shopId, name) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage shops"); return; }
+    const trimmed = (name || '').trim();
+    if (!trimmed) return;
+    try {
+      await setDoc(doc(db, 'shops', shopId), { name: trimmed }, { merge: true });
+      showToast('Shop renamed');
+    } catch (e) {
+      showToast('Could not rename shop — check your connection');
+    }
+  };
+
+  const deleteShop = async (shopId) => {
+    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage shops"); return; }
+    if (shops.length <= 1) { showToast('You need at least one shop'); return; }
+    try {
+      await deleteDoc(doc(db, 'shops', shopId));
+      if (activeShopId === shopId) {
+        const remaining = shops.find((s) => s.id !== shopId);
+        if (remaining) switchShop(remaining.id);
+      }
+      showToast('Shop deleted. Its existing items/sales/records are kept, just no longer tagged to an active shop, and will need reassigning if you want them under a different one.');
+    } catch (e) {
+      showToast('Could not delete shop — check your connection');
+    }
+  };
 
   // Total value of stock currently OUT with staff (assigned, not sitting in
   // the admin's own inventory), broken down per staff member - managers
@@ -2236,7 +2618,7 @@ export default function InventorySystem() {
   // already carry a cost/profit snapshot per line from the moment they were
   // rung up - so re-pricing an item later never rewrites history here.
   const profitStats = useMemo(() => {
-    const completed = sales.filter((s) => !s.cancelled);
+    const completed = shopSales.filter((s) => !s.cancelled);
     const totalRevenue = completed.reduce((s, sale) => s + (sale.total ?? 0), 0);
     const totalCost = completed.reduce((s, sale) => s + (sale.totalCost ?? 0), 0);
     const totalProfit = completed.reduce((s, sale) => s + (sale.totalProfit ?? (sale.total ?? 0) - (sale.totalCost ?? 0)), 0);
@@ -2261,10 +2643,10 @@ export default function InventorySystem() {
       }));
 
     return { totalRevenue, totalCost, totalProfit, margin, profitByItem, perSale };
-  }, [sales]);
+  }, [shopSales]);
 
   const filteredMovements = useMemo(() => {
-    return movements.filter((m) => {
+    return shopMovements.filter((m) => {
       const item = items.find((i) => i.id === m.itemId);
       const matchesSearch =
         !histSearch ||
@@ -2282,7 +2664,7 @@ export default function InventorySystem() {
       getSupplierIds(it).forEach((sid) => {
         const supplier = suppliers.find((s) => s.id === sid);
         if (!supplier) return;
-        const inbound = movements
+        const inbound = shopMovements
           .filter((m) => m.itemId === it.id && m.type === 'in')
           .sort((a, b) => b.timestamp - a.timestamp);
         const lastDelivery = inbound.length ? inbound[0].timestamp : null;
@@ -2302,7 +2684,7 @@ export default function InventorySystem() {
       });
     });
     return rows;
-  }, [myOwnItems, suppliers, movements, deliveryStatuses]);
+  }, [myOwnItems, suppliers, shopMovements, deliveryStatuses]);
 
   const supplierMap = useMemo(() => Object.fromEntries(suppliers.map((s) => [s.id, s])), [suppliers]);
 
@@ -2405,7 +2787,7 @@ export default function InventorySystem() {
 
       <BackgroundDecor animationTheme={effectiveBranding.animationTheme} />
 
-      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} onSignOut={handleSignOut} />
+      <Sidebar view={view} setView={setView} lowCount={totals.lowStock.length} role={myRole} pendingCount={pendingUsers.length} logo={effectiveLogo} onSignOut={handleSignOut} shops={shops} activeShopId={activeShopId} onSwitchShop={switchShop} />
 
       <main style={styles.main} className="depot-scroll depot-main">
         <TopBar
@@ -2415,6 +2797,7 @@ export default function InventorySystem() {
             if (view === 'inventory') setItemModal('new');
             if (view === 'suppliers') setSupplierModal('new');
             if (view === 'orders') setOrderModal('new');
+            if (view === 'restock') setRestockModal(true);
           }}
         />
 
@@ -2452,7 +2835,7 @@ export default function InventorySystem() {
         )}
 
         {view === 'barcodes' && (
-          <BarcodesView items={myOwnItems} categories={categories} />
+          <BarcodesView items={myOwnItems} categories={categories} canBackfill={can(myRole, 'editInventory')} />
         )}
 
         {view === 'staffInventory' && (
@@ -2488,10 +2871,18 @@ export default function InventorySystem() {
 
         {view === 'orders' && (
           <OrdersView
-            orders={orders}
+            orders={shopOrders}
             onReceive={receiveOrder}
             onCancel={(o) => setConfirmModal({ kind: 'order', target: o })}
           />
+        )}
+
+        {view === 'restock' && (
+          <RestockView restocks={shopRestocks} />
+        )}
+
+        {view === 'shops' && (
+          <ShopsView shops={shops} activeShopId={activeShopId} onSwitch={switchShop} onCreate={createShop} onRename={renameShop} onDelete={(s) => setConfirmModal({ kind: 'shop', target: s })} />
         )}
 
         {view === 'categories' && (
@@ -2526,11 +2917,11 @@ export default function InventorySystem() {
         )}
 
         {view === 'pos' && (
-          <POSView items={myOwnItems} onCompleteSale={completeSale} />
+          <POSView items={myOwnItems} onCompleteSale={completeSale} shops={shops} activeShopId={activeShopId} onSwitchShop={switchShop} />
         )}
 
         {view === 'sales' && (
-          <SalesHistoryView sales={sales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onDeleteSale={(sale) => setConfirmModal({ kind: 'sale-delete', target: sale })} onLogActivity={logActivity} />
+          <SalesHistoryView sales={myRole === 'staff' ? sales : shopSales} role={myRole} onCancelSale={(sale) => setConfirmModal({ kind: 'sale', target: sale })} onDeleteSale={(sale) => setConfirmModal({ kind: 'sale-delete', target: sale })} onLogActivity={logActivity} />
         )}
 
         {view === 'mysales' && (
@@ -2590,6 +2981,7 @@ export default function InventorySystem() {
           suppliers={suppliers}
           categories={categories}
           locations={locations}
+          items={myOwnItems}
           onClose={() => setItemModal(null)}
           onSave={saveItem}
         />
@@ -2623,6 +3015,15 @@ export default function InventorySystem() {
           suppliers={suppliers}
           onClose={() => setOrderModal(null)}
           onSave={saveOrder}
+        />
+      )}
+
+      {restockModal && (
+        <RestockModal
+          items={myOwnItems}
+          suppliers={suppliers}
+          onClose={() => setRestockModal(false)}
+          onSave={createRestock}
         />
       )}
 
@@ -2699,6 +3100,16 @@ export default function InventorySystem() {
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelOrder(confirmModal.target)}
           confirmLabel="Cancel Order"
+        />
+      )}
+
+      {confirmModal && confirmModal.kind === 'shop' && (
+        <ConfirmModal
+          title="DELETE SHOP"
+          message={<>Delete <strong>{confirmModal.target.name}</strong>? Its existing items, sales, and records are kept as-is (never deleted) — they'll just no longer be tagged to an active shop unless you reassign them.</>}
+          onCancel={() => setConfirmModal(null)}
+          onConfirm={() => { deleteShop(confirmModal.target.id); setConfirmModal(null); }}
+          confirmLabel="Delete Shop"
         />
       )}
 
@@ -3356,7 +3767,7 @@ function SubscriptionPausedScreen({ role, animationTheme, onSignOut }) {
   );
 }
 
-function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut }) {
+function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut, shops, activeShopId, onSwitchShop }) {
   const structure = [
     { type: 'item', key: 'overview', label: 'Overview', icon: LayoutGrid },
     { type: 'item', key: 'pos', label: 'Point of Sale', icon: ShoppingCart },
@@ -3366,12 +3777,14 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
       { key: 'staffInventory', label: 'Staff Inventory', icon: User },
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
       { key: 'orders', label: 'Orders', icon: ClipboardList },
+      { key: 'restock', label: 'Restock', icon: PackagePlus },
+      { key: 'shops', label: 'Shops', icon: Store },
       { key: 'categories', label: 'Categories', icon: Tag },
       { key: 'locations', label: 'Zonal Locations', icon: MapPin },
     ] },
     { type: 'item', key: 'mysales', label: 'My Sales', icon: Receipt },
     { type: 'group', label: 'Reports', icon: ScrollText, children: [
-      { key: 'delivery', label: 'Delivery Times', icon: Timer },
+      { key: 'delivery', label: 'Restock Records', icon: Timer },
       { key: 'sales', label: 'Sales History', icon: Receipt },
       { key: 'history', label: 'Transaction History', icon: ScrollText },
       { key: 'activity', label: 'Activity Log', icon: Clock },
@@ -3413,6 +3826,27 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut 
           <img src={logo} alt="Company logo" style={styles.logoImg} />
         </div>
       </div>
+      {shops && shops.length > 0 && (
+        <div style={{ padding: '0 4px', marginTop: 14 }}>
+          <div style={{ fontSize: 9.5, fontWeight: 700, color: 'rgba(245,243,236,0.4)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>
+            Active Shop
+          </div>
+          <div style={{ position: 'relative' }}>
+            <select
+              value={activeShopId || ''}
+              onChange={(e) => onSwitchShop(e.target.value)}
+              style={{
+                width: '100%', appearance: 'none', background: 'rgba(255,255,255,0.07)', color: '#fff',
+                border: '1px solid rgba(255,255,255,0.15)', borderRadius: 7, padding: '7px 24px 7px 10px',
+                fontSize: 12, fontWeight: 700, cursor: 'pointer',
+              }}
+            >
+              {shops.map((s) => <option key={s.id} value={s.id} style={{ color: '#111' }}>{s.name}</option>)}
+            </select>
+            <ChevronDown size={13} color="rgba(255,255,255,0.5)" style={{ position: 'absolute', right: 7, top: 8, pointerEvents: 'none' }} />
+          </div>
+        </div>
+      )}
       <nav style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 28 }} className="depot-sidebar-nav">
         {resolved.map((entry) => {
           if (entry.type === 'item') {
@@ -3505,13 +3939,16 @@ function TopBar({ view, role, onAdd }) {
       : ['Overview', 'Warehouse status at a glance'],
     pos: ['Point of Sale', 'Ring up a sale and update stock'],
     inventory: ['Inventory', 'Every SKU on the floor'],
+    barcodes: ['Barcodes', 'Generate, print, and download barcode labels'],
     staffInventory: ['Staff Inventory', 'Stock assigned to each staff member'],
     clientAccounts: ['Client Accounts', 'Manage subscriptions for every business on the platform'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
     orders: ['Orders', 'Purchase orders placed with your suppliers'],
+    restock: ['Restock', 'Receive inventory, with or without a supplier'],
+    shops: ['Shops', 'Create and switch between shops within your business'],
     categories: ['Categories', 'Organize items into your own groups'],
     locations: ['Zonal Locations', 'Manage where stock is stored'],
-    delivery: ['Delivery Times', 'Lead times and expected restocks'],
+    delivery: ['Restock Records', 'Lead times and expected restocks'],
     sales: ['Sales History', 'Every completed transaction'],
     history: ['Transaction History', 'Full receiving & issue ledger'],
     approvals: ['Team', 'Manage your team roster, roles, and approvals'],
@@ -3521,7 +3958,7 @@ function TopBar({ view, role, onAdd }) {
   };
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'))
-    || (view === 'orders' && can(role, 'manageOrders'));
+    || (view === 'orders' && can(role, 'manageOrders')) || (view === 'restock' && can(role, 'stockReceive'));
   const showManualLink = view === 'overview';
   return (
     <div style={styles.topbar} className="depot-topbar">
@@ -3531,7 +3968,7 @@ function TopBar({ view, role, onAdd }) {
       </div>
       {showAdd && (
         <button className="depot-btn depot-no-print depot-topbar-btn" style={styles.primaryBtn} onClick={onAdd}>
-          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : 'New Item'}
+          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : view === 'restock' ? 'New Restock' : 'New Item'}
         </button>
       )}
       {showManualLink && (
@@ -3845,26 +4282,36 @@ function BarcodeLabel({ item, showPrice = true }) {
   );
 }
 
-function BarcodesView({ items, categories }) {
+function BarcodesView({ items, categories, canBackfill }) {
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All');
   const [selected, setSelected] = useState(() => new Set());
   const [includePrice, setIncludePrice] = useState(true);
   const [printBatch, setPrintBatch] = useState(null);
 
-  // Backfilled items (created before this feature existed) won't have a
-  // barcode yet - they'll get one automatically next time they're edited
-  // and saved, same as any brand-new item.
-  const barcoded = useMemo(() => items.filter((it) => it.barcode), [items]);
+  // Items created before this feature existed won't have a `barcode` yet.
+  // saveItem() only assigns one the next time each item is individually
+  // edited, which would otherwise leave this whole page looking empty for
+  // any pre-existing inventory - so back-fill any missing ones right away
+  // instead of waiting on that. Self-terminating: once an item's barcode
+  // is written, it no longer shows up in `missing` on the next pass.
+  useEffect(() => {
+    if (!canBackfill) return;
+    const missing = items.filter((it) => !it.barcode);
+    if (missing.length === 0) return;
+    missing.forEach((it) => {
+      setDoc(doc(db, 'items', it.id), { barcode: generateBarcodeValue() }, { merge: true }).catch(() => {});
+    });
+  }, [items, canBackfill]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return barcoded.filter((it) => {
+    return items.filter((it) => {
       const matchesSearch = !q || it.name.toLowerCase().includes(q) || (it.sku || '').toLowerCase().includes(q);
       const matchesCat = categoryFilter === 'All' || it.category === categoryFilter;
       return matchesSearch && matchesCat;
     });
-  }, [barcoded, search, categoryFilter]);
+  }, [items, search, categoryFilter]);
 
   const allSelected = filtered.length > 0 && filtered.every((it) => selected.has(it.id));
 
@@ -3889,7 +4336,7 @@ function BarcodesView({ items, categories }) {
     });
   };
 
-  const selectedItems = useMemo(() => barcoded.filter((it) => selected.has(it.id)), [barcoded, selected]);
+  const selectedItems = useMemo(() => items.filter((it) => selected.has(it.id)), [items, selected]);
 
   useEffect(() => {
     const clear = () => setPrintBatch(null);
@@ -3974,7 +4421,7 @@ function BarcodesView({ items, categories }) {
         </label>
       </div>
 
-      <div className="depot-no-print depot-filterbar" style={{ ...styles.filterBar, gap: 10 }}>
+      <div className="depot-no-print depot-filterbar depot-barcode-toolbar" style={{ ...styles.filterBar, gap: 10, flexWrap: 'wrap' }}>
         <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6 }} onClick={toggleAll}>
           {allSelected ? <CheckSquare size={15} /> : <Square size={15} />}
           {allSelected ? 'Unselect All' : 'Select All'} ({filtered.length})
@@ -4001,8 +4448,8 @@ function BarcodesView({ items, categories }) {
 
       {filtered.length === 0 ? (
         <div className="depot-no-print" style={{ textAlign: 'center', padding: '60px 0', color: 'rgba(59,42,31,0.45)', fontSize: 13.5 }}>
-          {barcoded.length === 0
-            ? 'No barcoded items yet — barcodes are generated automatically the next time each item is added or edited.'
+          {items.length === 0
+            ? 'No inventory items yet — add some from the Inventory tab first.'
             : 'No items match your search/filter.'}
         </div>
       ) : (
@@ -4120,6 +4567,15 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                   <td style={styles.td}>
                     <span style={{ color: low ? 'var(--red)' : 'var(--ink)', fontWeight: low ? 700 : 500 }}>{it.quantity}</span>
                     {low && <AlertTriangle size={12} color="var(--red)" style={{ marginLeft: 5, verticalAlign: -1 }} />}
+                    {it.units && it.units.length > 0 && (() => {
+                      const counts = getUnitCounts(it);
+                      const units = getItemUnits(it);
+                      return (
+                        <div style={{ fontSize: 10.5, color: 'rgba(59,42,31,0.5)', marginTop: 2 }}>
+                          {units.map((u) => `${counts[u.name]} ${u.name}${counts[u.name] === 1 ? '' : 's'}`).join(' • ')}
+                        </div>
+                      );
+                    })()}
                   </td>
                   <td style={styles.td}>{currency(it.unitCost)}</td>
                   <td style={styles.td}>{currency(it.sellingPrice ?? it.unitCost)}</td>
@@ -5064,11 +5520,12 @@ function DeliveryTimesView({ rows, onUpdateStatus, onViewHistory }) {
   );
 }
 
-function POSView({ items, onCompleteSale }) {
+function POSView({ items, onCompleteSale, shops, activeShopId, onSwitchShop }) {
   const [search, setSearch] = useState('');
   const [cart, setCart] = useState([]); // [{itemId, qty}]
   const [lastReceipt, setLastReceipt] = useState(null);
   const [confirming, setConfirming] = useState(false);
+  const [amountReceived, setAmountReceived] = useState('');
 
   const sellable = useMemo(() => items.filter((it) => it.quantity > 0), [items]);
   const filtered = useMemo(() => {
@@ -5077,32 +5534,42 @@ function POSView({ items, onCompleteSale }) {
   }, [sellable, search]);
 
   const itemMap = useMemo(() => Object.fromEntries(items.map((i) => [i.id, i])), [items]);
-  const priceOf = (item) => item.sellingPrice ?? item.unitCost;
+  // Which unit is currently selected on each item's card, keyed by item id
+  // (index into that item's getItemUnits() list; 0 = base unit).
+  const [unitChoice, setUnitChoice] = useState({});
 
-  const addToCart = (item) => {
+  // Base-unit stock already committed to the cart for a given item, across
+  // every unit it might be present as - needed so mixing e.g. a Box/Case
+  // and some loose Pieces of the same item in one sale can't oversell it.
+  const cartBaseUsage = (prev, itemId, excludeKey) =>
+    prev.filter((l) => l.itemId === itemId && l.key !== excludeKey).reduce((s, l) => s + l.factor * l.qty, 0);
+
+  const addToCart = (item, unit) => {
     setLastReceipt(null);
+    const key = `${item.id}:${unit.name}`;
     setCart((prev) => {
-      const existing = prev.find((l) => l.itemId === item.id);
-      if (existing) {
-        if (existing.qty >= item.quantity) return prev;
-        return prev.map((l) => (l.itemId === item.id ? { ...l, qty: l.qty + 1 } : l));
-      }
-      return [...prev, { itemId: item.id, qty: 1 }];
+      const used = cartBaseUsage(prev, item.id, null);
+      const remaining = item.quantity - used;
+      if (remaining < unit.factor) return prev;
+      const existing = prev.find((l) => l.key === key);
+      if (existing) return prev.map((l) => l.key === key ? { ...l, qty: l.qty + 1 } : l);
+      return [...prev, {
+        key, itemId: item.id, sku: item.sku, name: item.name,
+        unitName: unit.name, factor: unit.factor, unitPrice: unit.price, unitCost: item.unitCost, qty: 1,
+      }];
     });
   };
 
-  const changeQty = (itemId, delta) => {
-    setCart((prev) => prev
-      .map((l) => {
-        if (l.itemId !== itemId) return l;
-        const max = itemMap[itemId]?.quantity ?? l.qty;
-        const nextQty = Math.min(max, Math.max(1, l.qty + delta));
-        return { ...l, qty: nextQty };
-      })
-    );
+  const changeQty = (key, itemId, factor, delta) => {
+    setCart((prev) => {
+      const item = itemMap[itemId];
+      const used = cartBaseUsage(prev, itemId, key);
+      const maxUnits = item ? Math.max(1, Math.floor((item.quantity - used) / factor)) : Infinity;
+      return prev.map((l) => l.key === key ? { ...l, qty: Math.min(maxUnits, Math.max(1, l.qty + delta)) } : l);
+    });
   };
 
-  const removeLine = (itemId) => setCart((prev) => prev.filter((l) => l.itemId !== itemId));
+  const removeLine = (key) => setCart((prev) => prev.filter((l) => l.key !== key));
 
   // Bluetooth/USB scanner support: a scan is treated exactly like tapping
   // the matching item card. Works regardless of what's focused on screen,
@@ -5118,7 +5585,7 @@ function POSView({ items, onCompleteSale }) {
   const handleScan = (code) => {
     const found = findItemByScan(sellable, code);
     if (found) {
-      addToCart(found);
+      addToCart(found, getItemUnits(found)[0]);
       setScanMsg({ ok: true, text: `Scanned: ${found.name}` });
     } else {
       setScanMsg({ ok: false, text: `No item matches barcode ${code}` });
@@ -5126,18 +5593,22 @@ function POSView({ items, onCompleteSale }) {
   };
   useBarcodeScanner(handleScan, true);
 
-  const subtotal = cart.reduce((s, l) => s + priceOf(itemMap[l.itemId] || {}) * l.qty, 0);
+  const subtotal = cart.reduce((s, l) => s + l.unitPrice * l.qty, 0);
   const total = subtotal;
+  const receivedNum = amountReceived === '' ? null : Number(amountReceived);
+  const change = receivedNum != null ? receivedNum - total : null;
+  const billValid = receivedNum != null && receivedNum >= total;
 
   const [busy, setBusy] = useState(false);
 
   const checkout = async () => {
     setBusy(true);
     try {
-      const sale = await onCompleteSale(cart);
+      const sale = await onCompleteSale(cart, amountReceived);
       if (sale) {
         setLastReceipt(sale);
         setCart([]);
+        setAmountReceived('');
       }
     } finally {
       setBusy(false);
@@ -5148,6 +5619,22 @@ function POSView({ items, onCompleteSale }) {
   return (
     <div style={{ animation: 'fadeIn 0.3s ease', display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 16, alignItems: 'start' }} className="depot-pos-layout">
       <div>
+        {shops && shops.length > 0 && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12, padding: '9px 12px',
+            background: '#fff', border: '1px solid rgba(59,42,31,0.15)', borderRadius: 6,
+          }}>
+            <Store size={15} color="var(--amber)" />
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: 'rgba(59,42,31,0.6)' }}>Selling from:</span>
+            <select
+              className="depot-select" value={activeShopId || ''} onChange={(e) => onSwitchShop(e.target.value)}
+              style={{ ...styles.modalInput, width: 220, padding: '6px 10px' }}
+            >
+              {shops.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            <span style={{ fontSize: 11, color: 'rgba(59,42,31,0.45)' }}>All sales and stock deductions apply to this shop.</span>
+          </div>
+        )}
         <div style={styles.searchBox}>
           <Search size={15} color="rgba(59,42,31,0.5)" />
           <input
@@ -5175,16 +5662,39 @@ function POSView({ items, onCompleteSale }) {
           {filtered.length === 0 && (
             <div style={styles.emptyState}>No sellable items match your search.</div>
           )}
-          {filtered.map((it) => (
-            <button key={it.id} className="depot-btn" style={styles.posItemCard} onClick={() => addToCart(it)}>
-              <div style={styles.posItemSku}>{it.sku}</div>
-              <div style={styles.posItemName}>{it.name}</div>
-              <div style={styles.posItemFooter}>
-                <span>{currency(priceOf(it))}</span>
-                <span style={{ color: 'rgba(59,42,31,0.5)' }}>{it.quantity} in stock</span>
+          {filtered.map((it) => {
+            const units = getItemUnits(it);
+            const choiceIdx = Math.min(unitChoice[it.id] ?? 0, units.length - 1);
+            const unit = units[choiceIdx];
+            const stockInUnit = unit.factor > 0 ? Math.floor((it.quantity || 0) / unit.factor) : 0;
+            return (
+              <div key={it.id} className="depot-btn" style={{ ...styles.posItemCard, cursor: 'default' }}>
+                <div style={styles.posItemSku}>{it.sku}</div>
+                <div style={styles.posItemName}>{it.name}</div>
+                {units.length > 1 && (
+                  <select
+                    className="depot-select" style={{ ...styles.modalInput, fontSize: 11.5, padding: '4px 8px', marginTop: 4, marginBottom: 4 }}
+                    value={choiceIdx} onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setUnitChoice((prev) => ({ ...prev, [it.id]: Number(e.target.value) }))}
+                  >
+                    {units.map((u, i) => <option key={u.name} value={i}>{u.name}</option>)}
+                  </select>
+                )}
+                <div style={styles.posItemFooter}>
+                  <span>{currency(unit.price)}</span>
+                  <span style={{ color: stockInUnit > 0 ? 'rgba(59,42,31,0.5)' : 'var(--red)' }}>
+                    {stockInUnit} {unit.name}{stockInUnit === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <button
+                  className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 6, padding: '6px 10px', fontSize: 12, opacity: stockInUnit > 0 ? 1 : 0.4 }}
+                  disabled={stockInUnit <= 0} onClick={() => addToCart(it, unit)}
+                >
+                  <Plus size={13} /> Add
+                </button>
               </div>
-            </button>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -5198,27 +5708,24 @@ function POSView({ items, onCompleteSale }) {
           <div style={styles.emptyState}>Tap an item to add it to the sale.</div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
-            {cart.map((line) => {
-              const item = itemMap[line.itemId];
-              if (!item) return null;
-              return (
-                <div key={line.itemId} style={styles.cartLine}>
-                  <div style={{ flex: 1 }}>
-                    <div style={styles.watchSku}>{item.sku}</div>
-                    <div style={styles.watchName}>{item.name}</div>
-                  </div>
-                  <div style={styles.qtyStepper}>
-                    <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.itemId, -1)}><Minus size={12} /></button>
-                    <span style={styles.qtyValue}>{line.qty}</span>
-                    <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.itemId, 1)}><Plus size={12} /></button>
-                  </div>
-                  <div style={{ width: 72, textAlign: 'right', fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
-                    {currency(priceOf(item) * line.qty)}
-                  </div>
-                  <IconBtn onClick={() => removeLine(line.itemId)} title="Remove" danger><X size={13} /></IconBtn>
+            {cart.map((line) => (
+              <div key={line.key} style={styles.cartLine}>
+                <div style={{ flex: 1 }}>
+                  <div style={styles.watchSku}>{line.sku}</div>
+                  <div style={styles.watchName}>{line.name}</div>
+                  <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)' }}>{currency(line.unitPrice)} / {line.unitName}</div>
                 </div>
-              );
-            })}
+                <div style={styles.qtyStepper}>
+                  <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.key, line.itemId, line.factor, -1)}><Minus size={12} /></button>
+                  <span style={styles.qtyValue}>{line.qty}</span>
+                  <button className="depot-btn" style={styles.qtyBtn} onClick={() => changeQty(line.key, line.itemId, line.factor, 1)}><Plus size={12} /></button>
+                </div>
+                <div style={{ width: 72, textAlign: 'right', fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
+                  {currency(line.unitPrice * line.qty)}
+                </div>
+                <IconBtn onClick={() => removeLine(line.key)} title="Remove" danger><X size={13} /></IconBtn>
+              </div>
+            ))}
           </div>
         )}
 
@@ -5227,8 +5734,29 @@ function POSView({ items, onCompleteSale }) {
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(total)}</span></div>
         </div>
 
-        <button className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 12, opacity: cart.length && !busy ? 1 : 0.45 }}
-          disabled={!cart.length || busy} onClick={() => setConfirming(true)}>
+        {cart.length > 0 && (
+          <div style={{ marginTop: 10 }}>
+            <Field label="Bill (Amount Received)">
+              <input
+                className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput}
+                placeholder="0.00" value={amountReceived}
+                onChange={(e) => setAmountReceived(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+              />
+            </Field>
+            {receivedNum != null && (
+              <div style={{
+                ...styles.cartTotalsRow, fontWeight: 700,
+                color: billValid ? 'var(--green)' : 'var(--red)',
+              }}>
+                <span>{billValid ? 'Change' : 'Insufficient — short by'}</span>
+                <span>{currency(Math.abs(change))}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        <button className="depot-btn" style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 12, opacity: cart.length && billValid && !busy ? 1 : 0.45 }}
+          disabled={!cart.length || !billValid || busy} onClick={() => setConfirming(true)}>
           <Receipt size={16} /> Confirm Sale
         </button>
       </div>
@@ -5236,7 +5764,7 @@ function POSView({ items, onCompleteSale }) {
       {confirming && (
         <ConfirmModal
           title="CONFIRM SALE"
-          message={<>Are you sure you want to complete this sale for <strong>{currency(total)}</strong>? This will deduct the sold quantities from stock.</>}
+          message={<>Are you sure you want to complete this sale for <strong>{currency(total)}</strong>? Bill: <strong>{currency(receivedNum)}</strong>, Change: <strong>{currency(change)}</strong>. This will deduct the sold quantities from stock.</>}
           onCancel={() => setConfirming(false)}
           onConfirm={checkout}
           confirmLabel={busy ? 'Processing…' : 'Confirm Sale'}
@@ -5309,7 +5837,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
     sale.receiptNo,
     new Date(sale.timestamp).toLocaleString('en-PH'),
     cashierLabel(sale),
-    sale.items.map((l) => `${l.qty}x ${l.sku}`).join('; '),
+    sale.items.map((l) => `${l.qty}${l.unitName ? ' ' + l.unitName : ''}x ${l.sku}`).join('; '),
     totalQtyFor(sale),
     sale.subtotal.toFixed(2),
     sale.total.toFixed(2),
@@ -5333,6 +5861,32 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
           />
         </div>
         <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
+        {[
+          { label: 'Today', days: 0 },
+          { label: 'This Week', days: 7 },
+          { label: 'This Month', days: 30 },
+          { label: 'This Year', days: 365 },
+          { label: 'All Time', days: null },
+        ].map((preset) => (
+          <button
+            key={preset.label}
+            className="depot-btn"
+            style={{ ...styles.ghostBtn, padding: '6px 12px', fontSize: 12 }}
+            onClick={() => {
+              if (preset.days === null) { setDateFrom(''); setDateTo(''); return; }
+              const to = new Date();
+              const from = new Date();
+              if (preset.days === 0) { from.setHours(0, 0, 0, 0); } else { from.setDate(from.getDate() - preset.days); }
+              setDateFrom(timestampToDateInputValue(from.getTime()));
+              setDateTo(timestampToDateInputValue(to.getTime()));
+            }}
+          >
+            {preset.label}
+          </button>
+        ))}
       </div>
 
       <div style={styles.statGrid} className="depot-stat-grid">
@@ -5507,7 +6061,7 @@ function MySalesView({ sales }) {
                   <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif", fontSize: 12.5 }}>
                     {new Date(sale.timestamp).toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
                   </td>
-                  <td style={styles.td}>{sale.items.map((l) => `${l.qty}× ${l.sku}`).join(', ')}</td>
+                  <td style={styles.td}>{sale.items.map((l) => `${l.qty}${l.unitName ? ' ' + l.unitName : ''}× ${l.sku}`).join(', ')}</td>
                   <td style={{ ...styles.td, fontWeight: 600 }}>{sale.items.reduce((sum, l) => sum + l.qty, 0)}</td>
                   <td style={{ ...styles.td, fontWeight: 600, textDecoration: sale.cancelled ? 'line-through' : 'none' }}>{currency(sale.total)}</td>
                   <td style={styles.td}>
@@ -6418,21 +6972,74 @@ function IconBtn({ children, onClick, title, danger, className }) {
   );
 }
 
-function ItemModal({ draft, suppliers, categories, locations, onClose, onSave }) {
+function ItemModal({ draft, suppliers, categories, locations, items, onClose, onSave }) {
+  const isNew = !draft;
+  const [skuTouched, setSkuTouched] = useState(!isNew); // existing items keep their SKU as-is until edited
   const [form, setForm] = useState(() => {
     if (!draft) {
       return {
-        sku: '', name: '', category: categories[0] || '', quantity: '', reorderPoint: '', unitCost: '',
+        sku: '', name: '', category: categories[0] || '', baseUnitStock: '', reorderPoint: '', unitCost: '',
         location: locations[0] || '', supplierIds: [], sellingPrice: '',
+        baseUnitName: 'Piece', units: [],
       };
     }
     const { supplierId, ...rest } = draft; // drop the legacy single-supplier field, replaced by supplierIds below
+    const counts = getUnitCounts(draft);
+    const baseUnitName = draft.baseUnitName || 'Piece';
     return {
       ...rest, supplierIds: getSupplierIds(draft),
       sellingPrice: draft.sellingPrice ?? draft.unitCost ?? 0,
+      baseUnitName,
+      baseUnitStock: counts[baseUnitName] ?? draft.quantity ?? 0,
+      units: (draft.units && draft.units.length ? draft.units : []).map((u) => ({ ...u, stock: counts[u.name] ?? 0 })),
     };
   });
-  const valid = form.sku.trim() && form.name.trim();
+
+  const addUnitRow = (name = '') => {
+    setForm((f) => ({ ...f, units: [...f.units, { name, factor: '', price: '', stock: 0 }] }));
+  };
+  const updateUnitRow = (i, patch) => {
+    setForm((f) => ({ ...f, units: f.units.map((u, idx) => idx === i ? { ...u, ...patch } : u) }));
+  };
+  const removeUnitRow = (i) => {
+    setForm((f) => ({ ...f, units: f.units.filter((_, idx) => idx !== i) }));
+  };
+
+  // Most items only ever sell one way, so the whole "multiple units" idea
+  // stays hidden until someone actually needs it - starts open only if
+  // this item already has units set up.
+  const [multiUnit, setMultiUnit] = useState(form.units.length > 0);
+  const enableMultiUnit = () => {
+    setMultiUnit(true);
+    if (form.units.length === 0) addUnitRow('Pack');
+  };
+  const disableMultiUnit = () => {
+    setMultiUnit(false);
+    setForm((f) => {
+      const foldedIn = f.units.reduce((sum, u) => sum + (Number(u.stock) || 0) * (Number(u.factor) || 0), 0);
+      return { ...f, units: [], baseUnitStock: (Number(f.baseUnitStock) || 0) + foldedIn };
+    });
+  };
+
+  // Total stock across every unit, converted to base-unit terms - this is
+  // what actually gets stored as `quantity` (kept for every other part of
+  // the app that reads a single total), derived live as the per-unit
+  // counts are edited.
+  const totalQuantity = (Number(form.baseUnitStock) || 0)
+    + form.units.reduce((sum, u) => sum + (Number(u.stock) || 0) * (Number(u.factor) || 0), 0);
+
+  // Live SKU assignment: as the item name is typed, the SKU suggestion
+  // updates to match it (MOT-000001 style) - only for new items, and only
+  // until the person edits the SKU field themselves, at which point we
+  // assume they want to keep whatever they typed there.
+  useEffect(() => {
+    if (!isNew || skuTouched) return;
+    setForm((f) => ({ ...f, sku: generateSkuFromName(f.name, items) }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.name, isNew, skuTouched]);
+
+  const duplicateSku = isDuplicateSku(form.sku, items, draft?.id);
+  const valid = form.sku.trim() && form.name.trim() && !duplicateSku;
   const markup = computeMarkupFromPrices(form.unitCost, form.sellingPrice);
   const toggleSupplier = (sid) => {
     setForm({
@@ -6450,9 +7057,18 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
           <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
         </div>
         <div style={styles.modalBody}>
+          <Field label="Item Name">
+            <input className="depot-input" style={styles.modalInput} value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Steel Sheet 4x8" autoFocus />
+          </Field>
           <Field label="SKU">
-            <input className="depot-input" style={styles.modalInput} value={form.sku}
-              onChange={(e) => setForm({ ...form, sku: e.target.value.toUpperCase() })} placeholder="RM-1000" />
+            <input className="depot-input" style={{ ...styles.modalInput, borderColor: duplicateSku ? 'var(--red)' : undefined }} value={form.sku}
+              onChange={(e) => { setSkuTouched(true); setForm({ ...form, sku: e.target.value.toUpperCase() }); }} placeholder="RM-1000" />
+            {duplicateSku ? (
+              <div style={{ fontSize: 11, color: 'var(--red)', marginTop: 4 }}>This SKU is already used by another item — choose a different one.</div>
+            ) : isNew && !skuTouched ? (
+              <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Auto-filled from the item name — edit it directly to set your own.</div>
+            ) : null}
           </Field>
           <Field label="Barcode">
             <div style={{
@@ -6461,10 +7077,6 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
             }}>
               {form.barcode || draft?.barcode || 'Generated automatically when you save'}
             </div>
-          </Field>
-          <Field label="Item Name">
-            <input className="depot-input" style={styles.modalInput} value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Steel Sheet 4x8" />
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Category" grow>
@@ -6501,9 +7113,9 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
             )}
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Quantity" grow>
-              <input className="depot-input" type="number" style={styles.modalInput} value={form.quantity}
-                onChange={(e) => setForm({ ...form, quantity: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+            <Field label={multiUnit ? `Loose ${form.baseUnitName || 'Piece'}s (not in a Pack/Box)` : 'Quantity'} grow>
+              <input className="depot-input" type="number" style={styles.modalInput} value={form.baseUnitStock}
+                onChange={(e) => setForm({ ...form, baseUnitStock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
             <Field label="Reorder Point" grow>
               <input className="depot-input" type="number" style={styles.modalInput} value={form.reorderPoint}
@@ -6515,7 +7127,7 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
             </Field>
           </div>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Selling Price (₱)" grow>
+            <Field label={multiUnit ? `Selling Price (₱) — per ${form.baseUnitName || 'Piece'}` : 'Selling Price (₱)'} grow>
               <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={form.sellingPrice}
                 onChange={(e) => setForm({ ...form, sellingPrice: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
             </Field>
@@ -6530,6 +7142,74 @@ function ItemModal({ draft, suppliers, categories, locations, onClose, onSave })
               </div>
             </Field>
           </div>
+
+          {!multiUnit ? (
+            <button className="depot-btn" style={{ ...styles.ghostBtn, fontSize: 12.5 }} onClick={enableMultiUnit}>
+              + This item also sells by the Pack or Box
+            </button>
+          ) : (
+            <div style={{ border: '1px solid rgba(59,42,31,0.15)', borderRadius: 8, padding: 14, marginTop: 4 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                <div style={{ fontWeight: 700, fontSize: 13 }}>Selling by more than one unit</div>
+                <button className="depot-btn" style={{ ...styles.ghostBtn, padding: '4px 10px', fontSize: 11.5 }} onClick={disableMultiUnit}>
+                  Turn off
+                </button>
+              </div>
+
+              <Field label="What do you call one single item?">
+                <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 180 }} value={form.baseUnitName}
+                  onChange={(e) => setForm({ ...form, baseUnitName: e.target.value })} placeholder="Piece" />
+              </Field>
+
+              {form.units.map((u, i) => (
+                <div key={i} style={{
+                  background: 'rgba(59,42,31,0.03)', borderRadius: 8, padding: 12, marginBottom: 10,
+                  display: 'flex', flexDirection: 'column', gap: 8,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
+                    <input className="depot-input" style={{ ...styles.modalInput, maxWidth: 160, fontWeight: 700 }} placeholder="e.g. Pack" value={u.name}
+                      onChange={(e) => updateUnitRow(i, { name: e.target.value })} />
+                    <button className="depot-btn" style={{ ...styles.ghostBtn, padding: 6 }} onClick={() => removeUnitRow(i)}><X size={13} /></button>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                    <span>1 {u.name || 'unit'} =</span>
+                    <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.factor}
+                      onChange={(e) => updateUnitRow(i, { factor: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                    <span>{form.baseUnitName || 'Piece'}s</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                    <span>Sells for ₱</span>
+                    <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 90, padding: '6px 8px' }} value={u.price}
+                      onChange={(e) => updateUnitRow(i, { price: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                    <span>per {u.name || 'unit'}</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, flexWrap: 'wrap' }}>
+                    <span>Sealed {u.name || 'units'} on the shelf right now:</span>
+                    <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.stock}
+                      onChange={(e) => updateUnitRow(i, { stock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
+                  </div>
+                </div>
+              ))}
+
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {UNIT_PRESETS.filter((p) => p !== form.baseUnitName && !form.units.some((u) => u.name === p)).map((p) => (
+                  <button key={p} className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow(p)}>+ {p}</button>
+                ))}
+                <button className="depot-btn" style={{ ...styles.ghostBtn, padding: '5px 10px', fontSize: 12 }} onClick={() => addUnitRow('')}>+ Another unit</button>
+              </div>
+
+              <div style={{
+                marginTop: 12, padding: '8px 10px', borderRadius: 6, background: 'rgba(79,138,99,0.08)',
+                fontSize: 12.5, fontWeight: 700, color: 'var(--green)', display: 'flex', justifyContent: 'space-between',
+              }}>
+                <span>Total stock (in {form.baseUnitName || 'Piece'}s)</span>
+                <span>{totalQuantity.toLocaleString()}</span>
+              </div>
+              <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 8 }}>
+                When one unit runs out at checkout, Stock IT automatically opens the next size up — no manual adjustment needed.
+              </div>
+            </div>
+          )}
         </div>
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
@@ -6820,6 +7500,220 @@ function MarkupModal({ item, onClose, onSave }) {
   );
 }
 
+function RestockModal({ items, suppliers, onClose, onSave }) {
+  const [itemId, setItemId] = useState('');
+  const [unitName, setUnitName] = useState('');
+  const [quantity, setQuantity] = useState('');
+  const [unitCost, setUnitCost] = useState('');
+  const [supplierId, setSupplierId] = useState('');
+  const [notes, setNotes] = useState('');
+
+  const selectedItem = items.find((it) => it.id === itemId);
+  const units = selectedItem ? getItemUnits(selectedItem) : [];
+
+  const handleItemChange = (id) => {
+    setItemId(id);
+    const it = items.find((i) => i.id === id);
+    if (it) {
+      setUnitCost(it.unitCost);
+      setUnitName(it.baseUnitName || 'Piece');
+    }
+  };
+
+  const valid = itemId && Number(quantity) > 0;
+
+  return (
+    <div style={styles.overlay}>
+      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <span>NEW RESTOCK</span>
+          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
+        </div>
+        <div style={styles.modalBody}>
+          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
+            Every restock is treated as already received — inventory updates the moment you save. A supplier is optional.
+          </div>
+          <Field label="Item">
+            <select className="depot-select" style={styles.modalInput} value={itemId} onChange={(e) => handleItemChange(e.target.value)}>
+              <option value="">— Select an item —</option>
+              {items.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name}</option>)}
+            </select>
+          </Field>
+          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
+            <Field label="Quantity Received" grow>
+              <input className="depot-input" type="number" style={styles.modalInput} value={quantity}
+                onChange={(e) => setQuantity(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
+            </Field>
+            <Field label="Unit" grow>
+              <select className="depot-select" style={styles.modalInput} value={unitName} onChange={(e) => setUnitName(e.target.value)} disabled={!selectedItem}>
+                {units.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+              </select>
+            </Field>
+          </div>
+          <Field label="Unit Cost (₱)">
+            <input className="depot-input" type="number" step="0.01" style={styles.modalInput} value={unitCost}
+              onChange={(e) => setUnitCost(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
+            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Defaults to the item's current base cost — edit if this batch cost differently.</div>
+          </Field>
+          <Field label="Supplier (optional)">
+            <select className="depot-select" style={styles.modalInput} value={supplierId} onChange={(e) => setSupplierId(e.target.value)}>
+              <option value="">— No Supplier —</option>
+              {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+          </Field>
+          <Field label="Notes (optional)">
+            <input className="depot-input" style={styles.modalInput} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="e.g. batch reference, condition on arrival" />
+          </Field>
+        </div>
+        <div style={styles.modalFooter}>
+          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
+          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
+            disabled={!valid} onClick={() => onSave({ itemId, quantity, unitName, unitCost, supplierId, notes })}>
+            <PackagePlus size={15} /> Receive Stock
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RestockView({ restocks }) {
+  const [search, setSearch] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return restocks.filter((r) => {
+      const matchesSearch = !q || r.itemSku.toLowerCase().includes(q) || r.itemName.toLowerCase().includes(q)
+        || (r.supplierName || '').toLowerCase().includes(q);
+      const matchesDate = inDateRange(r.receivedAt, dateFrom, dateTo);
+      return matchesSearch && matchesDate;
+    });
+  }, [restocks, search, dateFrom, dateTo]);
+
+  const receivedByLabel = (r) => r.receivedByUsername || r.receivedByEmail || 'Unknown';
+
+  const exportHeaders = ['Date Received', 'Item', 'Quantity', 'Unit', 'Unit Cost', 'Total Cost', 'Supplier', 'Received By', 'Notes'];
+  const exportRows = () => filtered.map((r) => [
+    formatDate(r.receivedAt), `${r.itemSku} — ${r.itemName}`, r.quantity, r.unitName,
+    r.unitCost.toFixed(2), (r.quantity * r.unitCost).toFixed(2), r.supplierName || '—', receivedByLabel(r), r.notes || '',
+  ]);
+  const handleDownload = () => downloadCSV('restock-records.csv', exportHeaders, exportRows());
+  const handleDownloadPDF = () => downloadPDF('restock-records.pdf', 'Restock Records', exportHeaders, exportRows());
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
+      <div style={styles.filterBar} className="depot-no-print depot-filterbar">
+        <div style={styles.searchBox}>
+          <Search size={15} color="rgba(59,42,31,0.5)" />
+          <input
+            className="depot-input"
+            placeholder="Search by item or supplier…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            style={styles.searchInput}
+          />
+        </div>
+        <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
+      </div>
+
+      <div style={styles.tableWrap} className="depot-scroll">
+        <table style={styles.table} className="depot-table">
+          <thead>
+            <tr>
+              {['Date Received', 'Item', 'Qty', 'Unit Cost', 'Total', 'Supplier', 'Received By'].map((h) => (
+                <th key={h} style={styles.th}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.length === 0 && (
+              <tr><td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No restock records match your filters.</td></tr>
+            )}
+            {filtered.map((r) => (
+              <tr key={r.id} className="depot-row">
+                <td style={styles.td}>{formatDate(r.receivedAt)}</td>
+                <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif" }}>
+                  {r.itemSku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {r.itemName}</span>
+                </td>
+                <td style={styles.td}>{r.quantity} {r.unitName}{r.quantity === 1 ? '' : 's'}</td>
+                <td style={styles.td}>{currency(r.unitCost)}</td>
+                <td style={{ ...styles.td, fontWeight: 600 }}>{currency(r.quantity * r.unitCost)}</td>
+                <td style={styles.td}>{r.supplierName || <span style={{ color: 'rgba(59,42,31,0.4)' }}>— No Supplier —</span>}</td>
+                <td style={styles.td}>{receivedByLabel(r)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ShopsView({ shops, activeShopId, onSwitch, onCreate, onRename, onDelete }) {
+  const [newName, setNewName] = useState('');
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameValue, setRenameValue] = useState('');
+
+  const startRename = (shop) => { setRenamingId(shop.id); setRenameValue(shop.name); };
+  const submitRename = () => {
+    if (renameValue.trim()) onRename(renamingId, renameValue.trim());
+    setRenamingId(null);
+  };
+
+  return (
+    <div style={{ animation: 'fadeIn 0.3s ease' }}>
+      <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 16, maxWidth: 560 }}>
+        Each shop has its own products, inventory, sales history, reports, and profit calculations — nothing is shared between shops except your suppliers, categories, and locations. Switch shops any time from here or the sidebar; POS also has its own shop selector.
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 20, maxWidth: 420 }}>
+        <input
+          className="depot-input" style={styles.modalInput} placeholder="New shop name"
+          value={newName} onChange={(e) => setNewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && newName.trim()) { onCreate(newName.trim()); setNewName(''); } }}
+        />
+        <button className="depot-btn" style={styles.primaryBtn} onClick={() => { if (newName.trim()) { onCreate(newName.trim()); setNewName(''); } }}>
+          <Plus size={15} /> New Shop
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 520 }}>
+        {shops.map((s) => (
+          <div key={s.id} style={{
+            ...styles.panel, display: 'flex', alignItems: 'center', gap: 12, padding: 14,
+            border: s.id === activeShopId ? '1px solid var(--amber)' : styles.panel.border,
+          }}>
+            <Store size={18} color={s.id === activeShopId ? 'var(--amber)' : 'rgba(59,42,31,0.4)'} />
+            <div style={{ flex: 1 }}>
+              {renamingId === s.id ? (
+                <input
+                  className="depot-input" style={{ ...styles.modalInput, padding: '5px 8px' }}
+                  value={renameValue} onChange={(e) => setRenameValue(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') submitRename(); }}
+                  onBlur={submitRename} autoFocus
+                />
+              ) : (
+                <>
+                  <div style={{ fontWeight: 700, fontSize: 14 }}>{s.name}</div>
+                  {s.id === activeShopId && <div style={{ fontSize: 10.5, color: 'var(--amber)', fontWeight: 700 }}>ACTIVE SHOP</div>}
+                </>
+              )}
+            </div>
+            {s.id !== activeShopId && (
+              <button className="depot-btn" style={styles.ghostBtn} onClick={() => onSwitch(s.id)}>Switch to this shop</button>
+            )}
+            <IconBtn onClick={() => startRename(s)} title="Rename"><Pencil size={14} /></IconBtn>
+            {shops.length > 1 && <IconBtn onClick={() => onDelete(s)} title="Delete" danger><Trash2 size={14} /></IconBtn>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function OrderModal({ draft, items, suppliers, onClose, onSave }) {
   const [itemId, setItemId] = useState(draft?.itemId || '');
   const [supplierId, setSupplierId] = useState(draft?.supplierId || '');
@@ -6942,7 +7836,7 @@ function SaleReceiptModal({ sale, onClose }) {
           <div style={{ borderTop: '1px dashed rgba(59,42,31,0.18)', borderBottom: '1px dashed rgba(59,42,31,0.18)', padding: '10px 0', marginBottom: 12 }}>
             {sale.items.map((line) => (
               <div key={line.itemId} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, padding: '3px 0' }}>
-                <span>{line.qty}× {line.sku}</span>
+                <span>{line.qty} {line.unitName || ''}× {line.sku}</span>
                 <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{currency(line.lineTotal)}</span>
               </div>
             ))}
@@ -6950,6 +7844,12 @@ function SaleReceiptModal({ sale, onClose }) {
 
           <div style={styles.cartTotalsRow}><span>Subtotal</span><span>{currency(sale.subtotal)}</span></div>
           <div style={{ ...styles.cartTotalsRow, ...styles.cartTotalsFinal }}><span>Total</span><span>{currency(sale.total)}</span></div>
+          {sale.amountReceived != null && (
+            <>
+              <div style={styles.cartTotalsRow}><span>Bill</span><span>{currency(sale.amountReceived)}</span></div>
+              <div style={{ ...styles.cartTotalsRow, fontWeight: 700, color: 'var(--green)' }}><span>Change</span><span>{currency(sale.change)}</span></div>
+            </>
+          )}
           <div style={{ fontSize: 12, color: 'rgba(59,42,31,0.55)', marginTop: 10 }}>
             {sale.paymentMethod ? `Paid via ${sale.paymentMethod}. ` : ''}Stock quantities have been updated.
           </div>
