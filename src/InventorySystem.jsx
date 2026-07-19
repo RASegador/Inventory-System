@@ -474,10 +474,11 @@ const UNIT_PRESETS = ['Piece', 'Pack', 'Box/Case'];
 // this fall back to base cost x factor, same number they'd have gotten
 // before this existed.
 function getItemUnits(item) {
-  const base = { name: item.baseUnitName || 'Piece', factor: 1, cost: item.unitCost ?? 0, price: item.sellingPrice ?? item.unitCost ?? 0, isBase: true };
+  const base = { name: item.baseUnitName || 'Piece', factor: 1, cost: item.unitCost ?? 0, price: item.sellingPrice ?? item.unitCost ?? 0, barcode: item.barcode || null, isBase: true };
   const extra = (item.units || []).map((u) => ({
     ...u, isBase: false,
     cost: u.cost ?? (item.unitCost ?? 0) * (u.factor || 1),
+    barcode: u.barcode || null,
   }));
   return [base, ...extra];
 }
@@ -963,15 +964,24 @@ function useBarcodeScanner(onScan, enabled = true) {
   }, [onScan, enabled]);
 }
 
-// Looks up an item by scanned barcode (falling back to SKU, since some
-// tenants may print/scan their own SKU-based labels from before this
-// feature existed) - shared by every scan-to-find flow in the app.
+// Looks up an item by scanned barcode - checks the item's own (base unit)
+// barcode, every additional unit's own separate barcode (a Pack/Box can
+// be scanned directly and this correctly reports THAT unit, not just the
+// item), and finally falls back to SKU for tenants who print/scan their
+// own SKU-based labels from before this feature existed. Returns
+// {item, unit} so callers know exactly which unit was actually scanned,
+// or null if nothing matches.
 function findItemByScan(items, code) {
   const trimmed = (code || '').trim();
   if (!trimmed) return null;
-  return items.find((it) => it.barcode === trimmed)
-    || items.find((it) => (it.sku || '').toUpperCase() === trimmed.toUpperCase())
-    || null;
+  for (const it of items) {
+    const units = getItemUnits(it);
+    const unitMatch = units.find((u) => u.barcode && u.barcode === trimmed);
+    if (unitMatch) return { item: it, unit: unitMatch };
+  }
+  const skuMatch = items.find((it) => (it.sku || '').toUpperCase() === trimmed.toUpperCase());
+  if (skuMatch) return { item: skuMatch, unit: getItemUnits(skuMatch)[0] };
+  return null;
 }
 
 // Staff log in with their Inventory ID + password only - no real email.
@@ -1836,6 +1846,11 @@ export default function InventorySystem() {
         name: u.name.trim(), factor: Number(u.factor),
         cost: u.cost === '' || u.cost == null ? null : Math.max(0, Number(u.cost) || 0),
         price: Math.max(0, Number(u.price) || 0),
+        // Each unit (Pack, Box/Case, ...) gets its own separate,
+        // scannable barcode, auto-assigned the first time it's created
+        // and preserved as-is on every later edit - same pattern as the
+        // item's own base-unit barcode.
+        barcode: u.barcode || generateBarcodeValue(),
       }));
     // The physical, discrete stock count at every unit level (e.g. 9 Packs
     // + 19 loose Pieces) is what actually gets stored and what POS
@@ -2122,7 +2137,7 @@ export default function InventorySystem() {
 
   const deleteCategory = async (name) => {
     if (!can(myRole, 'manageCategories')) { showToast("You don't have permission to manage categories"); return; }
-    const inUse = items.filter((it) => it.category === name).length;
+    const inUse = myOwnItems.filter((it) => it.category === name).length;
     if (inUse > 0) {
       showToast(`Can't remove "${name}" — ${inUse} item${inUse === 1 ? '' : 's'} still use it`);
       setConfirmModal(null);
@@ -2182,7 +2197,7 @@ export default function InventorySystem() {
 
   const deleteLocation = async (name) => {
     if (!can(myRole, 'manageLocations')) { showToast("You don't have permission to manage locations"); return; }
-    const inUse = items.filter((it) => it.location === name).length;
+    const inUse = myOwnItems.filter((it) => it.location === name).length;
     if (inUse > 0) {
       showToast(`Can't remove "${name}" — ${inUse} item${inUse === 1 ? '' : 's'} still use it`);
       setConfirmModal(null);
@@ -2424,6 +2439,8 @@ export default function InventorySystem() {
     // supplier assigned or changed later, same as everywhere else
     // Suppliers are used in the app now.
     const supplier = draft.supplierId ? suppliers.find((s) => s.id === draft.supplierId) : null;
+    const units = getItemUnits(item);
+    const unit = units.find((u) => u.name === draft.unitName) || units[0];
     const quantity = Math.max(1, Number(draft.quantity) || 0);
     const unitCost = Math.max(0, Number(draft.unitCost) || 0);
     const now = Date.now();
@@ -2432,7 +2449,7 @@ export default function InventorySystem() {
       id, ownerId,
       itemId: item.id, itemSku: item.sku, itemName: item.name,
       supplierId: supplier?.id || null, supplierName: supplier?.name || null,
-      quantity, unitCost, totalCost: quantity * unitCost,
+      quantity, unitName: unit.name, factor: unit.factor, unitCost, totalCost: quantity * unitCost,
       status: 'pending',
       orderDate: now,
       // No supplier means no known lead time to go on - expectedDate is
@@ -2460,16 +2477,25 @@ export default function InventorySystem() {
     const now = Date.now();
     try {
       if (item) {
-        await setDoc(doc(db, 'items', item.id), { ...item, quantity: item.quantity + order.quantity });
+        // Orders placed before unit selection existed have no unitName -
+        // fall back to the item's base unit so old pending orders still
+        // receive correctly.
+        const orderUnitName = order.unitName || item.baseUnitName || 'Piece';
+        const units = getItemUnits(item);
+        const counts = getUnitCounts(item);
+        const newStock = { ...counts, [orderUnitName]: (counts[orderUnitName] || 0) + order.quantity };
+        const newQuantity = totalBaseUnits(newStock, units);
+        await setDoc(doc(db, 'items', item.id), { ...item, quantity: newQuantity, unitStock: newStock });
         const mvId = 'm' + Math.random().toString(36).slice(2, 9);
         await setDoc(doc(db, 'movements', mvId), {
-          id: mvId, itemId: item.id, type: 'in', qty: order.quantity,
-          reason: `Order received${order.supplierName ? ` from ${order.supplierName}` : ''}`, timestamp: now, ownerId,
+          id: mvId, itemId: item.id, type: 'in', qty: order.quantity * (order.factor ?? 1),
+          reason: `Order received${order.supplierName ? ` from ${order.supplierName}` : ''}${orderUnitName !== (item.baseUnitName || 'Piece') ? ` (${order.quantity} ${orderUnitName})` : ''}`,
+          timestamp: now, ownerId,
           shopId: item.shopId || activeShopId || null,
         });
       }
       await setDoc(doc(db, 'orders', order.id), { status: 'received', receivedDate: now }, { merge: true });
-      showToast(item ? `Order received — ${order.quantity} × ${order.itemSku} added to stock` : 'Order marked received');
+      showToast(item ? `Order received — ${order.quantity} ${order.unitName || ''} × ${order.itemSku} added to stock` : 'Order marked received');
     } catch (e) {
       showToast('Could not mark order received — check your connection');
     }
@@ -2714,7 +2740,7 @@ export default function InventorySystem() {
   const handleInventoryScan = (code) => {
     const found = findItemByScan(items, code);
     if (found) {
-      setMoveModal(found);
+      setMoveModal(found.item);
     } else {
       showToast(`No item matches scanned barcode ${code}`);
     }
@@ -2905,7 +2931,7 @@ export default function InventorySystem() {
         {view === 'categories' && (
           <CategoriesView
             categories={categories}
-            items={items}
+            items={myOwnItems}
             onAdd={addCategory}
             onDelete={(name) => setConfirmModal({ kind: 'category', target: { name } })}
           />
@@ -2914,7 +2940,7 @@ export default function InventorySystem() {
         {view === 'locations' && (
           <LocationsView
             locations={locations}
-            items={items}
+            items={myOwnItems}
             onAdd={addLocation}
             onDelete={(name) => setConfirmModal({ kind: 'location', target: { name } })}
           />
@@ -3113,7 +3139,7 @@ export default function InventorySystem() {
       {confirmModal && confirmModal.kind === 'order' && (
         <ConfirmModal
           title="CANCEL ORDER"
-          message={<>Cancel the order for <strong>{confirmModal.target.quantity} × {confirmModal.target.itemSku}</strong>{confirmModal.target.supplierName ? <> from <strong>{confirmModal.target.supplierName}</strong></> : ''}? This won't affect stock.</>}
+          message={<>Cancel the order for <strong>{confirmModal.target.quantity} {confirmModal.target.unitName || ''} × {confirmModal.target.itemSku}</strong>{confirmModal.target.supplierName ? <> from <strong>{confirmModal.target.supplierName}</strong></> : ''}? This won't affect stock.</>}
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => cancelOrder(confirmModal.target)}
           confirmLabel="Cancel Order"
@@ -4264,20 +4290,23 @@ function Overview({ totals, categoryData, profitStats, staffInventoryStats, role
 // Renders one scannable barcode + item name + SKU + optional price, as a
 // small canvas-based label. Used both in the on-screen browse grid and
 // (via the same component) in the hidden print-only sheet.
-function BarcodeLabel({ item, showPrice = true }) {
+function BarcodeLabel({ item, unit, showPrice = true }) {
   const canvasRef = useRef(null);
+  const barcodeValue = unit?.barcode || item?.barcode;
   useEffect(() => {
-    if (!canvasRef.current || !item?.barcode) return;
+    if (!canvasRef.current || !barcodeValue) return;
     try {
-      JsBarcode(canvasRef.current, item.barcode, {
+      JsBarcode(canvasRef.current, barcodeValue, {
         format: 'CODE128', width: 1.6, height: 42, displayValue: false, margin: 0,
         background: '#ffffff', lineColor: '#111111',
       });
     } catch (e) {
-      // Non-barcode-safe characters somehow ended up in item.barcode -
+      // Non-barcode-safe characters somehow ended up in the barcode value -
       // leave the canvas blank rather than crashing the whole page.
     }
-  }, [item?.barcode]);
+  }, [barcodeValue]);
+  const unitName = unit?.name || item?.baseUnitName || 'Piece';
+  const isBase = unit?.isBase !== false; // treat missing unit (legacy call sites) as base
   return (
     <div className="barcode-label" style={{
       display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 3,
@@ -4288,12 +4317,14 @@ function BarcodeLabel({ item, showPrice = true }) {
         fontSize: 11, fontWeight: 700, textAlign: 'center', color: '#111', width: '100%',
         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       }}>
-        {item.name}
+        {item.name}{!isBase && <span style={{ fontWeight: 500, color: '#666' }}> ({unitName})</span>}
       </div>
       <canvas ref={canvasRef} style={{ maxWidth: '100%' }} />
-      <div style={{ fontSize: 10, color: '#333', letterSpacing: '0.03em', fontFamily: "'IBM Plex Mono', monospace" }}>{item.sku}</div>
+      <div style={{ fontSize: 10, color: '#333', letterSpacing: '0.03em', fontFamily: "'IBM Plex Mono', monospace" }}>
+        {item.sku}{!isBase && ` · ${unitName}`}
+      </div>
       {showPrice && (
-        <div style={{ fontSize: 12, fontWeight: 700, color: '#111' }}>{currency(item.sellingPrice ?? item.unitCost ?? 0)}</div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: '#111' }}>{currency(unit?.price ?? (item.sellingPrice ?? item.unitCost ?? 0))}</div>
       )}
     </div>
   );
@@ -4306,18 +4337,24 @@ function BarcodesView({ items, categories, canBackfill }) {
   const [includePrice, setIncludePrice] = useState(true);
   const [printBatch, setPrintBatch] = useState(null);
 
-  // Items created before this feature existed won't have a `barcode` yet.
+  // Items (and their individual units - Pack/Box each need their own)
+  // created before this feature existed won't have a barcode yet.
   // saveItem() only assigns one the next time each item is individually
   // edited, which would otherwise leave this whole page looking empty for
   // any pre-existing inventory - so back-fill any missing ones right away
-  // instead of waiting on that. Self-terminating: once an item's barcode
-  // is written, it no longer shows up in `missing` on the next pass.
+  // instead of waiting on that. Self-terminating: once a barcode is
+  // written, it no longer shows up in `missing` on the next pass.
   useEffect(() => {
     if (!canBackfill) return;
-    const missing = items.filter((it) => !it.barcode);
-    if (missing.length === 0) return;
-    missing.forEach((it) => {
-      setDoc(doc(db, 'items', it.id), { barcode: generateBarcodeValue() }, { merge: true }).catch(() => {});
+    items.forEach((it) => {
+      const patch = {};
+      if (!it.barcode) patch.barcode = generateBarcodeValue();
+      const units = (it.units || []).map((u) => u.barcode ? u : { ...u, barcode: generateBarcodeValue() });
+      const unitsChanged = units.some((u, i) => u.barcode !== (it.units || [])[i]?.barcode);
+      if (unitsChanged) patch.units = units;
+      if (Object.keys(patch).length > 0) {
+        setDoc(doc(db, 'items', it.id), patch, { merge: true }).catch(() => {});
+      }
     });
   }, [items, canBackfill]);
 
@@ -4330,30 +4367,33 @@ function BarcodesView({ items, categories, canBackfill }) {
     });
   }, [items, search, categoryFilter]);
 
-  const allSelected = filtered.length > 0 && filtered.every((it) => selected.has(it.id));
+  // One selectable/printable label PER UNIT - an item with a Pack
+  // configured produces two entries (Piece label, Pack label), each with
+  // its own distinct barcode.
+  const labelEntries = useMemo(() => {
+    return filtered.flatMap((it) => getItemUnits(it).map((unit) => ({ key: `${it.id}:${unit.name}`, item: it, unit })));
+  }, [filtered]);
 
-  const toggleOne = (id) => {
+  const allSelected = labelEntries.length > 0 && labelEntries.every((e) => selected.has(e.key));
+
+  const toggleOne = (key) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
+      if (next.has(key)) next.delete(key); else next.add(key);
       return next;
     });
   };
 
   const toggleAll = () => {
     setSelected((prev) => {
-      if (allSelected) {
-        const next = new Set(prev);
-        filtered.forEach((it) => next.delete(it.id));
-        return next;
-      }
       const next = new Set(prev);
-      filtered.forEach((it) => next.add(it.id));
+      if (allSelected) labelEntries.forEach((e) => next.delete(e.key));
+      else labelEntries.forEach((e) => next.add(e.key));
       return next;
     });
   };
 
-  const selectedItems = useMemo(() => items.filter((it) => selected.has(it.id)), [items, selected]);
+  const selectedEntries = useMemo(() => labelEntries.filter((e) => selected.has(e.key)), [labelEntries, selected]);
 
   useEffect(() => {
     const clear = () => setPrintBatch(null);
@@ -4376,11 +4416,11 @@ function BarcodesView({ items, categories, canBackfill }) {
     const cols = Math.max(1, Math.floor((pageW - marginX * 2 + gapX) / (labelW + gapX)));
     let col = 0, x = marginX, y = marginY;
 
-    list.forEach((it) => {
+    list.forEach(({ item: it, unit }) => {
       const canvas = document.createElement('canvas');
       let imgData = null;
       try {
-        JsBarcode(canvas, it.barcode, { format: 'CODE128', width: 2, height: 40, displayValue: false, margin: 0 });
+        JsBarcode(canvas, unit.barcode || it.barcode, { format: 'CODE128', width: 2, height: 40, displayValue: false, margin: 0 });
         imgData = canvas.toDataURL('image/png');
       } catch (e) { /* skip an unrenderable barcode rather than aborting the whole PDF */ }
 
@@ -4393,19 +4433,20 @@ function BarcodesView({ items, categories, canBackfill }) {
       doc.rect(x, y, labelW, labelH);
       doc.setFont(undefined, 'bold');
       doc.setFontSize(8);
-      const name = (it.name || '').length > 28 ? it.name.slice(0, 27) + '…' : (it.name || '');
+      const nameSuffix = unit.isBase === false ? ` (${unit.name})` : '';
+      const name = ((it.name || '') + nameSuffix).length > 28 ? ((it.name || '') + nameSuffix).slice(0, 27) + '…' : ((it.name || '') + nameSuffix);
       doc.text(name, x + labelW / 2, y + 5.5, { align: 'center' });
 
       if (imgData) doc.addImage(imgData, 'PNG', x + 5, y + 8, labelW - 10, 12);
 
       doc.setFont(undefined, 'normal');
       doc.setFontSize(7.5);
-      doc.text(it.sku || '', x + labelW / 2, y + 23.5, { align: 'center' });
+      doc.text(`${it.sku || ''}${unit.isBase === false ? ` · ${unit.name}` : ''}`, x + labelW / 2, y + 23.5, { align: 'center' });
 
       if (includePrice) {
         doc.setFont(undefined, 'bold');
         doc.setFontSize(9.5);
-        doc.text(currency(it.sellingPrice ?? it.unitCost ?? 0), x + labelW / 2, y + 29, { align: 'center' });
+        doc.text(currency(unit.price ?? (it.sellingPrice ?? it.unitCost ?? 0)), x + labelW / 2, y + 29, { align: 'center' });
       }
 
       col++;
@@ -4441,29 +4482,29 @@ function BarcodesView({ items, categories, canBackfill }) {
       <div className="depot-no-print depot-filterbar depot-barcode-toolbar" style={{ ...styles.filterBar, gap: 10, flexWrap: 'wrap' }}>
         <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6 }} onClick={toggleAll}>
           {allSelected ? <CheckSquare size={15} /> : <Square size={15} />}
-          {allSelected ? 'Unselect All' : 'Select All'} ({filtered.length})
+          {allSelected ? 'Unselect All' : 'Select All'} ({labelEntries.length})
         </button>
         <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)' }}>{selected.size} selected</div>
         <div style={{ flex: 1 }} />
-        <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: selectedItems.length ? 1 : 0.4 }}
-          disabled={!selectedItems.length} onClick={() => triggerPrint(selectedItems)}>
+        <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: selectedEntries.length ? 1 : 0.4 }}
+          disabled={!selectedEntries.length} onClick={() => triggerPrint(selectedEntries)}>
           <Printer size={14} /> Print Selected
         </button>
-        <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: selectedItems.length ? 1 : 0.4 }}
-          disabled={!selectedItems.length} onClick={() => downloadPDF(selectedItems)}>
+        <button className="depot-btn" style={{ ...styles.ghostBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: selectedEntries.length ? 1 : 0.4 }}
+          disabled={!selectedEntries.length} onClick={() => downloadPDF(selectedEntries)}>
           <Download size={14} /> Download Selected
         </button>
-        <button className="depot-btn" style={{ ...styles.primaryBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: filtered.length ? 1 : 0.4 }}
-          disabled={!filtered.length} onClick={() => triggerPrint(filtered)}>
+        <button className="depot-btn" style={{ ...styles.primaryBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: labelEntries.length ? 1 : 0.4 }}
+          disabled={!labelEntries.length} onClick={() => triggerPrint(labelEntries)}>
           <Printer size={14} /> Print All
         </button>
-        <button className="depot-btn" style={{ ...styles.primaryBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: filtered.length ? 1 : 0.4 }}
-          disabled={!filtered.length} onClick={() => downloadPDF(filtered)}>
+        <button className="depot-btn" style={{ ...styles.primaryBtn, display: 'flex', alignItems: 'center', gap: 6, opacity: labelEntries.length ? 1 : 0.4 }}
+          disabled={!labelEntries.length} onClick={() => downloadPDF(labelEntries)}>
           <Download size={14} /> Download All
         </button>
       </div>
 
-      {filtered.length === 0 ? (
+      {labelEntries.length === 0 ? (
         <div className="depot-no-print" style={{ textAlign: 'center', padding: '60px 0', color: 'rgba(59,42,31,0.45)', fontSize: 13.5 }}>
           {items.length === 0
             ? 'No inventory items yet — add some from the Inventory tab first.'
@@ -4471,15 +4512,15 @@ function BarcodesView({ items, categories, canBackfill }) {
         </div>
       ) : (
         <div className="barcode-browse-grid" style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 4 }}>
-          {filtered.map((it) => (
-            <div key={it.id} style={{ position: 'relative' }}>
+          {labelEntries.map((e) => (
+            <div key={e.key} style={{ position: 'relative' }}>
               <label style={{
                 position: 'absolute', top: 6, left: 6, zIndex: 2, background: 'rgba(255,255,255,0.9)',
                 borderRadius: 4, padding: 2, display: 'flex', cursor: 'pointer',
               }}>
-                <input type="checkbox" checked={selected.has(it.id)} onChange={() => toggleOne(it.id)} />
+                <input type="checkbox" checked={selected.has(e.key)} onChange={() => toggleOne(e.key)} />
               </label>
-              <BarcodeLabel item={it} showPrice={includePrice} />
+              <BarcodeLabel item={e.item} unit={e.unit} showPrice={includePrice} />
             </div>
           ))}
         </div>
@@ -4488,7 +4529,7 @@ function BarcodesView({ items, categories, canBackfill }) {
       {printBatch && (
         <div className="barcode-print-only" style={{ display: 'none' }}>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-            {printBatch.map((it) => <BarcodeLabel key={it.id} item={it} showPrice={includePrice} />)}
+            {printBatch.map((e) => <BarcodeLabel key={e.key} item={e.item} unit={e.unit} showPrice={includePrice} />)}
           </div>
         </div>
       )}
@@ -5190,7 +5231,7 @@ function OrdersView({ orders, onReceive, onCancel }) {
 
   const exportHeaders = ['Order Date', 'Item', 'Supplier', 'Quantity', 'Unit Cost', 'Total', 'Expected By', 'Status', 'Notes'];
   const exportRows = () => filtered.map((o) => [
-    formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName || '—', o.quantity,
+    formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName || '—', `${o.quantity} ${o.unitName || ''}`.trim(),
     o.unitCost.toFixed(2), o.totalCost.toFixed(2), formatDate(o.expectedDate), o.status, o.notes || '',
   ]);
   const handleDownload = () => downloadCSV('orders.csv', exportHeaders, exportRows());
@@ -5240,7 +5281,7 @@ function OrdersView({ orders, onReceive, onCancel }) {
                     {o.itemSku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {o.itemName}</span>
                   </td>
                   <td style={styles.td}>{o.supplierName || <span style={{ color: 'rgba(59,42,31,0.4)' }}>— No Supplier —</span>}</td>
-                  <td style={styles.td}>{o.quantity}</td>
+                  <td style={styles.td}>{o.quantity} {o.unitName || ''}</td>
                   <td style={styles.td}>{currency(o.unitCost)}</td>
                   <td style={styles.td}>{currency(o.totalCost)}</td>
                   <td style={styles.td}>{formatDate(o.expectedDate)}</td>
@@ -5602,8 +5643,8 @@ function POSView({ items, onCompleteSale, shops, activeShopId, onSwitchShop }) {
   const handleScan = (code) => {
     const found = findItemByScan(sellable, code);
     if (found) {
-      addToCart(found, getItemUnits(found)[0]);
-      setScanMsg({ ok: true, text: `Scanned: ${found.name}` });
+      addToCart(found.item, found.unit);
+      setScanMsg({ ok: true, text: `Scanned: ${found.item.name}${found.unit.isBase ? '' : ` (${found.unit.name})`}` });
     } else {
       setScanMsg({ ok: false, text: `No item matches barcode ${code}` });
     }
@@ -7263,6 +7304,12 @@ function ItemModal({ draft, suppliers, categories, locations, items, onClose, on
                       <input type="number" className="depot-input" style={{ ...styles.modalInput, width: 70, padding: '6px 8px' }} value={u.stock}
                         onChange={(e) => updateUnitRow(i, { stock: e.target.value === '' ? '' : Math.max(0, Number(e.target.value)) })} />
                     </div>
+                    <div style={{
+                      ...styles.modalInput, display: 'flex', alignItems: 'center', color: 'rgba(59,42,31,0.55)',
+                      fontFamily: "'IBM Plex Mono', 'Courier New', monospace", letterSpacing: '0.04em', fontSize: 12,
+                    }}>
+                      {u.barcode || `${u.name || 'This unit'}'s own barcode — generated automatically when you save`}
+                    </div>
                   </div>
                 );
               })}
@@ -7793,11 +7840,13 @@ function ShopsView({ shops, activeShopId, onSwitch, onCreate, onRename, onDelete
 function OrderModal({ draft, items, suppliers, onClose, onSave }) {
   const [itemId, setItemId] = useState(draft?.itemId || '');
   const [supplierId, setSupplierId] = useState(draft?.supplierId || '');
+  const [unitName, setUnitName] = useState(draft?.unitName || '');
   const [quantity, setQuantity] = useState(draft?.quantity ?? '');
   const [unitCost, setUnitCost] = useState(draft?.unitCost ?? '');
   const [notes, setNotes] = useState(draft?.notes || '');
 
   const selectedItem = items.find((it) => it.id === itemId);
+  const units = selectedItem ? getItemUnits(selectedItem) : [];
   // The item's own linked suppliers are offered first (for convenience,
   // since that's most often who you're re-ordering from), but the full
   // supplier list is always available too - a supplier isn't required at
@@ -7811,7 +7860,20 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
     // Default to the item's own supplier if it has exactly one linked;
     // otherwise leave it unset rather than guessing.
     setSupplierId(supplierIds.length === 1 ? supplierIds[0] : '');
-    if (it) setUnitCost(it.unitCost ?? '');
+    if (it) {
+      const itUnits = getItemUnits(it);
+      setUnitName(itUnits[0]?.name || it.baseUnitName || 'Piece');
+      setUnitCost(it.unitCost ?? '');
+    }
+  };
+
+  const handleUnitChange = (name) => {
+    setUnitName(name);
+    // Each unit (Piece/Pack/Box) has its own cost, set independently when
+    // the item was configured - jump to that unit's own cost as a
+    // starting point, same as picking the item itself does.
+    const unit = units.find((u) => u.name === name);
+    if (unit) setUnitCost(unit.cost ?? '');
   };
 
   const valid = itemId && Number(quantity) > 0;
@@ -7859,11 +7921,18 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
               <input className="depot-input" type="number" min="1" style={styles.modalInput} value={quantity}
                 onChange={(e) => setQuantity(e.target.value === '' ? '' : Math.max(1, Number(e.target.value)))} />
             </Field>
-            <Field label="Unit Cost (₱)" grow>
-              <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={unitCost}
-                onChange={(e) => setUnitCost(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
+            <Field label="Unit" grow>
+              <select className="depot-select" style={styles.modalInput} value={unitName} disabled={!selectedItem}
+                onChange={(e) => handleUnitChange(e.target.value)}>
+                {units.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+              </select>
             </Field>
           </div>
+          <Field label="Unit Cost (₱)">
+            <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={unitCost}
+              onChange={(e) => setUnitCost(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
+            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Defaults to the selected unit's own cost — edit if this order costs differently.</div>
+          </Field>
 
           <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', padding: '2px 2px 4px' }}>
             Order total: <strong style={{ color: 'var(--ink)' }}>{currency((Number(quantity) || 0) * (Number(unitCost) || 0))}</strong>
@@ -7877,7 +7946,7 @@ function OrderModal({ draft, items, suppliers, onClose, onSave }) {
         <div style={styles.modalFooter}>
           <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
           <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
-            disabled={!valid} onClick={() => onSave({ itemId, supplierId, quantity, unitCost, notes })}>
+            disabled={!valid} onClick={() => onSave({ itemId, supplierId, unitName, quantity, unitCost, notes })}>
             Place Order
           </button>
         </div>
