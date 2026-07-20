@@ -5862,7 +5862,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
                       <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                         <thead>
                           <tr>
-                            {['SKU', 'Item', 'Qty', 'Unit Price', 'Line Total'].map((h) => (
+                            {['SKU', 'Item', 'Qty', 'Unit', 'Unit Price', 'Line Total'].map((h) => (
                               <th key={h} style={{ ...styles.th, padding: '4px 8px', fontSize: 10.5 }}>{h}</th>
                             ))}
                           </tr>
@@ -5873,6 +5873,7 @@ function SalesHistoryView({ sales, role, onCancelSale, onDeleteSale, onLogActivi
                               <td style={{ padding: '4px 8px', fontFamily: "'Quicksand', sans-serif", fontSize: 12 }}>{l.sku}</td>
                               <td style={{ padding: '4px 8px', fontSize: 12 }}>{l.name}</td>
                               <td style={{ padding: '4px 8px', fontSize: 12 }}>{l.qty}</td>
+                              <td style={{ padding: '4px 8px', fontSize: 12, color: 'rgba(59,42,31,0.6)' }}>{l.unitName || '—'}</td>
                               <td style={{ padding: '4px 8px', fontSize: 12, fontFamily: "'IBM Plex Mono', monospace" }}>{currency(l.unitPrice)}</td>
                               <td style={{ padding: '4px 8px', fontSize: 12, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600 }}>{currency(l.lineTotal)}</td>
                             </tr>
