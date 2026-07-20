@@ -17,7 +17,7 @@ import {
   ArrowUpCircle, ArrowDownCircle, MapPin, Clock, LayoutGrid,
   ListOrdered, ScrollText, Boxes, ChevronDown, Truck, Timer,
   Mail, Phone, User, CheckCircle2, Tag, ShoppingCart, Receipt, Banknote, CreditCard, Minus,
-  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, ClipboardList, Undo2, Building2, PackagePlus,
+  Printer, Download, Leaf, Apple, ShoppingBasket, UserPlus, Undo2, Building2, PackagePlus,
   Wrench, Hammer, Ruler, PaintBucket, SprayCan, Droplet, Sparkles, FlaskConical, ShoppingBag, Shirt, Gem, Footprints,
   Barcode, ScanLine, Bluetooth, CheckSquare, Square, Store,
 } from 'lucide-react';
@@ -501,6 +501,19 @@ function getUnitCounts(item) {
   return counts;
 }
 
+// True stock value for one item: sums each unit's own physical count
+// times THAT unit's own cost (e.g. sealed Packs valued at the Pack's own
+// price, loose Pieces at the Piece's own price) - NOT quantity (the
+// base-unit total) times the base unit's cost alone. That naive
+// calculation silently zeroes out any item whose cost was only ever
+// entered on a non-base unit (Base Price left blank on Piece, set only
+// on Pack), even though real cost data exists on that unit.
+function itemInventoryValue(item) {
+  const units = getItemUnits(item);
+  const counts = getUnitCounts(item);
+  return units.reduce((sum, u) => sum + (counts[u.name] || 0) * (u.cost || 0), 0);
+}
+
 // Sum of every unit's count converted to base-unit terms - this is what
 // `item.quantity` always represents, kept in sync as a derived total any
 // time `unitStock` changes, so every other part of the app (low-stock
@@ -872,7 +885,6 @@ const VIEW_PERMISSIONS = {
   suppliers: 'manageSuppliers',
   categories: 'manageCategories',
   locations: 'manageLocations',
-  orders: 'manageOrders',
   restock: 'stockReceive',
   shops: 'manageOrders',
   delivery: 'viewReports',
@@ -1164,7 +1176,6 @@ export default function InventorySystem() {
   const [locations, setLocations] = useState([]);
   const [deliveryStatuses, setDeliveryStatuses] = useState({});
   const [sales, setSales] = useState([]);
-  const [orders, setOrders] = useState([]);
   const [restocks, setRestocks] = useState([]);
   const [shops, setShops] = useState([]);
   const [activeShopId, setActiveShopId] = useState(null);
@@ -1177,7 +1188,6 @@ export default function InventorySystem() {
   const [itemModal, setItemModal] = useState(null);
   const [moveModal, setMoveModal] = useState(null);
   const [supplierModal, setSupplierModal] = useState(null);
-  const [orderModal, setOrderModal] = useState(null);
   const [restockModal, setRestockModal] = useState(false);
   const [assignModal, setAssignModal] = useState(null);
   const [markupModal, setMarkupModal] = useState(null);
@@ -1764,9 +1774,6 @@ export default function InventorySystem() {
         } else {
           setSales([]);
         }
-        unsubs.push(onSnapshot(query(collection(db, 'orders'), where('ownerId', '==', ownerId)), (snap) => {
-          setOrders(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.orderDate - a.orderDate));
-        }, logSnapErr('orders')));
         unsubs.push(onSnapshot(query(collection(db, 'restocks'), where('ownerId', '==', ownerId)), (snap) => {
           setRestocks(snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => b.receivedAt - a.receivedAt));
         }, logSnapErr('restocks')));
@@ -1796,7 +1803,6 @@ export default function InventorySystem() {
         setMovements([]);
         setDeliveryStatuses({});
         setLoginLogs([]);
-        setOrders([]);
         setRestocks([]);
         setShops([]);
         setActiveShopId(null);
@@ -2445,90 +2451,6 @@ export default function InventorySystem() {
     setConfirmModal(null);
   };
 
-  const saveOrder = async (draft) => {
-    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
-    const item = items.find((i) => i.id === draft.itemId);
-    if (!item) { showToast('Pick an item first'); return; }
-    // Supplier is optional - an order can be placed without one and a
-    // supplier assigned or changed later, same as everywhere else
-    // Suppliers are used in the app now.
-    const supplier = draft.supplierId ? suppliers.find((s) => s.id === draft.supplierId) : null;
-    const units = getItemUnits(item);
-    const unit = units.find((u) => u.name === draft.unitName) || units[0];
-    const quantity = Math.max(1, Number(draft.quantity) || 0);
-    const unitCost = Math.max(0, Number(draft.unitCost) || 0);
-    const now = Date.now();
-    const id = 'o' + Math.random().toString(36).slice(2, 9);
-    const order = {
-      id, ownerId,
-      itemId: item.id, itemSku: item.sku, itemName: item.name,
-      supplierId: supplier?.id || null, supplierName: supplier?.name || null,
-      quantity, unitName: unit.name, factor: unit.factor, unitCost, totalCost: quantity * unitCost,
-      status: 'pending',
-      orderDate: now,
-      // No supplier means no known lead time to go on - expectedDate is
-      // just left as the order date itself rather than guessing.
-      expectedDate: now + (supplier?.leadTimeDays || 0) * DAY_MS,
-      receivedDate: null,
-      notes: (draft.notes || '').trim(),
-      createdBy: user.uid, createdByEmail: user.email || '',
-      shopId: item.shopId || activeShopId || null,
-    };
-    try {
-      await setDoc(doc(db, 'orders', id), order);
-      playAddSound();
-      showToast(supplier ? `Order placed with ${supplier.name}` : 'Order placed');
-    } catch (e) {
-      showToast('Could not place order — check your connection');
-    }
-    setOrderModal(null);
-  };
-
-  const receiveOrder = async (order) => {
-    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
-    if (order.status !== 'pending') { showToast(`This order is already ${order.status}`); return; }
-    const item = items.find((i) => i.id === order.itemId);
-    const now = Date.now();
-    try {
-      if (item) {
-        // Orders placed before unit selection existed have no unitName -
-        // fall back to the item's base unit so old pending orders still
-        // receive correctly.
-        const orderUnitName = order.unitName || item.baseUnitName || 'Piece';
-        const units = getItemUnits(item);
-        const counts = getUnitCounts(item);
-        const newStock = { ...counts, [orderUnitName]: (counts[orderUnitName] || 0) + order.quantity };
-        const newQuantity = totalBaseUnits(newStock, units);
-        await setDoc(doc(db, 'items', item.id), { ...item, quantity: newQuantity, unitStock: newStock });
-        const mvId = 'm' + Math.random().toString(36).slice(2, 9);
-        await setDoc(doc(db, 'movements', mvId), {
-          id: mvId, itemId: item.id, type: 'in', qty: order.quantity * (order.factor ?? 1),
-          reason: `Order received${order.supplierName ? ` from ${order.supplierName}` : ''}${orderUnitName !== (item.baseUnitName || 'Piece') ? ` (${order.quantity} ${orderUnitName})` : ''}`,
-          timestamp: now, ownerId,
-          shopId: item.shopId || activeShopId || null,
-        });
-      }
-      await setDoc(doc(db, 'orders', order.id), { status: 'received', receivedDate: now }, { merge: true });
-      showToast(item ? `Order received — ${order.quantity} ${order.unitName || ''} × ${order.itemSku} added to stock` : 'Order marked received');
-    } catch (e) {
-      showToast('Could not mark order received — check your connection');
-    }
-  };
-
-  const cancelOrder = async (order) => {
-    if (!can(myRole, 'manageOrders')) { showToast("You don't have permission to manage orders"); return; }
-    if (order.status !== 'pending') { showToast(`This order is already ${order.status}`); return; }
-    try {
-      await setDoc(doc(db, 'orders', order.id), {
-        status: 'cancelled', cancelledAt: Date.now(), cancelledBy: user.email || user.uid,
-      }, { merge: true });
-      showToast(`Order for ${order.itemSku} cancelled`);
-    } catch (e) {
-      showToast('Could not cancel order — check your connection');
-    }
-    setConfirmModal(null);
-  };
-
   // Staff's `items` state is already query-scoped to just their own holderId
   // (see the data-loading effect), so it needs no further filtering here.
   // A manager's `items` state includes the WHOLE tenant (their own master
@@ -2558,10 +2480,6 @@ export default function InventorySystem() {
     if (!activeShopId) return movements;
     return movements.filter((m) => !m.shopId || m.shopId === activeShopId);
   }, [movements, activeShopId]);
-  const shopOrders = useMemo(() => {
-    if (!activeShopId) return orders;
-    return orders.filter((o) => !o.shopId || o.shopId === activeShopId);
-  }, [orders, activeShopId]);
   const shopRestocks = useMemo(() => {
     if (!activeShopId) return restocks;
     return restocks.filter((r) => !r.shopId || r.shopId === activeShopId);
@@ -2621,12 +2539,18 @@ export default function InventorySystem() {
   // have access to.
   const staffInventoryStats = useMemo(() => {
     if (myRole === 'staff') return { total: 0, byStaff: [] };
-    const staffItems = items.filter((it) => it.holderId && it.holderId !== ownerId);
-    const total = staffItems.reduce((s, it) => s + it.quantity * it.unitCost, 0);
+    // Only count stock held by a staff account that's still actually
+    // approved and active - an item can be left with a stale holderId
+    // after that staff account is removed, and without this check it
+    // would keep showing up as "with staff" indefinitely even though no
+    // staff account exists any more.
+    const activeStaffUids = new Set(approvedUsers.filter((u) => u.role === 'staff').map((u) => u.id));
+    const staffItems = items.filter((it) => it.holderId && it.holderId !== ownerId && activeStaffUids.has(it.holderId));
+    const total = staffItems.reduce((s, it) => s + itemInventoryValue(it), 0);
     const byStaffMap = {};
     staffItems.forEach((it) => {
       if (!byStaffMap[it.holderId]) byStaffMap[it.holderId] = { staffUid: it.holderId, value: 0, skuCount: 0, units: 0 };
-      byStaffMap[it.holderId].value += it.quantity * it.unitCost;
+      byStaffMap[it.holderId].value += itemInventoryValue(it);
       byStaffMap[it.holderId].skuCount += 1;
       byStaffMap[it.holderId].units += it.quantity;
     });
@@ -2650,7 +2574,7 @@ export default function InventorySystem() {
     list.sort((a, b) => {
       if (sortKey === 'name') return a.name.localeCompare(b.name);
       if (sortKey === 'qty') return b.quantity - a.quantity;
-      if (sortKey === 'value') return b.quantity * b.unitCost - a.quantity * a.unitCost;
+      if (sortKey === 'value') return itemInventoryValue(b) - itemInventoryValue(a);
       if (sortKey === 'low') return (a.quantity - reorderThresholdInBase(a)) - (b.quantity - reorderThresholdInBase(b));
       return 0;
     });
@@ -2659,10 +2583,10 @@ export default function InventorySystem() {
 
   const totals = useMemo(() => {
     const totalUnits = myOwnItems.reduce((s, i) => s + i.quantity, 0);
-    const totalValue = myOwnItems.reduce((s, i) => s + i.quantity * i.unitCost, 0);
+    const totalValue = myOwnItems.reduce((s, i) => s + itemInventoryValue(i), 0);
     const lowStock = myOwnItems.filter((i) => i.quantity <= reorderThresholdInBase(i));
     return { totalSkus: myOwnItems.length, totalUnits, totalValue, lowStock };
-  }, [items]);
+  }, [myOwnItems]);
 
   const categoryData = useMemo(() => {
     return categories.map((cat) => ({
@@ -2853,7 +2777,6 @@ export default function InventorySystem() {
           onAdd={() => {
             if (view === 'inventory') setItemModal('new');
             if (view === 'suppliers') setSupplierModal('new');
-            if (view === 'orders') setOrderModal('new');
             if (view === 'restock') setRestockModal(true);
           }}
         />
@@ -2923,14 +2846,6 @@ export default function InventorySystem() {
             items={items}
             onEdit={(s) => setSupplierModal(s)}
             onDelete={(s) => setConfirmModal({ kind: 'supplier', target: s })}
-          />
-        )}
-
-        {view === 'orders' && (
-          <OrdersView
-            orders={shopOrders}
-            onReceive={receiveOrder}
-            onCancel={(o) => setConfirmModal({ kind: 'order', target: o })}
           />
         )}
 
@@ -3065,16 +2980,6 @@ export default function InventorySystem() {
         />
       )}
 
-      {orderModal && (
-        <OrderModal
-          draft={orderModal === 'new' ? null : orderModal}
-          items={myOwnItems}
-          suppliers={suppliers}
-          onClose={() => setOrderModal(null)}
-          onSave={saveOrder}
-        />
-      )}
-
       {restockModal && (
         <RestockModal
           items={myOwnItems}
@@ -3147,16 +3052,6 @@ export default function InventorySystem() {
           message={<>Remove <strong>{confirmModal.target.name}</strong>? Items linked to this supplier will be unlinked, not deleted.</>}
           onCancel={() => setConfirmModal(null)}
           onConfirm={() => deleteSupplier(confirmModal.target.id)}
-        />
-      )}
-
-      {confirmModal && confirmModal.kind === 'order' && (
-        <ConfirmModal
-          title="CANCEL ORDER"
-          message={<>Cancel the order for <strong>{confirmModal.target.quantity} {confirmModal.target.unitName || ''} × {confirmModal.target.itemSku}</strong>{confirmModal.target.supplierName ? <> from <strong>{confirmModal.target.supplierName}</strong></> : ''}? This won't affect stock.</>}
-          onCancel={() => setConfirmModal(null)}
-          onConfirm={() => cancelOrder(confirmModal.target)}
-          confirmLabel="Cancel Order"
         />
       )}
 
@@ -3833,7 +3728,6 @@ function Sidebar({ view, setView, lowCount, role, pendingCount, logo, onSignOut,
       { key: 'barcodes', label: 'Barcodes', icon: Barcode },
       { key: 'staffInventory', label: 'Staff Inventory', icon: User },
       { key: 'suppliers', label: 'Suppliers', icon: Truck },
-      { key: 'orders', label: 'Orders', icon: ClipboardList },
       { key: 'restock', label: 'Restock', icon: PackagePlus },
       { key: 'shops', label: 'Shops', icon: Store },
       { key: 'categories', label: 'Categories', icon: Tag },
@@ -4000,7 +3894,6 @@ function TopBar({ view, role, onAdd }) {
     staffInventory: ['Staff Inventory', 'Stock assigned to each staff member'],
     clientAccounts: ['Client Accounts', 'Manage subscriptions for every business on the platform'],
     suppliers: ['Suppliers', 'Vendors you order stock from'],
-    orders: ['Orders', 'Purchase orders placed with your suppliers'],
     restock: ['Restock', 'Receive inventory, with or without a supplier'],
     shops: ['Shops', 'Create and switch between shops within your business'],
     categories: ['Categories', 'Organize items into your own groups'],
@@ -4015,7 +3908,7 @@ function TopBar({ view, role, onAdd }) {
   };
   const [title, sub] = titles[view];
   const showAdd = (view === 'inventory' && can(role, 'editInventory')) || (view === 'suppliers' && can(role, 'manageSuppliers'))
-    || (view === 'orders' && can(role, 'manageOrders')) || (view === 'restock' && can(role, 'stockReceive'));
+    || (view === 'restock' && can(role, 'stockReceive'));
   const showManualLink = view === 'overview';
   return (
     <div style={styles.topbar} className="depot-topbar">
@@ -4025,7 +3918,7 @@ function TopBar({ view, role, onAdd }) {
       </div>
       {showAdd && (
         <button className="depot-btn depot-no-print depot-topbar-btn" style={styles.primaryBtn} onClick={onAdd}>
-          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'orders' ? 'New Order' : view === 'restock' ? 'New Restock' : 'New Item'}
+          <Plus size={16} /> {view === 'suppliers' ? 'New Supplier' : view === 'restock' ? 'New Restock' : 'New Item'}
         </button>
       )}
       {showManualLink && (
@@ -4557,7 +4450,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
   const itemEstProfit = (it) => it.quantity * itemMarkup(it).amount;
 
   const totalQty = filtered.reduce((s, it) => s + it.quantity, 0);
-  const totalBaseCostValue = filtered.reduce((s, it) => s + it.quantity * it.unitCost, 0);
+  const totalBaseCostValue = filtered.reduce((s, it) => s + itemInventoryValue(it), 0);
   const totalSellingValue = filtered.reduce((s, it) => s + it.quantity * (it.sellingPrice ?? it.unitCost), 0);
   const totalEstProfit = totalSellingValue - totalBaseCostValue;
 
@@ -4569,7 +4462,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
         it.sku, it.name, it.category, supplierNames(it).join('; '), it.location,
         it.quantity, (Number(it.unitCost) || 0).toFixed(2), (Number(it.sellingPrice ?? it.unitCost) || 0).toFixed(2),
         `${currency(markup.amount)} (${markup.percent.toFixed(1)}%)`,
-        (it.quantity * (Number(it.unitCost) || 0)).toFixed(2), (it.quantity * (Number(it.sellingPrice ?? it.unitCost) || 0)).toFixed(2),
+        itemInventoryValue(it).toFixed(2), (it.quantity * (Number(it.sellingPrice ?? it.unitCost) || 0)).toFixed(2),
         itemEstProfit(it).toFixed(2),
       ];
     }),
@@ -4654,7 +4547,7 @@ function InventoryView({ filtered, supplierMap, categories, role, search, setSea
                   <td style={{ ...styles.td, fontSize: 12.5 }}>
                     {(() => { const m = itemMarkup(it); return `${currency(m.amount)} (${m.percent.toFixed(1)}%)`; })()}
                   </td>
-                  <td style={styles.td}>{currency(it.quantity * it.unitCost)}</td>
+                  <td style={styles.td}>{currency(itemInventoryValue(it))}</td>
                   <td style={{ ...styles.td, fontWeight: 600, color: 'var(--green)' }}>{currency(it.quantity * (it.sellingPrice ?? it.unitCost))}</td>
                   <td style={{ ...styles.td, fontWeight: 600, color: itemEstProfit(it) >= 0 ? 'var(--green)' : 'var(--red)' }}>{currency(itemEstProfit(it))}</td>
                   {showActionsCol && (
@@ -4744,7 +4637,7 @@ function StaffInventoryView({ items, staffList, selectedStaffUid, setSelectedSta
                     <td style={styles.td}>{currency(it.unitCost)}</td>
                     <td style={styles.td}>{markupLabel}</td>
                     <td style={styles.td}>{currency(it.sellingPrice ?? it.unitCost)}</td>
-                    <td style={styles.td}>{currency(it.quantity * it.unitCost)}</td>
+                    <td style={styles.td}>{currency(itemInventoryValue(it))}</td>
                     <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                       <IconBtn onClick={() => onMove(it)} title="Record movement"><ArrowUpCircle size={15} /></IconBtn>
                       <IconBtn onClick={() => onEdit(it)} title="Edit"><Pencil size={14} /></IconBtn>
@@ -5219,106 +5112,6 @@ function SuppliersView({ suppliers, items, onEdit, onDelete }) {
           ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function OrdersView({ orders, onReceive, onCancel }) {
-  const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState('All');
-
-  const filtered = useMemo(() => {
-    return orders.filter((o) => {
-      const matchesStatus = statusFilter === 'All' || o.status === statusFilter.toLowerCase();
-      const q = search.toLowerCase();
-      const matchesSearch = !q || o.itemSku.toLowerCase().includes(q) || o.itemName.toLowerCase().includes(q)
-        || (o.supplierName || '').toLowerCase().includes(q);
-      return matchesStatus && matchesSearch;
-    });
-  }, [orders, search, statusFilter]);
-
-  const statusStyle = (status) => {
-    if (status === 'pending') return { bg: 'rgba(15,42,71,0.08)', color: 'var(--blueprint)' };
-    if (status === 'cancelled') return { bg: 'rgba(193,84,60,0.1)', color: 'var(--red)' };
-    return { bg: 'rgba(79,138,99,0.1)', color: 'var(--green)' }; // received
-  };
-
-  const exportHeaders = ['Order Date', 'Item', 'Supplier', 'Quantity', 'Unit Cost', 'Total', 'Expected By', 'Status', 'Notes'];
-  const exportRows = () => filtered.map((o) => [
-    formatDate(o.orderDate), `${o.itemSku} — ${o.itemName}`, o.supplierName || '—', `${o.quantity} ${o.unitName || ''}`.trim(),
-    o.unitCost.toFixed(2), o.totalCost.toFixed(2), formatDate(o.expectedDate), o.status, o.notes || '',
-  ]);
-  const handleDownload = () => downloadCSV('orders.csv', exportHeaders, exportRows());
-  const handleDownloadPDF = () => downloadPDF('orders.pdf', 'Orders', exportHeaders, exportRows());
-
-  return (
-    <div style={{ animation: 'fadeIn 0.3s ease' }}>
-      <ExportBar onPrint={printPage} onDownload={handleDownload} onDownloadPDF={handleDownloadPDF} />
-      <div style={styles.filterBar} className="depot-no-print depot-filterbar">
-        <div style={styles.searchBox}>
-          <Search size={15} color="rgba(59,42,31,0.5)" />
-          <input
-            className="depot-input"
-            placeholder="Search by item or supplier…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            style={styles.searchInput}
-          />
-        </div>
-        <select className="depot-select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} style={styles.select}>
-          <option value="All">All Statuses</option>
-          <option value="Pending">Pending</option>
-          <option value="Received">Received</option>
-          <option value="Cancelled">Cancelled</option>
-        </select>
-      </div>
-
-      <div style={styles.tableWrap} className="depot-scroll">
-        <table style={styles.table} className="depot-table">
-          <thead>
-            <tr>
-              {['Order Date', 'Item', 'Supplier', 'Qty', 'Unit Cost', 'Total', 'Expected By', 'Status', ''].map((h) => (
-                <th key={h} style={styles.th}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.length === 0 && (
-              <tr><td colSpan={9} style={{ ...styles.td, textAlign: 'center', padding: '32px 0', color: 'rgba(59,42,31,0.5)' }}>No orders match your filters.</td></tr>
-            )}
-            {filtered.map((o) => {
-              const st = statusStyle(o.status);
-              return (
-                <tr key={o.id} className="depot-row">
-                  <td style={styles.td}>{formatDate(o.orderDate)}</td>
-                  <td style={{ ...styles.td, fontFamily: "'Quicksand', sans-serif" }}>
-                    {o.itemSku} <span style={{ fontFamily: "'Nunito', sans-serif", color: 'rgba(59,42,31,0.55)' }}>— {o.itemName}</span>
-                  </td>
-                  <td style={styles.td}>{o.supplierName || <span style={{ color: 'rgba(59,42,31,0.4)' }}>— No Supplier —</span>}</td>
-                  <td style={styles.td}>{o.quantity} {o.unitName || ''}</td>
-                  <td style={styles.td}>{currency(o.unitCost)}</td>
-                  <td style={styles.td}>{currency(o.totalCost)}</td>
-                  <td style={styles.td}>{formatDate(o.expectedDate)}</td>
-                  <td style={styles.td}>
-                    <span style={{ ...styles.statusPill, background: st.bg, color: st.color }}>
-                      {o.status === 'received' && <CheckCircle2 size={12} />}
-                      {o.status.charAt(0).toUpperCase() + o.status.slice(1)}
-                    </span>
-                  </td>
-                  <td className="depot-no-print" style={{ ...styles.td, display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                    {o.status === 'pending' && (
-                      <>
-                        <IconBtn onClick={() => onReceive(o)} title="Mark received"><CheckCircle2 size={14} /></IconBtn>
-                        <IconBtn onClick={() => onCancel(o)} title="Cancel order" danger><X size={14} /></IconBtn>
-                      </>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
     </div>
   );
 }
@@ -7659,6 +7452,8 @@ function RestockModal({ items, suppliers, onClose, onSave }) {
   const [unitCost, setUnitCost] = useState('');
   const [supplierId, setSupplierId] = useState('');
   const [notes, setNotes] = useState('');
+  const [scanMsg, setScanMsg] = useState(null);
+  const quantityRef = useRef(null);
 
   const selectedItem = items.find((it) => it.id === itemId);
   const units = selectedItem ? getItemUnits(selectedItem) : [];
@@ -7672,6 +7467,26 @@ function RestockModal({ items, suppliers, onClose, onSave }) {
     }
   };
 
+  useEffect(() => {
+    if (!scanMsg) return;
+    const t = setTimeout(() => setScanMsg(null), 2500);
+    return () => clearTimeout(t);
+  }, [scanMsg]);
+
+  // Scan an item's barcode (or a specific unit's own barcode, e.g. a
+  // Pack's separate code) to select both the item and that exact unit in
+  // one motion - the only thing left to type by hand is the quantity.
+  const handleScan = (code) => {
+    const found = findItemByScan(items, code);
+    if (!found) { setScanMsg({ ok: false, text: `No item matches barcode ${code}` }); return; }
+    setItemId(found.item.id);
+    setUnitName(found.unit.name);
+    setUnitCost(found.unit.cost ?? found.item.unitCost ?? '');
+    setScanMsg({ ok: true, text: `Scanned: ${found.item.name}${found.unit.isBase === false ? ` (${found.unit.name})` : ''} — enter the quantity received` });
+    setTimeout(() => quantityRef.current?.focus(), 50);
+  };
+  useBarcodeScanner(handleScan, true);
+
   const valid = itemId && Number(quantity) > 0;
 
   return (
@@ -7682,9 +7497,21 @@ function RestockModal({ items, suppliers, onClose, onSave }) {
           <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
         </div>
         <div style={styles.modalBody}>
-          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4 }}>
-            Every restock is treated as already received — inventory updates the moment you save. A supplier is optional.
+          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <span>Every restock is treated as already received — inventory updates the moment you save. A supplier is optional.</span>
           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11.5, color: 'rgba(59,42,31,0.45)', marginBottom: 10 }}>
+            <Bluetooth size={13} /> Scanner ready — scan an item or unit's barcode to fill in the details below automatically
+          </div>
+          {scanMsg && (
+            <div style={{
+              marginBottom: 10, padding: '7px 12px', borderRadius: 6, fontSize: 12.5, fontWeight: 600,
+              background: scanMsg.ok ? 'rgba(79,138,99,0.12)' : 'rgba(193,80,58,0.12)',
+              color: scanMsg.ok ? 'var(--green)' : 'var(--red)', display: 'flex', alignItems: 'center', gap: 6,
+            }}>
+              <ScanLine size={14} /> {scanMsg.text}
+            </div>
+          )}
           <Field label="Item">
             <select className="depot-select" style={styles.modalInput} value={itemId} onChange={(e) => handleItemChange(e.target.value)}>
               <option value="">— Select an item —</option>
@@ -7693,7 +7520,7 @@ function RestockModal({ items, suppliers, onClose, onSave }) {
           </Field>
           <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
             <Field label="Quantity Received" grow>
-              <input className="depot-input" type="number" style={styles.modalInput} value={quantity}
+              <input ref={quantityRef} className="depot-input" type="number" style={styles.modalInput} value={quantity}
                 onChange={(e) => setQuantity(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
             </Field>
             <Field label="Unit" grow>
@@ -7861,124 +7688,6 @@ function ShopsView({ shops, activeShopId, onSwitch, onCreate, onRename, onDelete
             {shops.length > 1 && <IconBtn onClick={() => onDelete(s)} title="Delete" danger><Trash2 size={14} /></IconBtn>}
           </div>
         ))}
-      </div>
-    </div>
-  );
-}
-
-function OrderModal({ draft, items, suppliers, onClose, onSave }) {
-  const [itemId, setItemId] = useState(draft?.itemId || '');
-  const [supplierId, setSupplierId] = useState(draft?.supplierId || '');
-  const [unitName, setUnitName] = useState(draft?.unitName || '');
-  const [quantity, setQuantity] = useState(draft?.quantity ?? '');
-  const [unitCost, setUnitCost] = useState(draft?.unitCost ?? '');
-  const [notes, setNotes] = useState(draft?.notes || '');
-
-  const selectedItem = items.find((it) => it.id === itemId);
-  const units = selectedItem ? getItemUnits(selectedItem) : [];
-  // The item's own linked suppliers are offered first (for convenience,
-  // since that's most often who you're re-ordering from), but the full
-  // supplier list is always available too - a supplier isn't required at
-  // all, matching how Suppliers work everywhere else in the app now.
-  const linkedSupplierIds = selectedItem ? getSupplierIds(selectedItem) : [];
-
-  const handleItemChange = (id) => {
-    setItemId(id);
-    const it = items.find((i) => i.id === id);
-    const supplierIds = it ? getSupplierIds(it) : [];
-    // Default to the item's own supplier if it has exactly one linked;
-    // otherwise leave it unset rather than guessing.
-    setSupplierId(supplierIds.length === 1 ? supplierIds[0] : '');
-    if (it) {
-      const itUnits = getItemUnits(it);
-      setUnitName(itUnits[0]?.name || it.baseUnitName || 'Piece');
-      setUnitCost(it.unitCost ?? '');
-    }
-  };
-
-  const handleUnitChange = (name) => {
-    setUnitName(name);
-    // Each unit (Piece/Pack/Box) has its own cost, set independently when
-    // the item was configured - jump to that unit's own cost as a
-    // starting point, same as picking the item itself does.
-    const unit = units.find((u) => u.name === name);
-    if (unit) setUnitCost(unit.cost ?? '');
-  };
-
-  const valid = itemId && Number(quantity) > 0;
-
-  return (
-    <div style={styles.overlay}>
-      <div style={styles.modal} className="depot-modal" onClick={(e) => e.stopPropagation()}>
-        <div style={styles.modalHeader}>
-          <span>NEW ORDER</span>
-          <button className="depot-btn" onClick={onClose} style={styles.closeBtn}><X size={16} /></button>
-        </div>
-        <div style={styles.modalBody}>
-          <Field label="Item">
-            <select className="depot-select" style={styles.modalInput} value={itemId}
-              onChange={(e) => handleItemChange(e.target.value)}>
-              <option value="">— Select an item —</option>
-              {items.map((it) => <option key={it.id} value={it.id}>{it.sku} — {it.name}</option>)}
-            </select>
-          </Field>
-
-          <Field label="Supplier (optional)">
-            <select className="depot-select" style={styles.modalInput} value={supplierId} disabled={!itemId}
-              onChange={(e) => setSupplierId(e.target.value)}>
-              <option value="">— No Supplier —</option>
-              {linkedSupplierIds.length > 0 && (
-                <optgroup label="Linked to this item">
-                  {linkedSupplierIds.map((sid) => suppliers.find((s) => s.id === sid)).filter(Boolean).map((s) => (
-                    <option key={s.id} value={s.id}>{s.name} ({s.leadTimeDays}d lead time)</option>
-                  ))}
-                </optgroup>
-              )}
-              <optgroup label="All suppliers">
-                {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name} ({s.leadTimeDays}d lead time)</option>)}
-              </optgroup>
-            </select>
-            {itemId && suppliers.length === 0 && (
-              <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>
-                You haven't added any suppliers yet — that's fine, you can place this order without one and add suppliers later.
-              </div>
-            )}
-          </Field>
-
-          <div style={{ display: 'flex', gap: 12 }} className="depot-modal-body-row">
-            <Field label="Quantity" grow>
-              <input className="depot-input" type="number" min="1" style={styles.modalInput} value={quantity}
-                onChange={(e) => setQuantity(e.target.value === '' ? '' : Math.max(1, Number(e.target.value)))} />
-            </Field>
-            <Field label="Unit" grow>
-              <select className="depot-select" style={styles.modalInput} value={unitName} disabled={!selectedItem}
-                onChange={(e) => handleUnitChange(e.target.value)}>
-                {units.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
-              </select>
-            </Field>
-          </div>
-          <Field label="Unit Cost (₱)">
-            <input className="depot-input" type="number" step="0.01" min="0" style={styles.modalInput} value={unitCost}
-              onChange={(e) => setUnitCost(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))} />
-            <div style={{ fontSize: 11, color: 'rgba(59,42,31,0.5)', marginTop: 4 }}>Defaults to the selected unit's own cost — edit if this order costs differently.</div>
-          </Field>
-
-          <div style={{ fontSize: 12.5, color: 'rgba(59,42,31,0.6)', padding: '2px 2px 4px' }}>
-            Order total: <strong style={{ color: 'var(--ink)' }}>{currency((Number(quantity) || 0) * (Number(unitCost) || 0))}</strong>
-          </div>
-
-          <Field label="Notes">
-            <input className="depot-input" style={styles.modalInput} value={notes}
-              onChange={(e) => setNotes(e.target.value)} placeholder="Optional notes…" />
-          </Field>
-        </div>
-        <div style={styles.modalFooter}>
-          <button className="depot-btn" style={styles.ghostBtn} onClick={onClose}>Cancel</button>
-          <button className="depot-btn" style={{ ...styles.primaryBtn, opacity: valid ? 1 : 0.45 }}
-            disabled={!valid} onClick={() => onSave({ itemId, supplierId, unitName, quantity, unitCost, notes })}>
-            Place Order
-          </button>
-        </div>
       </div>
     </div>
   );
